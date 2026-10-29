@@ -142,12 +142,66 @@ pub fn substitute_names_in_text_pub(s: &str, names: &HashMap<VarId, String>) -> 
     substitute_names_in_text(s, names)
 }
 
+/// Applies `f` to the text outside Java string and char literals and copies the
+/// literals unchanged. A quote not closed on its line (apostrophe in a comment) is
+/// treated as code.
+pub(crate) fn map_outside_literals(s: &str, mut f: impl FnMut(&str) -> String) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut code_start = 0;
+    let mut at = 0;
+    while let Some(quote) = s[at..].chars().next() {
+        let open = at;
+        at += quote.len_utf8();
+        if quote != '"' && quote != '\'' {
+            continue;
+        }
+        if let Some(len) = literal_len(&s[at..], quote) {
+            at += len;
+            out.push_str(&f(&s[code_start..open]));
+            out.push_str(&s[open..at]);
+            code_start = at;
+        }
+    }
+    out.push_str(&f(&s[code_start..]));
+    out
+}
+
+/// Length of a literal after its opening `quote`, closing quote included.
+fn literal_len(rest: &str, quote: char) -> Option<usize> {
+    let mut escaped = false;
+    for (at, c) in rest.char_indices() {
+        if c == '\n' {
+            return None;
+        }
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == quote {
+            return Some(at + c.len_utf8());
+        }
+    }
+    None
+}
+
+/// Non-ASCII bytes count as identifier bytes: Java identifiers may contain letters
+/// outside ASCII.
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || !b.is_ascii()
+}
+
 fn substitute_names_in_text(s: &str, names: &HashMap<VarId, String>) -> String {
+    map_outside_literals(s, |code| substitute_names_in_code(code, names))
+}
+
+fn substitute_names_in_code(s: &str, names: &HashMap<VarId, String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     let bytes = s.as_bytes();
     while i < bytes.len() {
-        if bytes[i] == b'v' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+        let starts_word = i == 0 || !is_ident_byte(bytes[i - 1]);
+        let at_reg = bytes[i] == b'v' && bytes.get(i + 1).is_some_and(|b| b.is_ascii_digit());
+        if starts_word && at_reg {
             let start = i;
             i += 1;
             let mut reg: u32 = 0;
@@ -166,6 +220,10 @@ fn substitute_names_in_text(s: &str, names: &HashMap<VarId, String>) -> String {
             } else {
                 0
             };
+            if i < bytes.len() && is_ident_byte(bytes[i]) {
+                out.push_str(&s[start..i]);
+                continue;
+            }
             let vid = VarId::new(reg, ver);
             let resolved = names.get(&vid).or_else(|| {
                 if ver != 0 {
@@ -193,4 +251,50 @@ fn substitute_names_in_text(s: &str, names: &HashMap<VarId, String>) -> String {
 
 fn append_comment(base: String, _comment: Option<&str>) -> String {
     base
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names() -> HashMap<VarId, String> {
+        let mut names = HashMap::new();
+        names.insert(VarId::new(1, 0), "this".to_string());
+        names.insert(VarId::new(4, 0), "localRawFile".to_string());
+        names
+    }
+
+    #[test]
+    fn substitute_names_skips_literals_and_partial_words() {
+        let input = r#"v1.get("ota/api/conf/v1", "xhv4O1", 'v', "p0") + v4"#;
+        let expected = r#"this.get("ota/api/conf/v1", "xhv4O1", 'v', "p0") + localRawFile"#;
+        assert_eq!(substitute_names_in_text(input, &names()), expected);
+    }
+
+    #[test]
+    fn substitute_names_needs_a_word_boundary_outside_literals() {
+        assert_eq!(substitute_names_in_text("xhv4O1 + v4", &names()), "xhv4O1 + localRawFile");
+        assert_eq!(substitute_names_in_text("v1_x(v1)", &names()), "v1_x(this)");
+    }
+
+    #[test]
+    fn substitute_names_skips_a_literal_with_an_escaped_quote() {
+        let input = r#"f("a\"v1\"b", v1)"#;
+        assert_eq!(substitute_names_in_text(input, &names()), r#"f("a\"v1\"b", this)"#);
+    }
+
+    #[test]
+    fn substitute_names_keeps_non_ascii_literals_byte_identical() {
+        let input = r#"f("é v1 ü", v1)"#;
+        assert_eq!(substitute_names_in_text(input, &names()), r#"f("é v1 ü", this)"#);
+    }
+
+    #[test]
+    fn map_outside_literals_treats_an_unclosed_quote_as_code() {
+        let upper = |code: &str| code.to_uppercase();
+        assert_eq!(map_outside_literals(r#"a "b" c"#, upper), r#"A "b" C"#);
+        assert_eq!(map_outside_literals("a 'b", upper), "A 'B");
+        assert_eq!(map_outside_literals("// don't\nx 'y'", upper), "// DON'T\nX 'y'");
+        assert_eq!(map_outside_literals(r"'\\' x", upper), r"'\\' X");
+    }
 }

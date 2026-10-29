@@ -4,7 +4,7 @@
 //! invoke+move-result+return folding and similar patterns.
 
 use crate::decompile::ir::VarId;
-use crate::decompile::ir::{Expr as IrExpr, Stmt as IrStmt};
+use crate::decompile::ir::{map_outside_literals, Expr as IrExpr, Stmt as IrStmt};
 use std::collections::{HashMap, HashSet};
 
 /// A single transformation pass over method IR.
@@ -751,6 +751,10 @@ pub(crate) fn rename_vars_in_text_public(s: &str, cur_ver: &HashMap<u32, u32>) -
 /// Best-effort text rewrite: `vN` -> `vN_k` if current version for N is k>0.
 /// Leaves already-versioned `vN_k` unchanged.
 fn rename_vars_in_text(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
+    map_outside_literals(s, |code| rename_vars_in_code(code, cur_ver))
+}
+
+fn rename_vars_in_code(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -918,6 +922,10 @@ fn replace_whole_ident(text: &str, var: &str, replacement: &str) -> String {
     if var.is_empty() || !text.contains(var) {
         return text.to_string();
     }
+    map_outside_literals(text, |code| replace_whole_ident_in_code(code, var, replacement))
+}
+
+fn replace_whole_ident_in_code(text: &str, var: &str, replacement: &str) -> String {
     let bytes = text.as_bytes();
     let v = var.as_bytes();
     let mut out = String::with_capacity(text.len() + replacement.len());
@@ -1666,5 +1674,31 @@ mod tests {
             replace_whole_ident(text, "v2", "x"),
             "v1 = \"┌─┐ 友盟\" + x; // 日志"
         );
+    }
+
+    #[test]
+    fn rename_vars_skips_literals() {
+        let cur_ver = HashMap::from([(1, 2)]);
+        let out = rename_vars_in_text(r#"v1 + "ota/api/conf/v1" + 'v'"#, &cur_ver);
+        assert_eq!(out, r#"v1_2 + "ota/api/conf/v1" + 'v'"#);
+    }
+
+    #[test]
+    fn rename_vars_skips_a_literal_with_an_escaped_quote() {
+        let cur_ver = HashMap::from([(1, 2)]);
+        let out = rename_vars_in_text(r#"f("a\"v1\"b", v1)"#, &cur_ver);
+        assert_eq!(out, r#"f("a\"v1\"b", v1_2)"#);
+    }
+
+    #[test]
+    fn replace_whole_ident_skips_literals() {
+        let out = replace_whole_ident(r#"g(v1, "v1", 'v')"#, "v1", "x");
+        assert_eq!(out, r#"g(x, "v1", 'v')"#);
+    }
+
+    #[test]
+    fn replace_whole_ident_skips_a_literal_with_an_escaped_quote() {
+        let out = replace_whole_ident(r#"g("a\"v1\"b", v1)"#, "v1", "x");
+        assert_eq!(out, r#"g("a\"v1\"b", x)"#);
     }
 }

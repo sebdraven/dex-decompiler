@@ -1,5 +1,6 @@
 //! Shared parsing, identifier, and structural helpers.
 
+use crate::decompile::ir::map_outside_literals;
 use std::collections::{HashMap, HashSet};
 
 /// Strip trailing "  // ..." comment from a line to get the statement part.
@@ -942,6 +943,17 @@ pub(crate) fn replace_ident_as_expr(text: &str, var: &str, replacement: &str) ->
     let needs_wrap = replacement.contains(' ')
         || (replacement.starts_with('(') && !replacement.ends_with(')'))
         || is_cast_expr(replacement);
+    map_outside_literals(text, |code| {
+        replace_ident_as_expr_in_code(code, var, replacement, needs_wrap)
+    })
+}
+
+fn replace_ident_as_expr_in_code(
+    text: &str,
+    var: &str,
+    replacement: &str,
+    needs_wrap: bool,
+) -> String {
     let bytes = text.as_bytes();
     let v = var.as_bytes();
     let mut out = String::with_capacity(text.len() + replacement.len());
@@ -1623,4 +1635,21 @@ pub(crate) fn is_filled_array_literal(rhs: &str) -> bool {
         return false;
     }
     rhs.contains("[]{") || rhs.contains("[] {")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_ident_as_expr_skips_literals() {
+        let out = replace_ident_as_expr(r#"k.equals("k") || k == 'k'"#, "k", "s");
+        assert_eq!(out, r#"s.equals("k") || s == 'k'"#);
+    }
+
+    #[test]
+    fn replace_ident_as_expr_skips_a_literal_with_an_escaped_quote() {
+        let out = replace_ident_as_expr(r#"f("a\"k\"b", k)"#, "k", "s");
+        assert_eq!(out, r#"f("a\"k\"b", s)"#);
+    }
 }

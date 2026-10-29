@@ -7671,6 +7671,10 @@ fn is_branch_offset(token: &str) -> bool {
 /// Replace raw register references (vN) in a condition string with display names.
 /// Word-boundary aware: `v1` won't match inside `v10`.
 fn replace_register_names(condition: &str, reg_to_name: &HashMap<u32, String>) -> String {
+    ir::map_outside_literals(condition, |code| replace_register_names_in_code(code, reg_to_name))
+}
+
+fn replace_register_names_in_code(condition: &str, reg_to_name: &HashMap<u32, String>) -> String {
     let bytes = condition.as_bytes();
     let mut result = String::with_capacity(condition.len());
     let mut i = 0;
@@ -8225,6 +8229,10 @@ fn replace_ident_in_body(body: &str, from: &str, to: &str) -> String {
     if from == to || from.is_empty() {
         return body.to_string();
     }
+    ir::map_outside_literals(body, |code| replace_ident_in_code(code, from, to))
+}
+
+fn replace_ident_in_code(body: &str, from: &str, to: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let bytes = body.as_bytes();
     let mut i = 0;
@@ -9997,4 +10005,30 @@ mod tests {
         assert_eq!(args, "café, v1");
     }
 
+    #[test]
+    fn replace_register_names_skips_literals() {
+        let names = HashMap::from([(1, "this".to_string())]);
+        let out = replace_register_names(r#"v1.equals("ota/api/conf/v1")"#, &names);
+        assert_eq!(out, r#"this.equals("ota/api/conf/v1")"#);
+    }
+
+    #[test]
+    fn replace_register_names_skips_a_literal_with_an_escaped_quote() {
+        let names = HashMap::from([(1, "this".to_string())]);
+        let out = replace_register_names(r#"v1.equals("a\"v1\"b")"#, &names);
+        assert_eq!(out, r#"this.equals("a\"v1\"b")"#);
+    }
+
+    #[test]
+    fn replace_ident_in_body_skips_literals() {
+        let body = "    return p0 + \"p0\" + 'p';\n";
+        let out = replace_ident_in_body(body, "p0", "context");
+        assert_eq!(out, "    return context + \"p0\" + 'p';\n");
+    }
+
+    #[test]
+    fn replace_ident_in_body_skips_a_literal_with_an_escaped_quote() {
+        let out = replace_ident_in_body(r#"f("a\"p0\"b", p0);"#, "p0", "context");
+        assert_eq!(out, r#"f("a\"p0\"b", context);"#);
+    }
 }
