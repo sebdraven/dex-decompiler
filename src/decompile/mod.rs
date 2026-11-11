@@ -1980,7 +1980,13 @@ impl<'a> Decompiler<'a> {
             format_condition(ins.mnemonic(), &resolved)
         };
         let mut cfg = MethodCfg::build(&instructions, insns_bytes, base_offset, &condition_for);
-        Self::fold_constants_into_conditions(&mut cfg, &instructions, Some(self.dex));
+        // Folding needs the entry definitions of parameters and the catch edges (B2).
+        self.prepare_def_webs(&cfg, &instructions, code, encoded);
+        {
+            let webs = self.method_webs.borrow();
+            let webs = webs.as_ref().map(|(_, w)| w);
+            Self::fold_constants_into_conditions(&mut cfg, &instructions, Some(self.dex), webs);
+        }
         self.fold_field_reads_into_conditions(&mut cfg, &instructions);
         self.fold_aget_into_switch_conditions(&mut cfg, &instructions);
         self.prepare_method_reg_types(
@@ -4325,10 +4331,13 @@ impl<'a> Decompiler<'a> {
     /// branch as a block start, so `const/16 v2, 100; if-ge v1, v2` often lands in
     /// two blocks (`[const]` → `[if-ge]`). Without this, loop bounds become undefined
     /// temps (`while (i < i2)`).
+    /// `webs`: the method's def-use webs (parameter entry definitions, catch edges). When
+    /// absent, webs are built from `cfg` alone.
     fn fold_constants_into_conditions(
         cfg: &mut MethodCfg,
         instructions: &[Instruction],
         dex: Option<&DexFile>,
+        webs: Option<&DefWebs>,
     ) {
         let mut mutated = HashSet::new();
         for ins in instructions {
@@ -4387,6 +4396,16 @@ impl<'a> Decompiler<'a> {
                 offs
             })
             .collect();
+        // A definition is substituted only if it is the sole definition reaching the
+        // point that consumes it, and dropped only if that is its sole use (D1, D6).
+        let local_webs;
+        let webs = match webs {
+            Some(w) => w,
+            None => {
+                local_webs = DefWebs::build(cfg, instructions, &[], &[]);
+                &local_webs
+            }
+        };
         let mut folded: HashSet<u32> = HashSet::new();
         for (bid, block) in cfg.blocks.iter_mut().enumerate() {
             if let BlockEnd::Conditional {
@@ -4394,6 +4413,23 @@ impl<'a> Decompiler<'a> {
             } = block.end
             {
                 let offs = block.instruction_offsets.clone();
+                let Some(&branch_off) = offs.last() else {
+                    continue;
+                };
+                // Register named in the condition → offset where its value is read.
+                let mut consumer: HashMap<u32, u32> = webs
+                    .reads(branch_off)
+                    .iter()
+                    .map(|&reg| (reg, branch_off))
+                    .collect();
+                let only_def_reaching = |consumer: &HashMap<u32, u32>, reg: u32, def: u32| {
+                    consumer
+                        .get(&reg)
+                        .is_some_and(|&at| webs.reaching(at, reg) == BTreeSet::from([def]))
+                };
+                let same_value = |reg: u32, def: u32| {
+                    webs.reaching(def, reg) == webs.reaching(branch_off, reg)
+                };
                 // Same-block materialization before the if (skip the if itself).
                 let same_block_foldable: Vec<u32> = if offs.len() >= 2 {
                     offs[..offs.len() - 1].to_vec()
@@ -4423,12 +4459,18 @@ impl<'a> Decompiler<'a> {
                                 if is_loop && mutated.contains(&reg) {
                                     continue;
                                 }
+                                if !only_def_reaching(&consumer, reg, off) {
+                                    continue;
+                                }
                                 let mut map = HashMap::new();
                                 map.insert(reg, parts[1].to_string());
                                 let next = replace_register_names(condition, &map);
                                 if next != *condition {
                                     *condition = next;
-                                    folded.insert(off);
+                                    consumer.remove(&reg);
+                                    if webs.use_count(reg, off) == 1 {
+                                        folded.insert(off);
+                                    }
                                 }
                             }
                         }
@@ -4448,12 +4490,19 @@ impl<'a> Decompiler<'a> {
                             if is_loop && mutated.contains(&dst) {
                                 continue;
                             }
+                            if !only_def_reaching(&consumer, dst, off) || !same_value(src, off) {
+                                continue;
+                            }
                             let mut map = HashMap::new();
                             map.insert(dst, format!("v{}", src));
                             let next = replace_register_names(condition, &map);
                             if next != *condition {
                                 *condition = next;
-                                folded.insert(off);
+                                consumer.remove(&dst);
+                                consumer.insert(src, off);
+                                if webs.use_count(dst, off) == 1 {
+                                    folded.insert(off);
+                                }
                             }
                         }
                     } else if m == "instance-of" {
@@ -4464,7 +4513,14 @@ impl<'a> Decompiler<'a> {
                                 if is_loop && mutated.contains(&dst) {
                                     continue;
                                 }
-                                let src = parse_one_reg(parts[1])
+                                if !only_def_reaching(&consumer, dst, off) {
+                                    continue;
+                                }
+                                let src_reg = parse_one_reg(parts[1]);
+                                if src_reg.is_some_and(|s| !same_value(s, off)) {
+                                    continue;
+                                }
+                                let src = src_reg
                                     .map(|s| format!("v{}", s))
                                     .unwrap_or_else(|| parts[1].to_string());
                                 let ty = dex
@@ -4476,7 +4532,13 @@ impl<'a> Decompiler<'a> {
                                 let next = replace_register_names(condition, &map);
                                 if next != *condition {
                                     *condition = next;
-                                    folded.insert(off);
+                                    consumer.remove(&dst);
+                                    if let Some(s) = src_reg {
+                                        consumer.insert(s, off);
+                                    }
+                                    if webs.use_count(dst, off) == 1 {
+                                        folded.insert(off);
+                                    }
                                 }
                             }
                         }
@@ -10329,7 +10391,7 @@ mod tests {
             entry: 0,
             folded_const_offsets: HashSet::new(),
         };
-        Decompiler::fold_constants_into_conditions(&mut cfg, &instructions, None);
+        Decompiler::fold_constants_into_conditions(&mut cfg, &instructions, None, None);
         cfg
     }
 
@@ -10430,6 +10492,85 @@ mod tests {
             cfg.folded_const_offsets.contains(&4),
             "const/16 must be marked folded so it is not emitted as i2"
         );
+    }
+
+    /// D1: `move-result v0` kills `const/4 v0, 0` before `if-eqz v0`: nothing to fold.
+    #[test]
+    fn fold_skips_const_overwritten_by_move_result() {
+        let ins = vec![
+            Instruction::new(0, 2, 0x12, "const/4", "v0, 0".into()),
+            Instruction::new(2, 6, 0x6e, "invoke-virtual", "v1, method@0".into()),
+            Instruction::new(8, 2, 0x0a, "move-result", "v0".into()),
+            Instruction::new(10, 4, 0x38, "if-eqz", "v0, +008h".into()),
+        ];
+        let cfg = fold_cfg(vec![0, 2, 8, 10], "v0 == 0", false, ins);
+        assert_eq!(cond_of(&cfg), "v0 == 0");
+        assert!(cfg.folded_const_offsets.is_empty());
+    }
+
+    /// D6: the const also feeds `add-int/lit8`: substituted in the test, but still emitted.
+    #[test]
+    fn fold_keeps_const_with_another_use() {
+        let ins = vec![
+            Instruction::new(0, 2, 0x12, "const/4", "v0, 5".into()),
+            Instruction::new(2, 4, 0xd8, "add-int/lit8", "v1, v0, 1".into()),
+            Instruction::new(6, 4, 0x38, "if-eqz", "v0, +008h".into()),
+        ];
+        let cfg = fold_cfg(vec![0, 2, 6], "v0 == 0", false, ins);
+        assert_eq!(cond_of(&cfg), "5 == 0");
+        assert!(cfg.folded_const_offsets.is_empty());
+    }
+
+    #[test]
+    fn counter_names_are_synthetic_temps_only() {
+        assert!(is_counter_name("s0"));
+        assert!(is_counter_name("obj12"));
+        assert!(is_counter_name("arr1"));
+        assert!(!is_counter_name("i"));
+        assert!(!is_counter_name("length_1"));
+        assert!(!is_counter_name("email"));
+        assert!(!is_counter_name("s0_r3"));
+    }
+
+    /// B1: a primitive inferred from another definition never beats the declared `Object`.
+    #[test]
+    fn call_result_type_declared_object_beats_inferred_primitive() {
+        assert_eq!(call_result_type("java.lang.Object", Some("int")), "java.lang.Object");
+        assert_eq!(
+            call_result_type("java.lang.Object", Some("android.os.PowerManager")),
+            "android.os.PowerManager"
+        );
+        assert_eq!(call_result_type("java.lang.Object", None), "java.lang.Object");
+        assert_eq!(
+            call_result_type("android.content.SharedPreferences", Some("java.lang.String")),
+            "android.content.SharedPreferences"
+        );
+    }
+
+    /// B2: parameter v1 is reassigned on one path only; at the join it may still hold the
+    /// incoming value, so `const/4 v1, 0` must not be folded into `if-eqz v1`.
+    #[test]
+    fn fold_skips_param_reassigned_on_one_path() {
+        let bytecode = [
+            0x38, 0x00, 0x03, 0x00, // 00: if-eqz v0, +3 -> 06
+            0x12, 0x01, // 04: const/4 v1, 0
+            0x38, 0x01, 0x03, 0x00, // 06: if-eqz v1, +3 -> 0c
+            0x0e, 0x00, // 0a: return-void
+            0x0e, 0x00, // 0c: return-void
+        ];
+        let instructions = decode_all(&bytecode, 0).unwrap();
+        let condition_for = |ins: &Instruction| format_condition(ins.mnemonic(), ins.operands());
+        let mut cfg = MethodCfg::build(&instructions, &bytecode, 0, &condition_for);
+        let webs = DefWebs::build(&cfg, &instructions, &[], &[1]);
+        Decompiler::fold_constants_into_conditions(&mut cfg, &instructions, None, Some(&webs));
+        let branch = cfg.block_id_at_offset(6).expect("block at 06");
+        match &cfg.blocks[branch].end {
+            BlockEnd::Conditional { condition, .. } => {
+                assert!(condition.contains("v1"), "{condition}")
+            }
+            other => panic!("expected conditional, got {other:?}"),
+        }
+        assert!(!cfg.folded_const_offsets.contains(&4));
     }
 
     #[test]
