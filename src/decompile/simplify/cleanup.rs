@@ -283,6 +283,11 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
         if !want {
             continue;
         }
+        if !def_reaches_uses_alone(&lines, c.def_idx, c.end_idx, &c.var)
+            || literal_used_as_receiver(&lines, c.def_idx, c.end_idx, &c.var, &c.val)
+        {
+            continue;
+        }
         match latest_inline_by_var.get(&c.var) {
             Some(&prev) if cands[prev].def_idx > c.def_idx => {}
             _ => {
@@ -303,7 +308,8 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
         let call_rhs = c.use_count == 1
             && is_simple_call_expr(&c.val)
             && only_use_is_whole_rhs(&lines, &c.var, c.def_idx, c.end_idx);
-        if index_lit || call_rhs {
+        if (index_lit || call_rhs) && def_reaches_uses_alone(&lines, c.def_idx, c.end_idx, &c.var)
+        {
             bare_inline.insert(i);
         }
     }
@@ -397,6 +403,120 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
         }
     }
     out
+}
+
+fn indent_width(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Whether the definition on `def_idx` is the only one reaching the uses of `var` up to
+/// `end_idx` (its next assignment, or EOF), judged from the block structure (D1):
+/// no read outside the defining block, no conditional reassignment, no loop back edge
+/// that carries another value, and no declaration dropped under a later assignment.
+fn def_reaches_uses_alone(lines: &[&str], def_idx: usize, end_idx: usize, var: &str) -> bool {
+    let depth = indent_width(lines[def_idx]);
+    // Read before any earlier assignment: a loop back edge, or another variable.
+    let first_assign = lines[..def_idx]
+        .iter()
+        .position(|l| line_kills_var(l, var));
+    let first_read = lines[..def_idx]
+        .iter()
+        .position(|l| ident_used_as_rvalue(l, var));
+    if let Some(read) = first_read {
+        if first_assign.map_or(true, |assign| assign > read) {
+            return false;
+        }
+    }
+    // In a loop, a read earlier in the body sees this value on the next iteration.
+    if let Some(header) = enclosing_loop_header(lines, def_idx) {
+        if lines[header..def_idx]
+            .iter()
+            .any(|l| ident_used_as_rvalue(l, var))
+        {
+            return false;
+        }
+    }
+    // Past the end of the defining block, other definitions reach too.
+    let scope_end = lines
+        .iter()
+        .enumerate()
+        .skip(def_idx + 1)
+        .find(|(_, l)| {
+            let t = strip_trailing_comment(l);
+            let t = t.trim_start();
+            indent_width(l) < depth
+                && (t.starts_with('}') || t.starts_with("case ") || t.starts_with("default:"))
+        })
+        .map(|(j, _)| j)
+        .unwrap_or(lines.len());
+    let stop = (end_idx + 1).min(lines.len());
+    if scope_end < stop && lines[scope_end..stop].iter().any(|l| ident_occurs(l, var)) {
+        return false;
+    }
+    if end_idx < lines.len() {
+        // Reassigned inside a nested branch or loop.
+        if indent_width(lines[end_idx]) > depth {
+            return false;
+        }
+        // Dropping `T var = …;` would leave the later `var = …;` undeclared.
+        let def = strip_trailing_comment(lines[def_idx]);
+        let typed = def
+            .trim()
+            .split(" = ")
+            .next()
+            .is_some_and(|lhs| lhs.trim().contains(' '));
+        if typed {
+            return false;
+        }
+    }
+    true
+}
+
+/// Line index of the `while` / `for` / `do` header enclosing `idx`.
+fn enclosing_loop_header(lines: &[&str], idx: usize) -> Option<usize> {
+    let mut depth = indent_width(lines[idx]);
+    for k in (0..idx).rev() {
+        let width = indent_width(lines[k]);
+        if width >= depth {
+            continue;
+        }
+        let t = strip_trailing_comment(lines[k]);
+        let t = t.trim();
+        if !t.ends_with('{') {
+            continue;
+        }
+        depth = width;
+        if t.starts_with("while ")
+            || t.starts_with("while(")
+            || t.starts_with("for ")
+            || t.starts_with("for(")
+            || t == "do {"
+        {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// A numeric / null / boolean / char literal can never be a receiver: `0.x`, `null.f()`.
+fn literal_used_as_receiver(lines: &[&str], def_idx: usize, end_idx: usize, var: &str, val: &str) -> bool {
+    let v = val.trim();
+    let non_object = is_numeric_literal(v)
+        || matches!(v, "null" | "true" | "false")
+        || (v.starts_with('\'') && v.ends_with('\''));
+    if !non_object {
+        return false;
+    }
+    let stop = (end_idx + 1).min(lines.len());
+    lines[def_idx + 1..stop].iter().any(|l| {
+        let t = strip_trailing_comment(l);
+        t.match_indices(var).any(|(at, _)| {
+            let bytes = t.as_bytes();
+            let before_ok = at == 0 || !(is_ident_byte(bytes[at - 1]) || bytes[at - 1] == b'.');
+            let next = bytes.get(at + var.len()).copied();
+            before_ok && matches!(next, Some(b'.') | Some(b'['))
+        })
+    })
 }
 
 /// The only reads of `var` in the live range are `expr[var]` or `new T[var]`.
@@ -527,6 +647,16 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
         {
             continue;
         }
+        // The only assignment in the body, and it alone reaches every use (D1).
+        if lines
+            .iter()
+            .enumerate()
+            .any(|(j, l)| j != idx && line_kills_var(l, &var))
+            || !def_reaches_uses_alone(&lines, idx, lines.len(), &var)
+            || literal_used_as_receiver(&lines, idx, lines.len(), &var, &val)
+        {
+            continue;
+        }
         *assign_counts.entry(var.clone()).or_insert(0) += 1;
         assigns.insert(var, (idx, val));
     }
@@ -607,7 +737,9 @@ pub(crate) fn fix_undeclared_temp_assigns(body: &str) -> String {
                         let indent = leading_indent(line);
                         let comment = line.get(binding.len()..).unwrap_or("");
                         let stmt = t.trim_end_matches(';');
-                        current = format!("{}int {};", indent, stmt);
+                        // The type comes from the definition, `int` only when nothing says otherwise (D2).
+                        let ty = evident_type_of_rhs(&rhs).unwrap_or_else(|| "int".to_string());
+                        current = format!("{}{} {};", indent, ty, stmt);
                         current.push_str(comment);
                     }
                 }
@@ -629,8 +761,51 @@ pub(crate) fn fix_undeclared_temp_assigns(body: &str) -> String {
     out
 }
 
+/// Java type an expression shows by itself: `(T) x`, `new T(…)`, `new T[n]`, literals.
+fn evident_type_of_rhs(rhs: &str) -> Option<String> {
+    let r = rhs.trim();
+    if r.starts_with('"') {
+        return Some("String".to_string());
+    }
+    if matches!(r, "true" | "false") {
+        return Some("boolean".to_string());
+    }
+    if r == "null" {
+        return Some("Object".to_string());
+    }
+    let is_type_char = |c: char| c.is_alphanumeric() || matches!(c, '.' | '_' | '$');
+    if let Some(rest) = r.strip_prefix("new ") {
+        let ty: String = rest.chars().take_while(|&c| is_type_char(c)).collect();
+        let after = &rest[ty.len()..];
+        if ty.is_empty() {
+            return None;
+        }
+        if after.starts_with('(') {
+            return Some(ty);
+        }
+        if after.starts_with('[') {
+            return Some(format!("{}{}", ty, "[]".repeat(after.matches('[').count())));
+        }
+        return None;
+    }
+    let (ty, operand) = r.strip_prefix('(')?.split_once(')')?;
+    let ty = ty.trim();
+    let looks_like_type = matches!(
+        ty.trim_end_matches("[]"),
+        "int" | "long" | "short" | "byte" | "char" | "boolean" | "float" | "double"
+    ) || ty.contains('.')
+        || ty.starts_with(|c: char| c.is_ascii_uppercase());
+    let is_cast = looks_like_type
+        && ty.chars().all(|c| is_type_char(c) || matches!(c, '[' | ']'))
+        && operand
+            .trim_start()
+            .starts_with(|c: char| c.is_alphanumeric() || matches!(c, '(' | '"' | '_' | '$'));
+    is_cast.then(|| ty.to_string())
+}
+
 /// Merge `x = new Foo();` + `x.<init>(args);` (and typed forms) into `x = new Foo(args);`.
-/// Merge `x = new Foo();` + `x.<init>(args);` (and typed forms) into `x = new Foo(args);`.
+/// Statements loading the arguments may sit in between (D7); the merged statement takes
+/// the `<init>` position so those arguments are defined before use.
 pub(crate) fn merge_constructor_calls(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
     if lines.len() < 2 {
@@ -638,66 +813,62 @@ pub(crate) fn merge_constructor_calls(body: &str) -> String {
     }
     let mut skip: HashSet<usize> = HashSet::new();
     let mut replacements: HashMap<usize, String> = HashMap::new();
-    let mut i = 0;
-    while i + 1 < lines.len() {
+    for i in 0..lines.len() {
+        if skip.contains(&i) {
+            continue;
+        }
         let binding = strip_trailing_comment(lines[i]);
         let t = binding.trim();
         let Some(eq) = t.find(" = ") else {
-            i += 1;
             continue;
         };
         let lhs = t[..eq].trim();
         let rhs = t[eq + 3..].trim_end_matches(';').trim();
         let var = lhs.rsplit(' ').next().unwrap_or(lhs);
         let Some(class) = rhs.strip_prefix("new ").and_then(|s| s.strip_suffix("()")) else {
-            i += 1;
             continue;
         };
-        // Skip intervening simple assigns that don't touch `var`.
+        let indent = leading_indent(lines[i]);
         let mut j = i + 1;
         while j < lines.len() {
-            let jb = strip_trailing_comment(lines[j]);
-            let jt = jb.trim();
-            if let Some((init_var, args)) = parse_init_call(lines[j]) {
-                if init_var == var {
-                    let indent = leading_indent(lines[i]);
-                    let typed = if lhs.contains(' ') {
-                        format!(
-                            "{}{} = new {}({});",
-                            indent,
-                            lhs,
-                            class,
-                            args.unwrap_or_default()
-                        )
-                    } else {
-                        format!(
-                            "{}{} = new {}({});",
-                            indent,
-                            var,
-                            class,
-                            args.unwrap_or_default()
-                        )
-                    };
-                    replacements.insert(i, typed);
-                    skip.insert(j);
-                    i = j + 1;
-                    break;
-                }
-            }
-            if assign_lhs_var(lines[j]).as_deref() == Some(var) {
-                i += 1;
-                break;
-            }
-            // Allow simple temps between new and init.
-            if parse_simple_assign_line(lines[j]).is_some() || jt.is_empty() {
+            if skip.contains(&j) {
                 j += 1;
                 continue;
             }
-            i += 1;
+            if let Some((init_var, args)) = parse_init_call(lines[j]) {
+                if init_var == var {
+                    replacements.insert(
+                        j,
+                        format!("{}{} = new {}({});", indent, lhs, class, args.unwrap_or_default()),
+                    );
+                    skip.insert(i);
+                    break;
+                }
+            }
+            let jb = strip_trailing_comment(lines[j]);
+            let jt = jb.trim();
+            if jt.is_empty() {
+                j += 1;
+                continue;
+            }
+            if assign_lhs_var(lines[j]).as_deref() == Some(var) || ident_occurs(jt, var) {
+                break;
+            }
+            // Argument set-up in the same block: temps, nested `new`, `sb.append(x);`.
+            let plain_stmt = jt.ends_with(';')
+                && !jt.contains('{')
+                && !jt.starts_with('}')
+                && !jt.starts_with("return")
+                && !jt.starts_with("throw ")
+                && jt != "break;"
+                && jt != "continue;";
+            if parse_simple_assign_line(lines[j]).is_some()
+                || (plain_stmt && leading_indent(lines[j]) == indent)
+            {
+                j += 1;
+                continue;
+            }
             break;
-        }
-        if j >= lines.len() {
-            i += 1;
         }
     }
     if replacements.is_empty() {
