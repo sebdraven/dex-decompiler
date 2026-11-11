@@ -1254,7 +1254,7 @@ fn name_for_var(
     name
 }
 
-fn type_prefix(ty: &str) -> &'static str {
+pub(crate) fn type_prefix(ty: &str) -> &'static str {
     match ty {
         "int" | "short" | "byte" => "i",
         "boolean" => "z",
