@@ -508,14 +508,51 @@ impl<'a> Decompiler<'a> {
         self.ensure_type_indexes();
         let fields = self.field_type_index.borrow();
         let returns = self.method_return_index.borrow();
-        infer_types_cached(
+        let mut types = infer_types_cached(
             self.dex,
             encoded,
             code,
             stmts,
             fields.as_ref().expect("field index"),
             returns.as_ref().expect("return index"),
-        )
+        );
+        // A call result is typed by the callee's signature (D2). Receiver-style targets
+        // (`v3.getSystemService`) lose the class, and the register-wide fallback would
+        // paint the type of another definition of the same register.
+        let declared = self.call_return_types.borrow();
+        if !declared.is_empty() {
+            for stmt in stmts {
+                let IrStmt::Assign {
+                    dst,
+                    rhs: IrExpr::Call { .. },
+                    comment: Some(comment),
+                } = stmt
+                else {
+                    continue;
+                };
+                let Some(ret) = comment_insn_offset(comment).and_then(|off| declared.get(&off))
+                else {
+                    continue;
+                };
+                let ty = call_result_type(ret, types.get(dst).map(|s| s.as_str()));
+                types.insert(*dst, ty);
+            }
+        }
+        types
+    }
+
+    /// Declared Java return type of an invoke's `method@N` operand (`None` for void).
+    fn invoke_return_type(&self, ops: &str) -> Option<String> {
+        let idx: u32 = ops
+            .rsplit(',')
+            .next()?
+            .trim()
+            .strip_prefix("method@")?
+            .parse()
+            .ok()?;
+        let info = self.dex.get_method_info(idx).ok()?;
+        let ret = java::descriptor_to_java(&info.return_type);
+        (ret != "void").then_some(ret)
     }
 
     /// Enrich per-block types from method-wide / debug maps, reusing the field index.
@@ -1912,6 +1949,9 @@ impl<'a> Decompiler<'a> {
             .map_err(|e| DexDecompilerError::Disassembly(e.to_string()))?;
         if instructions.is_empty() {
             return Ok("        // (no instructions)\n".to_string());
+        }
+        if *self.lambda_inline_depth.borrow() == 0 {
+            self.call_return_types.borrow_mut().clear();
         }
 
         *self.method_return_type.borrow_mut() = self
@@ -6236,6 +6276,11 @@ impl<'a> Decompiler<'a> {
                     || m.starts_with("invoke-direct")
                     || is_super;
                 if let Some((target, args, param_types)) = parse_invoke_call_parts(&ops_resolved) {
+                    if let Some(ret) = self.invoke_return_type(ops) {
+                        self.call_return_types
+                            .borrow_mut()
+                            .insert(offset as u32, ret);
+                    }
                     let (target, args) = if is_super {
                         to_super_style(&target, &args)
                     } else if is_instance {
@@ -8713,6 +8758,21 @@ fn instruction_writes_register(ins: &Instruction) -> Option<u32> {
         return None;
     }
     parse_one_reg(ins.operands())
+}
+
+/// Type of a call result: the callee's declared return type, except that an inferred
+/// reference type beats an erased `Object` return. A primitive never does (D2).
+fn call_result_type(declared: &str, inferred: Option<&str>) -> String {
+    match inferred {
+        Some(t) if declared == "java.lang.Object" && !is_primitive_java_type(t) => t.to_string(),
+        _ => declared.to_string(),
+    }
+}
+
+/// Instruction offset of an IR comment `// [idx] 00ab (…): …` (the first one when merged).
+fn comment_insn_offset(comment: &str) -> Option<u32> {
+    let hex = comment.split_once("] ")?.1.split_whitespace().next()?;
+    u32::from_str_radix(hex, 16).ok()
 }
 
 pub(crate) fn escape_java_string(s: &str) -> String {
