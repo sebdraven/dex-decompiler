@@ -718,11 +718,34 @@ impl Pass for SsaRenamePass {
                     cur_ver.insert(dst.reg, dst.ver);
                     out.push(IrStmt::Phi { dst, incomings });
                 }
-                IrStmt::Raw(s) => out.push(IrStmt::Raw(rename_vars_in_text(&s, &cur_ver))),
+                IrStmt::Raw(s) => {
+                    // `vN = …;` (move-result without its invoke, cmp, float ops) defines vN.
+                    if let Some((reg, rhs)) = raw_register_def(&s) {
+                        let rhs = rename_vars_in_text(rhs, &cur_ver);
+                        let v = next_ver.entry(reg).or_insert(0);
+                        *v += 1;
+                        cur_ver.insert(reg, *v);
+                        out.push(IrStmt::Raw(format!("v{}_{} = {}", reg, *v, rhs)));
+                    } else {
+                        out.push(IrStmt::Raw(rename_vars_in_text(&s, &cur_ver)));
+                    }
+                }
             }
         }
         out
     }
+}
+
+/// `vN = rhs` at the start of a raw line → (N, rhs).
+fn raw_register_def(s: &str) -> Option<(u32, &str)> {
+    let rest = s.strip_prefix('v')?;
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let reg = rest[..digits].parse().ok()?;
+    let rhs = rest[digits..].strip_prefix(" = ")?;
+    Some((reg, rhs))
 }
 
 fn rename_expr(expr: IrExpr, cur_ver: &HashMap<u32, u32>) -> IrExpr {
