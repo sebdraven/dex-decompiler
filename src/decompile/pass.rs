@@ -808,25 +808,39 @@ fn rename_vars_in_code(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
 }
 
 /// Merge `new Foo()` + `receiver.<init>(args)` → `new Foo(args)`, and remove the bare `<init>` call.
-/// Allows intervening simple assignments (e.g. `const-class`) that don't redefine the receiver.
+/// Statements loading the arguments may sit in between as long as they leave the receiver
+/// alone (`const-class`, nested `new`, `sb.append(x)` without move-result, field reads).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConstructorMergePass;
 
 impl Pass for ConstructorMergePass {
     fn run(&self, stmts: Vec<IrStmt>) -> Vec<IrStmt> {
-        let mut out: Vec<IrStmt> = Vec::with_capacity(stmts.len());
-        let mut i = 0;
-        while i < stmts.len() {
-            if let Some((merged, next_i)) = try_merge_constructor(&stmts, i) {
-                out.extend(merged);
-                i = next_i;
-                continue;
+        // `new A(new B(…))`: the outer pair merges first, the inner one on the next round.
+        let mut current = stmts;
+        for _ in 0..8 {
+            let next = merge_constructors_once(&current);
+            if next == current {
+                break;
             }
-            out.push(stmts[i].clone());
-            i += 1;
+            current = next;
         }
-        out
+        current
     }
+}
+
+fn merge_constructors_once(stmts: &[IrStmt]) -> Vec<IrStmt> {
+    let mut out: Vec<IrStmt> = Vec::with_capacity(stmts.len());
+    let mut i = 0;
+    while i < stmts.len() {
+        if let Some((merged, next_i)) = try_merge_constructor(stmts, i) {
+            out.extend(merged);
+            i = next_i;
+            continue;
+        }
+        out.push(stmts[i].clone());
+        i += 1;
+    }
+    out
 }
 
 fn call_is_init_for_reg(target: &str, reg: u32) -> bool {
@@ -867,8 +881,10 @@ fn try_merge_constructor(stmts: &[IrStmt], i: usize) -> Option<(Vec<IrStmt>, usi
                 comment: c2,
             } if call_is_init_for_reg(target, dst_reg) => {
                 let merged_comment = merge_comment(comment.as_deref(), c2.as_deref());
-                // Inline intervening const-class / const-string temps into constructor args so
-                // we don't emit `new Intent(this, local0)` before `local0 = Foo.class`.
+                // Inline single-use literal temps (const-class / const-string) so we don't
+                // emit `new Intent(this, local0)` before `local0 = Foo.class`.
+                let later_uses = used_var_ids(&stmts[j + 1..]);
+                let between_uses = used_var_ids(&intervening);
                 let mut args = args.clone();
                 let mut keep_intervening: Vec<IrStmt> = Vec::new();
                 for inter in &intervening {
@@ -878,10 +894,15 @@ fn try_merge_constructor(stmts: &[IrStmt], i: usize) -> Option<(Vec<IrStmt>, usi
                         ..
                     } = inter
                     {
-                        let inlined = inline_var_in_args(&args, *idst, rval);
-                        if inlined != args {
-                            args = inlined;
-                            continue;
+                        if is_ctor_literal_arg(rval)
+                            && !later_uses.contains(idst)
+                            && !between_uses.contains(idst)
+                        {
+                            let inlined = inline_var_in_args(&args, *idst, rval);
+                            if inlined != args {
+                                args = inlined;
+                                continue;
+                            }
                         }
                     }
                     keep_intervening.push(inter.clone());
@@ -894,7 +915,9 @@ fn try_merge_constructor(stmts: &[IrStmt], i: usize) -> Option<(Vec<IrStmt>, usi
                 });
                 return Some((out, j + 1));
             }
-            s @ IrStmt::Assign { .. } => {
+            s @ (IrStmt::Assign { .. } | IrStmt::Expr { .. } | IrStmt::Raw(_))
+                if !used_regs(std::slice::from_ref(s)).contains(&dst_reg) =>
+            {
                 intervening.push(s.clone());
                 j += 1;
             }
@@ -904,18 +927,24 @@ fn try_merge_constructor(stmts: &[IrStmt], i: usize) -> Option<(Vec<IrStmt>, usi
     None
 }
 
-/// Replace `vN` / `vN_k` for `vid` in a comma-separated arg list with `rval`.
+/// Literal that may be moved into constructor arguments.
+fn is_ctor_literal_arg(rval: &str) -> bool {
+    let r = rval.trim();
+    (r.starts_with('"') && r.ends_with('"') && r.len() >= 2)
+        || r.ends_with(".class")
+        || matches!(r, "null" | "true" | "false")
+        || is_numeric_const_rhs(r)
+}
+
+/// Replace exactly `vid` (`vN_k`, or `vN` for version 0) in a comma-separated arg list.
+/// The bare `vN` of a versioned `vid` is the value from before the block: not `vid`.
 fn inline_var_in_args(args: &str, vid: VarId, rval: &str) -> String {
-    let names = if vid.ver == 0 {
-        vec![format!("v{}", vid.reg)]
+    let name = if vid.ver == 0 {
+        format!("v{}", vid.reg)
     } else {
-        vec![format!("v{}_{}", vid.reg, vid.ver), format!("v{}", vid.reg)]
+        format!("v{}_{}", vid.reg, vid.ver)
     };
-    let mut out = args.to_string();
-    for name in names {
-        out = replace_whole_ident(&out, &name, rval);
-    }
-    out
+    replace_whole_ident(args, &name, rval)
 }
 
 fn replace_whole_ident(text: &str, var: &str, replacement: &str) -> String {
