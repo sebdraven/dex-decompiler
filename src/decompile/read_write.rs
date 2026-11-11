@@ -230,6 +230,61 @@ pub fn instruction_reads_writes(mnemonic: &str, ops_resolved: &str) -> (Vec<u32>
             return (vec![src], vec![dst]);
         }
     }
+    if let Some((dst, src, _lit)) = parse_two_regs_and_literal(ops) {
+        if matches!(
+            m,
+            "add-int/lit16"
+                | "rsub-int"
+                | "mul-int/lit16"
+                | "div-int/lit16"
+                | "rem-int/lit16"
+                | "and-int/lit16"
+                | "or-int/lit16"
+                | "xor-int/lit16"
+        ) {
+            return (vec![src], vec![dst]);
+        }
+    }
+
+    // cmp*: dst = compare(src1, src2)
+    if matches!(
+        m,
+        "cmpl-float" | "cmpg-float" | "cmpl-double" | "cmpg-double" | "cmp-long"
+    ) {
+        if let Some((a, b, c)) = parse_three_regs(ops) {
+            if m.ends_with("-float") {
+                return (vec![b, c], vec![a]);
+            }
+            let mut reads = wide_pair(b);
+            reads.extend(wide_pair(c));
+            return (reads, vec![a]);
+        }
+    }
+
+    // binop/2addr: vA = vA op vB
+    if m.ends_with("/2addr") {
+        if let Some((a, b)) = parse_two_regs(ops) {
+            if m.contains("-long/") || m.contains("-double/") {
+                let mut reads = wide_pair(a);
+                if m.starts_with("shl-") || m.starts_with("shr-") || m.starts_with("ushr-") {
+                    reads.push(b);
+                } else {
+                    reads.extend(wide_pair(b));
+                }
+                return (reads, wide_pair(a));
+            }
+            return (vec![a, b], vec![a]);
+        }
+    }
+
+    // neg/not and primitive conversions: vA = op vB
+    if let Some((src_wide, dst_wide)) = unary_widths(m) {
+        if let Some((a, b)) = parse_two_regs(ops) {
+            let reads = if src_wide { wide_pair(b) } else { vec![b] };
+            let writes = if dst_wide { wide_pair(a) } else { vec![a] };
+            return (reads, writes);
+        }
+    }
 
     // array-length: dest, array -> read array, write dest
     if m == "array-length" {
@@ -338,6 +393,16 @@ pub fn instruction_reads_writes(mnemonic: &str, ops_resolved: &str) -> (Vec<u32>
     }
 
     (vec![], vec![])
+}
+
+/// (source is wide, destination is wide) for `neg-*`, `not-*` and `x-to-y`.
+fn unary_widths(m: &str) -> Option<(bool, bool)> {
+    let wide = |t: &str| t == "long" || t == "double";
+    if let Some(t) = m.strip_prefix("neg-").or_else(|| m.strip_prefix("not-")) {
+        return Some((wide(t), wide(t)));
+    }
+    let (src, dst) = m.split_once("-to-")?;
+    Some((wide(src), wide(dst)))
 }
 
 /// From invoke operands "v0, v1, Lclass;->m(I)V" return [0, 1].
@@ -491,6 +556,32 @@ mod tests {
         assert_eq!(
             instruction_reads_writes("return-wide", "v4"),
             (vec![4, 5], vec![])
+        );
+    }
+
+    /// Reaching definitions must see these redefinitions (D1).
+    #[test]
+    fn two_addr_unary_lit16_and_cmp_define_their_destination() {
+        assert_eq!(
+            instruction_reads_writes("add-int/2addr", "v0, v1"),
+            (vec![0, 1], vec![0])
+        );
+        assert_eq!(
+            instruction_reads_writes("shl-long/2addr", "v2, v4"),
+            (vec![2, 3, 4], vec![2, 3])
+        );
+        assert_eq!(
+            instruction_reads_writes("int-to-long", "v0, v2"),
+            (vec![2], vec![0, 1])
+        );
+        assert_eq!(instruction_reads_writes("neg-int", "v1, v2"), (vec![2], vec![1]));
+        assert_eq!(
+            instruction_reads_writes("mul-int/lit16", "v1, v2, 300"),
+            (vec![2], vec![1])
+        );
+        assert_eq!(
+            instruction_reads_writes("cmp-long", "v0, v2, v4"),
+            (vec![2, 3, 4, 5], vec![0])
         );
     }
 }
