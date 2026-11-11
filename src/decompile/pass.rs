@@ -1701,4 +1701,99 @@ mod tests {
         let out = replace_whole_ident(r#"g("a\"v1\"b", v1)"#, "v1", "x");
         assert_eq!(out, r#"g("a\"v1\"b", x)"#);
     }
+
+    /// D1: a `move-result` whose invoke is in another block is still a new definition.
+    #[test]
+    fn ssa_raw_move_result_is_a_new_definition() {
+        let stmts = vec![
+            IrStmt::Assign {
+                dst: VarId::new(0, 0),
+                rhs: IrExpr::Raw("\"wsClient\"".into()),
+                comment: None,
+            },
+            IrStmt::Raw("v0 = <result>;".into()),
+            IrStmt::Expr {
+                expr: IrExpr::Call {
+                    target: "v0.f".into(),
+                    args: "".into(),
+                },
+                comment: None,
+            },
+        ];
+        let out = SsaRenamePass.run(stmts);
+        assert_eq!(out[0].to_java_line(), "v0_1 = \"wsClient\";");
+        assert_eq!(out[1].to_java_line(), "v0_2 = <result>;");
+        assert_eq!(out[2].to_java_line(), "v0_2.f();");
+    }
+
+    /// D7: `new D0.K()` + argument set-up (nested `new`, `append` without result) + `<init>`.
+    #[test]
+    fn constructor_merge_skips_argument_setup() {
+        let call = |target: &str, args: &str| IrStmt::Expr {
+            expr: IrExpr::Call {
+                target: target.into(),
+                args: args.into(),
+            },
+            comment: None,
+        };
+        let stmts = vec![
+            IrStmt::Assign {
+                dst: VarId::new(2, 1),
+                rhs: IrExpr::Raw("new D0.K()".into()),
+                comment: None,
+            },
+            IrStmt::Assign {
+                dst: VarId::new(3, 1),
+                rhs: IrExpr::Raw("new java.lang.StringBuilder()".into()),
+                comment: None,
+            },
+            call("v3_1.<init>", ""),
+            call("v3_1.append", "v4"),
+            IrStmt::Assign {
+                dst: VarId::new(3, 2),
+                rhs: IrExpr::Call {
+                    target: "v3_1.toString".into(),
+                    args: "".into(),
+                },
+                comment: None,
+            },
+            call("v2_1.<init>", "v3_2"),
+        ];
+        let lines: Vec<String> = ConstructorMergePass
+            .run(stmts)
+            .iter()
+            .map(|s| s.to_java_line())
+            .collect();
+        assert!(lines.iter().all(|l| !l.contains("<init>")), "{lines:?}");
+        assert_eq!(lines.first().map(String::as_str), Some("v3_1 = new java.lang.StringBuilder();"));
+        assert_eq!(lines.last().map(String::as_str), Some("v2_1 = new D0.K(v3_2);"));
+    }
+
+    /// D1: inlining the temp `v1_1` into constructor args must not touch `v1`, the value
+    /// from before the block.
+    #[test]
+    fn constructor_merge_inlines_only_the_exact_version() {
+        let stmts = vec![
+            IrStmt::Assign {
+                dst: VarId::new(0, 1),
+                rhs: IrExpr::Raw("new Foo()".into()),
+                comment: None,
+            },
+            IrStmt::Assign {
+                dst: VarId::new(1, 1),
+                rhs: IrExpr::Raw("\"x\"".into()),
+                comment: None,
+            },
+            IrStmt::Expr {
+                expr: IrExpr::Call {
+                    target: "v0_1.<init>".into(),
+                    args: "v1, v1_1".into(),
+                },
+                comment: None,
+            },
+        ];
+        let out = ConstructorMergePass.run(stmts);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to_java_line(), "v0_1 = new Foo(v1, \"x\");");
+    }
 }
