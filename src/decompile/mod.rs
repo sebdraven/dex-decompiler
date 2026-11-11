@@ -6,6 +6,7 @@ pub mod accessors;
 pub mod annotations;
 pub mod cfg;
 pub mod const_fields;
+mod def_webs;
 pub mod deobf;
 pub mod graph;
 mod ir;
@@ -33,6 +34,7 @@ pub mod value_flow;
 use crate::error::{DexDecompilerError, Result};
 use crate::java;
 use cfg::{BlockEnd, BlockId, MethodCfg};
+use def_webs::{DefKey, DefWebs};
 use dex_bytecode::{decode_all, Instruction};
 use dex_parser::{ClassDef, CodeItem, DexFile, EncodedMethod, NO_INDEX};
 use ir::{Expr as IrExpr, Stmt as IrStmt, VarId};
@@ -48,7 +50,7 @@ use region::{
 use ssa::{apply_canonical_names, construct_ssa, phi_canonical_map, phi_registers, strip_phis};
 use simplify::is_temp_like_name;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use type_infer::{
     build_var_names_with_regs, enrich_types_with_field_index, infer_types_cached,
@@ -413,6 +415,21 @@ pub struct Decompiler<'a> {
     field_type_index: RefCell<Option<FieldTypeIndex>>,
     /// Lazy DEX-wide method return-type index (amortized across methods / CFG blocks).
     method_return_index: RefCell<Option<MethodReturnIndex>>,
+    /// Def-use webs of the method being decompiled, keyed by its `insns_off`.
+    method_webs: RefCell<Option<(usize, DefWebs)>>,
+    /// Per-method temp-name ownership, so two variables never share a synthetic name.
+    method_names: RefCell<MethodNameState>,
+    /// Invoke offset (as printed in IR comments) → declared Java return type.
+    call_return_types: RefCell<HashMap<u32, String>>,
+}
+
+#[derive(Default)]
+struct MethodNameState {
+    insns_off: usize,
+    /// Synthetic name → register that claimed it first.
+    owners: HashMap<String, u32>,
+    /// Web → name chosen for a reused parameter register.
+    web_names: HashMap<DefKey, String>,
 }
 
 impl<'a> Decompiler<'a> {
@@ -443,6 +460,9 @@ impl<'a> Decompiler<'a> {
             method_return_type: RefCell::new(None),
             field_type_index: RefCell::new(None),
             method_return_index: RefCell::new(None),
+            method_webs: RefCell::new(None),
+            method_names: RefCell::new(MethodNameState::default()),
+            call_return_types: RefCell::new(HashMap::new()),
         }
     }
 
@@ -475,6 +495,9 @@ impl<'a> Decompiler<'a> {
             method_return_type: RefCell::new(None),
             field_type_index: RefCell::new(None),
             method_return_index: RefCell::new(None),
+            method_webs: RefCell::new(None),
+            method_names: RefCell::new(MethodNameState::default()),
+            call_return_types: RefCell::new(HashMap::new()),
         }
     }
 
