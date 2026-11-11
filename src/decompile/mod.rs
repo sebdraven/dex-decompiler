@@ -1555,7 +1555,26 @@ impl<'a> Decompiler<'a> {
                 cached.clone()
             } else {
                 let code = self.dex.get_code_item(encoded.code_off).ok()?;
-                let b = self.decompile_method_body(&code, &encoded, None).ok()?;
+                // The lambda body is decompiled in the middle of the enclosing method:
+                // keep the enclosing method's per-register state.
+                let saved_types = self.method_reg_types.borrow_mut().take();
+                let saved_names = self.method_reg_names.borrow_mut().take();
+                let saved_debug = self.method_debug_types.borrow_mut().take();
+                let saved_return = self.method_return_type.borrow_mut().take();
+                let saved_phi = std::mem::take(&mut *self.phi_regs.borrow_mut());
+                let saved_webs = self.method_webs.borrow_mut().take();
+                let saved_method_names = std::mem::take(&mut *self.method_names.borrow_mut());
+                let saved_call_returns = std::mem::take(&mut *self.call_return_types.borrow_mut());
+                let b = self.decompile_method_body(&code, &encoded, None).ok();
+                *self.method_reg_types.borrow_mut() = saved_types;
+                *self.method_reg_names.borrow_mut() = saved_names;
+                *self.method_debug_types.borrow_mut() = saved_debug;
+                *self.method_return_type.borrow_mut() = saved_return;
+                *self.phi_regs.borrow_mut() = saved_phi;
+                *self.method_webs.borrow_mut() = saved_webs;
+                *self.method_names.borrow_mut() = saved_method_names;
+                *self.call_return_types.borrow_mut() = saved_call_returns;
+                let b = b?;
                 cache.insert(cache_key, b.clone());
                 b
             }
