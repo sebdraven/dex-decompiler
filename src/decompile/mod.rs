@@ -222,6 +222,65 @@ fn is_signature_style_name(s: &str) -> bool {
         )
 }
 
+/// `prefix + digits` names minted by `name_for_var` / `param_display_name` (`s0`, `obj3`).
+fn is_counter_name(name: &str) -> bool {
+    let Some(at) = name.find(|c: char| c.is_ascii_digit()) else {
+        return false;
+    };
+    let (prefix, digits) = name.split_at(at);
+    digits.bytes().all(|b| b.is_ascii_digit())
+        && matches!(
+            prefix,
+            "i" | "z"
+                | "l"
+                | "s"
+                | "f"
+                | "d"
+                | "c"
+                | "p"
+                | "obj"
+                | "sb"
+                | "intent"
+                | "uri"
+                | "bundle"
+                | "ctx"
+                | "view"
+                | "cls"
+                | "arr"
+                | "ex"
+                | "list"
+                | "map"
+                | "set"
+                | "v"
+                | "local"
+        )
+}
+
+/// Register of each declared parameter. Parameters fill `[registers_size - ins_size,
+/// registers_size)`; `long` / `double` take two slots. `this` leads when `ins_size` is one
+/// more than the declared width (access flags only break a tie on malformed code).
+fn param_registers(code: &CodeItem, is_static: bool, param_types: &[String]) -> Vec<u32> {
+    let width_of = |ty: &str| if matches!(ty, "long" | "double" | "J" | "D") { 2 } else { 1 };
+    let declared: u32 = param_types.iter().map(|ty| width_of(ty.as_str())).sum();
+    let ins_size = code.ins_size as u32;
+    let has_this = if ins_size == declared + 1 {
+        true
+    } else if ins_size == declared {
+        false
+    } else {
+        !is_static
+    };
+    let mut slot = (code.registers_size as u32).saturating_sub(ins_size) + u32::from(has_this);
+    param_types
+        .iter()
+        .map(|ty| {
+            let reg = slot;
+            slot += width_of(ty.as_str());
+            reg
+        })
+        .collect()
+}
+
 fn is_java_ident(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -1892,6 +1951,7 @@ impl<'a> Decompiler<'a> {
             insns_bytes,
             class_name,
         );
+        self.seed_name_owners();
         self.rename_condition_registers(&mut cfg, &instructions, encoded, code);
         self.rename_switch_conditions(&mut cfg);
         if cfg.block_count() == 0 {
@@ -4828,6 +4888,27 @@ impl<'a> Decompiler<'a> {
                 }
             }
 
+            // Same per-web names as the emitted body (D1, D5).
+            if let Some(&branch_off) = cfg.blocks[block_id].instruction_offsets.last() {
+                self.apply_condition_web_names(&mut merged, branch_off, &local_types, encoded, code);
+            }
+            let mentioned = match &cfg.blocks[block_id].end {
+                BlockEnd::Conditional { condition, .. } => regs_mentioned_in_operands(condition),
+                _ => Vec::new(),
+            };
+            for reg in mentioned {
+                if let Some(name) = merged.get_mut(&reg) {
+                    if is_counter_name(name) {
+                        *name = self.claim_temp_name(name, reg);
+                    }
+                }
+            }
+            for (reg, name) in local_names.iter_mut() {
+                if let Some(merged_name) = merged.get(reg) {
+                    *name = merged_name.clone();
+                }
+            }
+
             if let BlockEnd::Conditional {
                 ref mut condition, ..
             } = cfg.blocks[block_id].end
@@ -5027,19 +5108,316 @@ impl<'a> Decompiler<'a> {
         }
         if self.use_debug_names && code.debug_info_off != 0 {
             if let Ok(dbg) = self.dex.debug_info_for_code(code) {
-                let param_base = registers_size.saturating_sub(ins_size);
-                let param_name_offset = if is_static { 0usize } else { 1usize };
+                let param_regs = self.declared_param_registers(encoded, code);
                 for (i, pname) in dbg.parameter_names.iter().enumerate() {
                     let Some(name) = pname.as_ref() else { continue };
                     if !is_java_ident(name) {
                         continue;
                     }
-                    let reg = param_base + param_name_offset as u32 + i as u32;
+                    let Some(&reg) = param_regs.get(i) else {
+                        continue;
+                    };
                     names_by_reg.insert(reg, name.clone());
                 }
             }
         }
         *self.method_reg_names.borrow_mut() = Some(names_by_reg);
+    }
+
+    /// Method-wide def-use webs; catch handlers are reached from their protected blocks.
+    fn prepare_def_webs(
+        &self,
+        cfg: &MethodCfg,
+        instructions: &[Instruction],
+        code: &CodeItem,
+        encoded: &EncodedMethod,
+    ) {
+        let mut cfg = cfg.clone();
+        let mut exceptional_edges = Vec::new();
+        if code.tries_size > 0 {
+            if let Some(pairs) = try_handler_pairs(self.dex.data.as_ref(), encoded.code_off, code)
+            {
+                let mut ranges = Vec::new();
+                let mut leaders = Vec::new();
+                for (try_item, handler) in pairs {
+                    let start = try_item.start_addr * 2;
+                    let end = (try_item.start_addr + try_item.insn_count as u32) * 2;
+                    let mut starts: Vec<u32> =
+                        handler.handlers.iter().map(|entry| entry.addr * 2).collect();
+                    if let Some(catch_all) = handler.catch_all_addr {
+                        starts.push(catch_all * 2);
+                    }
+                    leaders.extend(starts.iter().copied());
+                    ranges.push((start, end, starts));
+                }
+                cfg.split_at_offsets(&leaders);
+                for (start, end, starts) in ranges {
+                    exceptional_edges.extend(cfg.exceptional_edges_for_range(start, end, &starts));
+                }
+            }
+        }
+        let registers_size = code.registers_size as u32;
+        let param_base = registers_size.saturating_sub(code.ins_size as u32);
+        let entry_regs: Vec<u32> = (param_base..registers_size).collect();
+        let webs = DefWebs::build(&cfg, instructions, &exceptional_edges, &entry_regs);
+        *self.method_webs.borrow_mut() = Some((code.insns_off, webs));
+        *self.method_names.borrow_mut() = MethodNameState {
+            insns_off: code.insns_off,
+            ..MethodNameState::default()
+        };
+    }
+
+    /// Method-wide names (`prepare_method_reg_types`) own their temp names first.
+    fn seed_name_owners(&self) {
+        let mut state = self.method_names.borrow_mut();
+        if let Some(names) = self.method_reg_names.borrow().as_ref() {
+            let mut by_reg: Vec<(&u32, &String)> = names.iter().collect();
+            by_reg.sort();
+            for (reg, name) in by_reg {
+                state.owners.entry(name.clone()).or_insert(*reg);
+            }
+        }
+    }
+
+    /// Display name of each parameter register: debug name, else signature name.
+    fn param_display_names_by_reg(
+        &self,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+    ) -> HashMap<u32, String> {
+        let mut names = self.signature_param_names(encoded, code);
+        let Ok(info) = self.dex.get_method_info(encoded.method_idx) else {
+            return names;
+        };
+        let params: Vec<String> = info
+            .params
+            .iter()
+            .map(|p| java::descriptor_to_java(p))
+            .collect();
+        let is_static = (encoded.access_flags & 0x8) != 0;
+        let regs = param_registers(code, is_static, &params);
+        for (reg, debug) in regs
+            .into_iter()
+            .zip(self.debug_parameter_display_names(encoded, &params))
+        {
+            if let Some(name) = debug {
+                names.insert(reg, name);
+            }
+        }
+        names
+    }
+
+    fn declared_param_registers(&self, encoded: &EncodedMethod, code: &CodeItem) -> Vec<u32> {
+        let Ok(info) = self.dex.get_method_info(encoded.method_idx) else {
+            return Vec::new();
+        };
+        let params: Vec<String> = info
+            .params
+            .iter()
+            .map(|p| java::descriptor_to_java(p))
+            .collect();
+        param_registers(code, (encoded.access_flags & 0x8) != 0, &params)
+    }
+
+    /// Register that `instructions_to_ir` + `SsaRenamePass` give a new version for `ins`.
+    fn ir_def_reg(&self, ins: &Instruction) -> Option<u32> {
+        let m = ins.mnemonic();
+        if m.ends_with("-payload") || m.starts_with("invoke-") || m.starts_with("filled-new-array")
+        {
+            return None;
+        }
+        let ops = self.resolve_operands(ins.operands());
+        if m.starts_with("move-result") || m == "fill-array-data" {
+            return parse_one_reg(&ops);
+        }
+        if let Some((dst, _)) = parse_assign_rhs(m, &ops) {
+            return Some(dst);
+        }
+        // Raw `vA = …;` lines from `instruction_to_java` (cmp*, float/double 23x).
+        if m.starts_with("cmp") || m.ends_with("-float") || m.ends_with("-double") {
+            return parse_three_regs(&ops).map(|(dst, _, _)| dst);
+        }
+        None
+    }
+
+    /// One Java variable per def-use web (D1, D5): every definition and use of a web gets
+    /// the same name, a parameter register keeps the parameter's name only while it holds
+    /// the incoming value, and a synthetic temp name belongs to a single register.
+    fn apply_def_web_names(
+        &self,
+        name_map: &mut HashMap<VarId, String>,
+        type_map: &HashMap<VarId, String>,
+        seq: &[Instruction],
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+    ) {
+        let webs_slot = self.method_webs.borrow();
+        let Some((webs_off, webs)) = webs_slot.as_ref() else {
+            return;
+        };
+        if *webs_off != code.insns_off || self.method_names.borrow().insns_off != code.insns_off {
+            return;
+        }
+        let registers_size = code.registers_size as u32;
+        let param_base = registers_size.saturating_sub(code.ins_size as u32);
+        let param_names = self.param_display_names_by_reg(encoded, code);
+        // SSA version k of a register is its k-th IR definition in `seq`.
+        let mut defs_by_reg: HashMap<u32, Vec<u32>> = HashMap::new();
+        for ins in seq {
+            if let Some(reg) = self.ir_def_reg(ins) {
+                defs_by_reg.entry(reg).or_default().push(ins.offset as u32);
+            }
+        }
+        // Version 0 is the value read before the first definition in `seq`.
+        let incoming = |reg: u32| -> BTreeSet<u32> {
+            let first_def = defs_by_reg.get(&reg).and_then(|d| d.first().copied());
+            let probe = seq
+                .iter()
+                .map(|ins| ins.offset as u32)
+                .take_while(|off| first_def.map_or(true, |d| *off <= d))
+                .find(|off| webs.reads(*off).contains(&reg))
+                .or_else(|| seq.first().map(|ins| ins.offset as u32));
+            probe
+                .map(|off| webs.reaching(off, reg))
+                .unwrap_or_default()
+        };
+        let mut vids: Vec<VarId> = name_map.keys().copied().collect();
+        vids.sort_by_key(|v| (v.reg, v.ver));
+        for vid in vids {
+            let reg = vid.reg;
+            let defs = if vid.ver == 0 {
+                incoming(reg)
+            } else {
+                match defs_by_reg
+                    .get(&reg)
+                    .and_then(|d| d.get(vid.ver as usize - 1))
+                {
+                    Some(&off) => BTreeSet::from([off]),
+                    None => continue,
+                }
+            };
+            let web_set: BTreeSet<DefKey> = defs.iter().map(|&d| webs.web(reg, d)).collect();
+            let Some(&web) = web_set.iter().next() else {
+                continue;
+            };
+            let Some(name) = name_map.get_mut(&vid) else {
+                continue;
+            };
+            if (param_base..registers_size).contains(&reg) {
+                if defs.iter().any(|&d| webs.shares_entry(reg, d)) {
+                    if let Some(p) = param_names.get(&reg) {
+                        *name = p.clone();
+                    }
+                    continue;
+                }
+                if name.as_str() == "this"
+                    || param_names.values().any(|p| p.as_str() == name.as_str())
+                {
+                    let ty = type_map.get(&vid).map(|s| s.as_str());
+                    *name = self.web_local_name(web, reg, ty);
+                    continue;
+                }
+            }
+            if web_set.len() == 1 {
+                *name = self.web_name(web, name, reg);
+            } else if is_counter_name(name) {
+                *name = self.claim_temp_name(name, reg);
+            }
+        }
+    }
+
+    /// Names of the registers an `if` reads, aligned with the body: the reaching web's
+    /// name, the parameter's name only while the register holds the incoming value.
+    fn apply_condition_web_names(
+        &self,
+        names: &mut HashMap<u32, String>,
+        branch_off: u32,
+        types: &HashMap<u32, String>,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+    ) {
+        let webs_slot = self.method_webs.borrow();
+        let Some((webs_off, webs)) = webs_slot.as_ref() else {
+            return;
+        };
+        if *webs_off != code.insns_off || self.method_names.borrow().insns_off != code.insns_off {
+            return;
+        }
+        let registers_size = code.registers_size as u32;
+        let param_base = registers_size.saturating_sub(code.ins_size as u32);
+        let param_names = self.param_display_names_by_reg(encoded, code);
+        for &reg in webs.reads(branch_off) {
+            let defs = webs.reaching(branch_off, reg);
+            let Some(&def) = defs.iter().next() else {
+                continue;
+            };
+            let web = webs.web(reg, def);
+            let is_param = (param_base..registers_size).contains(&reg);
+            if is_param && defs.iter().any(|&d| webs.shares_entry(reg, d)) {
+                if let Some(p) = param_names.get(&reg) {
+                    names.insert(reg, p.clone());
+                }
+                continue;
+            }
+            let Some(name) = names.get(&reg).cloned() else {
+                continue;
+            };
+            let named = if is_param && (name == "this" || param_names.values().any(|p| *p == name))
+            {
+                self.web_local_name(web, reg, types.get(&reg).map(|s| s.as_str()))
+            } else {
+                self.web_name(web, &name, reg)
+            };
+            names.insert(reg, named);
+        }
+    }
+
+    /// Name shared by every definition and use of `web`: the first one named wins.
+    fn web_name(&self, web: DefKey, current: &str, reg: u32) -> String {
+        if let Some(name) = self.method_names.borrow().web_names.get(&web) {
+            return name.clone();
+        }
+        let name = if is_counter_name(current) {
+            self.claim_temp_name(current, reg)
+        } else {
+            current.to_string()
+        };
+        self.method_names
+            .borrow_mut()
+            .web_names
+            .insert(web, name.clone());
+        name
+    }
+
+    /// Name for a web that reuses a parameter register (never the parameter's name).
+    fn web_local_name(&self, web: DefKey, reg: u32, ty: Option<&str>) -> String {
+        if let Some(name) = self.method_names.borrow().web_names.get(&web) {
+            return name.clone();
+        }
+        let prefix = match ty.map(type_infer::type_prefix) {
+            None | Some("v") => "local",
+            Some(p) => p,
+        };
+        let name = self.claim_temp_name(&format!("{}{}", prefix, reg), reg);
+        self.method_names
+            .borrow_mut()
+            .web_names
+            .insert(web, name.clone());
+        name
+    }
+
+    /// The first register to use a synthetic name owns it; others get `name_rN`.
+    fn claim_temp_name(&self, name: &str, reg: u32) -> String {
+        let mut state = self.method_names.borrow_mut();
+        let owner = state.owners.get(name).copied();
+        match owner {
+            Some(owner) if owner != reg => format!("{}_r{}", name, reg),
+            Some(_) => name.to_string(),
+            None => {
+                state.owners.insert(name.to_string(), reg);
+                name.to_string()
+            }
+        }
     }
 
     /// Instruction list for a block (for method_used_regs or emit_block_instructions).
@@ -5272,20 +5650,19 @@ impl<'a> Decompiler<'a> {
         let Ok(dbg) = self.dex.debug_info_for_code(code) else {
             return;
         };
-        let registers_size = code.registers_size as u32;
-        let ins_size = code.ins_size as u32;
-        let is_static = (encoded.access_flags & 0x8) != 0;
-        let param_base = registers_size.saturating_sub(ins_size);
-        // Parameter names: skip `this` for instance methods.
-        let param_name_offset = if is_static { 0usize } else { 1usize };
+        // A parameter name belongs to the incoming value (version 0), not to a later
+        // reuse of its register; `long` / `double` parameters take two registers.
+        let param_regs = self.declared_param_registers(encoded, code);
         for (i, pname) in dbg.parameter_names.iter().enumerate() {
             let Some(name) = pname.as_ref() else { continue };
             if !is_java_ident(name) {
                 continue;
             }
-            let reg = param_base + param_name_offset as u32 + i as u32;
+            let Some(&reg) = param_regs.get(i) else {
+                continue;
+            };
             for (var, display) in name_map.iter_mut() {
-                if var.reg == reg && display.as_str() != "this" {
+                if var.reg == reg && var.ver == 0 && display.as_str() != "this" {
                     *display = name.clone();
                 }
             }
@@ -5531,6 +5908,7 @@ impl<'a> Decompiler<'a> {
             }
         }
         self.apply_signature_param_names(&mut name_map, encoded, code);
+        self.apply_def_web_names(&mut name_map, &type_map, &seq, encoded, code);
         // User renames must win over method-wide / debug names.
         self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
         for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), declared) {
