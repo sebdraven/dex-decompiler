@@ -1765,3 +1765,89 @@ mod string_switch {
         );
     }
 }
+
+/// Register reuse: a definition is inlined only into the uses it alone reaches.
+/// Bodies keep their indentation: block structure is read from it.
+mod variable_reuse {
+    use super::*;
+
+    /// D1 (001173): `"wsClient"` is stored in a branch; after the join `s0` may still
+    /// hold `this.client`, so the literal must not become the receiver.
+    #[test]
+    fn literal_stored_in_a_branch_is_not_inlined_after_the_join() {
+        let body = concat!(
+            "        s0 = this.client;\n",
+            "        if (z0) {\n",
+            "            s0 = \"wsClient\";\n",
+            "            Log.d(\"T\", s0);\n",
+            "        }\n",
+            "        s0.f();\n",
+        );
+        let out = cleanup_decompiler_artifacts(body);
+        assert!(!out.contains("\"wsClient\".f()"), "{out}");
+        assert!(out.contains("s0.f();"), "{out}");
+    }
+
+    /// D1: the loop reads, on the next iteration, the value assigned at its end.
+    #[test]
+    fn literal_assigned_in_a_loop_is_not_inlined_over_the_back_edge() {
+        let body = concat!(
+            "        s0 = this.first;\n",
+            "        while (z0) {\n",
+            "            this.use(s0);\n",
+            "            s0 = \"next\";\n",
+            "            this.log(s0);\n",
+            "        }\n",
+        );
+        let out = cleanup_decompiler_artifacts(body);
+        assert!(out.contains("this.use(s0);"), "{out}");
+        assert!(out.contains("s0 = \"next\";"), "{out}");
+    }
+
+    /// D5 (000128, 000137): a numeric literal is never a receiver (`0.x.j(…)`).
+    #[test]
+    fn numeric_literal_is_never_inlined_as_a_receiver() {
+        let body = concat!("        p0 = 0;\n", "        p0.x.j(1);\n");
+        let cleaned = cleanup_decompiler_artifacts(body);
+        assert!(!cleaned.contains("0.x"), "{cleaned}");
+        let simplified = simplify_method_body(body, false);
+        assert!(!simplified.contains("0.x"), "{simplified}");
+    }
+
+    /// D2 (001155): an undeclared temp is declared with the type of its definition.
+    #[test]
+    fn undeclared_temp_takes_the_type_of_its_definition() {
+        let body = concat!(
+            "        s4 = (android.os.PowerManager) obj0;\n",
+            "        s5 = \"alarm\";\n",
+            "        i6 = i0 + 1;\n",
+        );
+        let out = fix_undeclared_temp_assigns(body);
+        assert!(out.contains("android.os.PowerManager s4 = (android.os.PowerManager) obj0;"), "{out}");
+        assert!(out.contains("String s5 = \"alarm\";"), "{out}");
+        assert!(out.contains("int i6 = i0 + 1;"), "{out}");
+    }
+
+    /// D7 (001173 onCreate): `new` + argument set-up + `<init>` → one `new T(args)` placed
+    /// after the arguments it uses.
+    #[test]
+    fn constructor_merges_across_argument_setup() {
+        let body = concat!(
+            "        D0.K v2 = new D0.K();\n",
+            "        java.lang.StringBuilder sb0 = new java.lang.StringBuilder();\n",
+            "        sb0.<init>();\n",
+            "        sb0.append(s1);\n",
+            "        String s2 = sb0.toString();\n",
+            "        v2.<init>(s2);\n",
+        );
+        let out = merge_constructor_calls(body);
+        assert!(!out.contains("<init>"), "{out}");
+        let built = out.find("D0.K v2 = new D0.K(s2);").expect(&out);
+        let arg = out.find("String s2 = sb0.toString();").expect(&out);
+        assert!(arg < built, "{out}");
+        assert!(
+            out.contains("java.lang.StringBuilder sb0 = new java.lang.StringBuilder();"),
+            "{out}"
+        );
+    }
+}
