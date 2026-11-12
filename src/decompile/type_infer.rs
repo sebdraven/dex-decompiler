@@ -985,7 +985,8 @@ pub fn build_var_names_with_regs(
 /// Activity → View → TextView → String onto one debug name like `email`.
 fn unify_names_by_register(names: &mut HashMap<VarId, String>, type_map: &HashMap<VarId, String>) {
     // Union-find over VarIds that share a register and compatible types.
-    let vars: Vec<VarId> = names.keys().copied().collect();
+    let mut vars: Vec<VarId> = names.keys().copied().collect();
+    vars.sort();
     let mut parent: HashMap<VarId, VarId> = vars.iter().map(|v| (*v, *v)).collect();
 
     fn find(parent: &mut HashMap<VarId, VarId>, x: VarId) -> VarId {
@@ -1035,9 +1036,10 @@ fn unify_names_by_register(names: &mut HashMap<VarId, String>, type_map: &HashMa
         }
     }
 
-    // Pick best name per cluster.
+    // Pick best name per cluster; on a tie the smallest version wins.
     let mut best: HashMap<VarId, String> = HashMap::new();
-    for (vid, name) in names.iter() {
+    for vid in &vars {
+        let name = &names[vid];
         let root = find(&mut parent, *vid);
         let score = name_quality(name, type_map.get(vid).map(|s| s.as_str()));
         match best.get(&root) {
@@ -1102,7 +1104,8 @@ pub(crate) fn preferred_debug_type_for_reg<'a>(
     type_map: &'a HashMap<VarId, String>,
 ) -> Option<&'a str> {
     let mut latest: Option<(u32, &'a str)> = None;
-    let mut object_ty: Option<&'a str> = None;
+    // Several object types: the latest version's, not the map's last one.
+    let mut object_ty: Option<(u32, &'a str)> = None;
     for (var, ty) in type_map {
         if var.reg != reg {
             continue;
@@ -1111,11 +1114,11 @@ pub(crate) fn preferred_debug_type_for_reg<'a>(
         if latest.map(|(v, _)| var.ver >= v).unwrap_or(true) {
             latest = Some((var.ver, t));
         }
-        if !is_primitive_java_type(t) {
-            object_ty = Some(t);
+        if !is_primitive_java_type(t) && object_ty.map_or(true, |(v, _)| var.ver >= v) {
+            object_ty = Some((var.ver, t));
         }
     }
-    object_ty.or(latest.map(|(_, t)| t))
+    object_ty.or(latest).map(|(_, t)| t)
 }
 
 fn name_quality(name: &str, typ: Option<&str>) -> i32 {

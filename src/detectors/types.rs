@@ -998,6 +998,17 @@ pub fn method_matches_any(method_ref: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|p| method_ref.contains(p))
 }
 
+/// `invoke_method_map` entries in offset order (the map itself has no stable order).
+pub(crate) fn invokes_by_offset(owned: &ValueFlowAnalysisOwned) -> Vec<(u32, &String)> {
+    let mut invokes: Vec<(u32, &String)> = owned
+        .invoke_method_map
+        .iter()
+        .map(|(&off, method_ref)| (off, method_ref))
+        .collect();
+    invokes.sort_unstable_by_key(|&(off, _)| off);
+    invokes
+}
+
 fn fmt_hex(off: u32) -> String {
     format!("0x{off:x}")
 }
@@ -1288,9 +1299,9 @@ pub fn invoke_scan(
     patterns: &[&str],
 ) -> Vec<VulnFinding> {
     let mut findings = Vec::new();
-    for (offset, method_ref) in &owned.invoke_method_map {
+    for (offset, method_ref) in invokes_by_offset(owned) {
         if method_matches_any(method_ref, patterns) {
-            let (trace, evidence) = invoke_only_trace(owned, *offset, method_ref);
+            let (trace, evidence) = invoke_only_trace(owned, offset, method_ref);
             findings.push(VulnFinding::with_flow(
                 category,
                 class_name,
@@ -1298,7 +1309,7 @@ pub fn invoke_scan(
                 None,
                 None,
                 "",
-                *offset,
+                offset,
                 None,
                 method_ref.clone(),
                 trace,

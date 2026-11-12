@@ -77,10 +77,17 @@ impl ValueFlowAnalysisOwned {
             writes.extend(result.writes);
         }
         ValueFlowResult {
-            reads: reads.into_iter().collect(),
-            writes: writes.into_iter().collect(),
+            reads: sorted_points(reads),
+            writes: sorted_points(writes),
         }
     }
+}
+
+/// Program points in address order, not hash-set order.
+fn sorted_points(points: impl IntoIterator<Item = (u32, u32)>) -> Vec<(u32, u32)> {
+    let mut v: Vec<(u32, u32)> = points.into_iter().collect();
+    v.sort_unstable();
+    v
 }
 
 /// Per-instruction read/write sets: offset -> (regs_read, regs_written).
@@ -357,7 +364,7 @@ impl<'a> ValueFlowAnalysis<'a> {
                 }
             }
         }
-        let writes: Vec<(u32, u32)> = written_set.into_iter().collect();
+        let writes = sorted_points(written_set);
 
         // Reads: all (offset, reg) that use the value (direct use of seed or use of any copy).
         let mut read_set: HashSet<(u32, u32)> = HashSet::new();
@@ -366,7 +373,7 @@ impl<'a> ValueFlowAnalysis<'a> {
                 read_set.extend(uses.iter().copied());
             }
         }
-        let reads: Vec<(u32, u32)> = read_set.into_iter().collect();
+        let reads = sorted_points(read_set);
 
         ValueFlowResult { reads, writes }
     }
@@ -375,7 +382,7 @@ impl<'a> ValueFlowAnalysis<'a> {
     pub fn def_use(&self, def_offset: u32, def_reg: u32) -> Vec<(u32, u32)> {
         self.def_use
             .get(&(def_offset, def_reg))
-            .map(|s| s.iter().copied().collect())
+            .map(|s| sorted_points(s.iter().copied()))
             .unwrap_or_default()
     }
 
@@ -383,7 +390,7 @@ impl<'a> ValueFlowAnalysis<'a> {
     pub fn use_def(&self, use_offset: u32, use_reg: u32) -> Vec<(u32, u32)> {
         self.use_def
             .get(&(use_offset, use_reg))
-            .map(|s| s.iter().copied().collect())
+            .map(|s| sorted_points(s.iter().copied()))
             .unwrap_or_default()
     }
 }

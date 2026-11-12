@@ -3,7 +3,8 @@
 use crate::decompile::value_flow::ValueFlowAnalysisOwned;
 use crate::decompile::Decompiler;
 use crate::detectors::{
-    enrich_mas, invoke_scan, method_matches_any, source_sink_scan, MasLink, VulnFinding,
+    enrich_mas, invoke_scan, invokes_by_offset, method_matches_any, source_sink_scan, MasLink,
+    VulnFinding,
 };
 use crate::java::descriptor_to_java;
 use crate::semgrep::match_java::{PreparedPattern, TokenizedSource};
@@ -358,14 +359,14 @@ fn scan_method_prepared(
                         if want.is_empty() || method_name == want {
                             let methods: Vec<&str> =
                                 native.methods.iter().map(|s| s.as_str()).collect();
-                            for (offset, method_ref) in &owned.invoke_method_map {
+                            for (offset, method_ref) in invokes_by_offset(owned) {
                                 if method_matches_any(method_ref, &methods) {
                                     native_hit = true;
                                     findings.push(finding_from_rule(
                                         rule,
                                         class_name,
                                         method_name,
-                                        Some(*offset),
+                                        Some(offset),
                                         method_ref.clone(),
                                         "native",
                                     ));

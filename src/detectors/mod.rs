@@ -82,6 +82,7 @@ pub use types::{
     category_meta, invoke_scan, method_matches_any, source_sink_scan, CategoryMeta, VulnFinding,
     VulnTraceStep,
 };
+pub(crate) use types::invokes_by_offset;
 pub use unsafe_deserialization::scan_unsafe_deserialization;
 pub use uri_grant::scan_uri_grant;
 pub use weak_crypto::{scan_insufficient_key_length, scan_weak_crypto};

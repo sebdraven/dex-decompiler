@@ -1,7 +1,7 @@
 //! Emulator state: values, registers, heap, and snapshot types.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize, Serializer};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "value")]
@@ -77,8 +77,17 @@ pub enum HeapObjectKind {
     },
     Instance {
         class: String,
+        #[serde(serialize_with = "serialize_sorted_fields")]
         fields: HashMap<String, Value>,
     },
+}
+
+/// Serialize instance fields in key order so snapshots are stable across runs.
+fn serialize_sorted_fields<S: Serializer>(
+    fields: &HashMap<String, Value>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    fields.iter().collect::<BTreeMap<_, _>>().serialize(serializer)
 }
 
 /// A decoded instruction with offset and disassembly for the UI.

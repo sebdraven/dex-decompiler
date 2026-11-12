@@ -28,7 +28,10 @@ pub fn build_resource_name_map(
 /// Turn id → `R.type.name` into literal-token replacements for Java source.
 pub fn resource_replacements(map: &HashMap<u32, String>) -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(map.len().saturating_mul(4));
-    for (&id, name) in map {
+    // Id order: equal-length keys are then applied in the same order every run.
+    let mut ids: Vec<(&u32, &String)> = map.iter().collect();
+    ids.sort();
+    for (&id, name) in ids {
         if name.is_empty() {
             continue;
         }

@@ -7,11 +7,13 @@
 //! - `try_catch_fixtures`: strong try/catch/finally/TWR tests (DEX metadata + Java shape).
 //! - `jadx_parity`: jadx integration-test style regression (conditions/loops/switch/try/generics/inner).
 //! - `dataflow`: expected A/R, def_to_loc, du, ud, group_variables (same as androguard).
+//! - `determinism`: the same input decompiled 20 times gives the same Java.
 
 mod apk_decompiler_fixtures;
 mod control_flow;
 mod dataflow;
 mod decompiler_fixtures;
+mod determinism;
 mod equivalence;
 mod filters;
 mod fixture_harness;

@@ -3,7 +3,7 @@
 //! Used for method-level renaming. φ-nodes are stripped before Java emission;
 //! versions linked by a φ share one display name via [`phi_canonical_map`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::cfg::{BlockId, MethodCfg};
 use super::graph::Graph;
@@ -85,8 +85,8 @@ pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut HashMap<BlockId, Vec<IrStmt>>
     let df = dominance_frontiers(cfg);
     let preds = predecessors(cfg);
 
-    // Registers defined somewhere.
-    let mut all_regs: HashSet<u32> = HashSet::new();
+    // Registers defined somewhere; ordered: φ-nodes are inserted at block start in this order.
+    let mut all_regs: BTreeSet<u32> = BTreeSet::new();
     let mut def_sites: HashMap<u32, HashSet<BlockId>> = HashMap::new();
     for (&bid, stmts) in blocks.iter() {
         for r in defs_in_block(stmts) {
@@ -285,11 +285,12 @@ pub fn phi_canonical_map(blocks: &HashMap<BlockId, Vec<IrStmt>>) -> HashMap<VarI
             x
         }
     }
+    // The smallest member is the root, whatever the union order.
     fn union(parent: &mut HashMap<VarId, VarId>, a: VarId, b: VarId) {
         let ra = find(parent, a);
         let rb = find(parent, b);
         if ra != rb {
-            parent.insert(rb, ra);
+            parent.insert(ra.max(rb), ra.min(rb));
         }
     }
 
@@ -338,8 +339,10 @@ pub fn apply_canonical_names(
     name_map: &mut HashMap<VarId, String>,
     canonical: &HashMap<VarId, VarId>,
 ) {
-    // Ensure each web root has a name (prefer any existing member's name).
-    let snapshot: Vec<(VarId, String)> = name_map.iter().map(|(k, v)| (*k, v.clone())).collect();
+    // Ensure each web root has a name (prefer the smallest member's name).
+    let mut snapshot: Vec<(VarId, String)> =
+        name_map.iter().map(|(k, v)| (*k, v.clone())).collect();
+    snapshot.sort();
     for (vid, name) in &snapshot {
         if let Some(canon) = canonical.get(vid) {
             name_map.entry(*canon).or_insert_with(|| name.clone());

@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VarId {
     pub reg: u32,
     /// SSA version. Version 0 is the "unversioned" base used by the current pipeline.

@@ -49,10 +49,15 @@ impl RenameMap {
         field_names: &[String],
     ) -> Vec<(String, String)> {
         let mut replacements = Vec::new();
-        for (old_pkg, new_pkg) in &self.package {
+        // Key order: `apply_to_java` keeps this order among equal-length names.
+        let mut packages: Vec<_> = self.package.iter().collect();
+        packages.sort();
+        for (old_pkg, new_pkg) in packages {
             replacements.push((old_pkg.clone(), new_pkg.clone()));
         }
-        for (old_class, new_class) in &self.class {
+        let mut classes: Vec<_> = self.class.iter().collect();
+        classes.sort();
+        for (old_class, new_class) in classes {
             replacements.push((old_class.clone(), new_class.clone()));
             // For the class we're emitting, also replace simple name in "class SimpleName extends ..."
             if old_class == class_name {

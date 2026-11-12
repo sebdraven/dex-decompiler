@@ -828,11 +828,13 @@ impl MethodCfg {
     pub fn format_debug(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
+        let mut headers: Vec<BlockId> = self.loop_headers.iter().copied().collect();
+        headers.sort_unstable();
         let _ = writeln!(
             out,
             "blocks={} loop_headers={:?}",
             self.block_count(),
-            self.loop_headers
+            headers
         );
         for (i, b) in self.blocks.iter().enumerate() {
             let _ = writeln!(
@@ -844,8 +846,10 @@ impl MethodCfg {
             );
         }
         let _ = writeln!(out, "edges={:?}", self.successor_edges());
-        for &h in &self.loop_headers {
-            let _ = writeln!(out, "  loop {h} exits={:?}", self.loop_exit_targets(h));
+        for h in headers {
+            let mut exits: Vec<BlockId> = self.loop_exit_targets(h).into_iter().collect();
+            exits.sort_unstable();
+            let _ = writeln!(out, "  loop {h} exits={:?}", exits);
         }
         out
     }

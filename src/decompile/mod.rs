@@ -3362,11 +3362,13 @@ impl<'a> Decompiler<'a> {
         if phi_regs.is_empty() {
             return;
         }
-        let vids: Vec<VarId> = name_map
+        let mut vids: Vec<VarId> = name_map
             .keys()
             .copied()
             .filter(|v| phi_regs.contains(&v.reg))
             .collect();
+        // Pairs are merged one after another: the order decides which name spreads.
+        vids.sort();
         for i in 0..vids.len() {
             for j in (i + 1)..vids.len() {
                 let a = vids[i];
@@ -5276,10 +5278,13 @@ impl<'a> Decompiler<'a> {
         let mut regs: Vec<u32> = name_map.keys().map(|v| v.reg).collect();
         regs.sort_unstable();
         regs.dedup();
+        // Equal scores: the smallest version wins.
+        let mut entries: Vec<(&VarId, &String)> = name_map.iter().collect();
+        entries.sort();
         for reg in regs {
             let method_ty = by_reg.get(&reg).map(|s| s.as_str());
             let mut best: Option<(i32, String)> = None;
-            for (vid, name) in &name_map {
+            for &(vid, name) in &entries {
                 if vid.reg != reg {
                     continue;
                 }
@@ -8567,11 +8572,13 @@ fn polish_boolean_condition(
     if !is_java_ident(name) {
         return condition.to_string();
     }
-    let ty = local_names.iter().find_map(|(reg, n)| {
-        (n == name)
-            .then(|| local_types.get(reg).map(|t| t.as_str()))
-            .flatten()
-    });
+    // Several registers with this name: the smallest typed one.
+    let ty = local_names
+        .iter()
+        .filter(|(_, n)| n.as_str() == name)
+        .filter_map(|(reg, _)| local_types.get(reg).map(|t| (*reg, t.as_str())))
+        .min_by_key(|&(reg, _)| reg)
+        .map(|(_, t)| t);
     let ty = if looks_like_boolean_temp(name) {
         Some("boolean")
     } else {

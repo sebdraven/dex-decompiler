@@ -746,8 +746,8 @@ pub(crate) fn restore_enum_switchmap_cases(body: &str) -> String {
         }
         // If body still has assignment lines for a key, use the key that has slots.
         if switchmap_key.is_none() {
-            // Pick any key present in assignments (typical: one SwitchMap per method).
-            if let Some(((k, _), _)) = assignments.iter().next() {
+            // Typical: one SwitchMap per method; otherwise the smallest key.
+            if let Some((k, _)) = assignments.keys().min() {
                 switchmap_key = Some(k.clone());
             }
         }

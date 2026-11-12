@@ -1,7 +1,7 @@
 //! Weak WebView / deeplink host checks (contains/endsWith vs allow-list equals).
 
 use crate::decompile::value_flow::ValueFlowAnalysisOwned;
-use crate::detectors::types::{method_matches_any, VulnFinding};
+use crate::detectors::types::{invokes_by_offset, method_matches_any, VulnFinding};
 
 const WEAK_CHECKS: &[&str] = &["contains", "endsWith", "startsWith", "indexOf"];
 const HOST_APIS: &[&str] = &["getHost", "getAuthority", "Uri.getHost", "toString"];
@@ -37,7 +37,7 @@ pub fn scan_weak_host_validation(
         return Vec::new();
     }
     // Emit one finding at first weak-check invoke.
-    for (offset, method_ref) in &owned.invoke_method_map {
+    for (offset, method_ref) in invokes_by_offset(owned) {
         if method_matches_any(method_ref, WEAK_CHECKS) {
             return vec![VulnFinding::new(
                 "webview_weak_host_check",
@@ -45,7 +45,7 @@ pub fn scan_weak_host_validation(
                 method_name,
                 None,
                 method_ref.clone(),
-                *offset,
+                offset,
                 method_ref.clone(),
             )];
         }

@@ -1,7 +1,7 @@
 //! World-readable / world-writable file modes (`MODE_WORLD_*`).
 
 use crate::decompile::value_flow::ValueFlowAnalysisOwned;
-use crate::detectors::types::{method_matches_any, VulnFinding};
+use crate::detectors::types::{invokes_by_offset, method_matches_any, VulnFinding};
 
 const SINKS: &[&str] = &[
     "openFileOutput",
@@ -33,7 +33,7 @@ pub fn scan_storage_mode(
         return Vec::new();
     }
     let mut findings = Vec::new();
-    for (offset, method_ref) in &owned.invoke_method_map {
+    for (offset, method_ref) in invokes_by_offset(owned) {
         if method_matches_any(method_ref, SINKS) {
             findings.push(VulnFinding::new(
                 "world_readable_storage",
@@ -41,7 +41,7 @@ pub fn scan_storage_mode(
                 method_name,
                 None,
                 "MODE_WORLD_*",
-                *offset,
+                offset,
                 method_ref.clone(),
             ));
         }
@@ -51,7 +51,8 @@ pub fn scan_storage_mode(
         if let Some((offset, desc)) = owned
             .insn_at
             .iter()
-            .find(|(_, s)| text_mentions_world_mode(s))
+            .filter(|(_, s)| text_mentions_world_mode(s))
+            .min_by_key(|&(&o, _)| o)
             .map(|(o, s)| (*o, s.clone()))
         {
             findings.push(VulnFinding::new(
