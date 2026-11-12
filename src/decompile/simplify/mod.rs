@@ -17,7 +17,8 @@ mod tests;
 
 pub use format::simplify_synchronized_blocks;
 pub use pipeline::simplify_method_body;
-pub(crate) use pipeline::simplify_method_body_with_params;
+pub(crate) use pipeline::simplify_method_body_with_webs;
+pub(crate) use util::WebNames;
 pub use string_switch::restore_string_switch;
 pub(crate) use expr::wrap_postinc_div_try;
 

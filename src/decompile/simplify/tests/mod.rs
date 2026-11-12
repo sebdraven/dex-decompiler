@@ -1831,8 +1831,11 @@ mod variable_reuse {
     /// R2 (000128 f()): reassigning a parameter is not a declaration (`int p0 = 0;`).
     #[test]
     fn reassigned_parameter_is_not_redeclared() {
-        let params: std::collections::HashSet<String> = ["p0".to_string()].into_iter().collect();
-        let out = fix_undeclared_temp_assigns_with_params("        p0 = 0;\n", &params);
+        let webs = WebNames {
+            params: ["p0".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let out = fix_undeclared_temp_assigns_with_webs("        p0 = 0;\n", &webs);
         assert!(!out.contains("int p0"), "{out}");
         assert!(out.contains("p0 = 0;"), "{out}");
     }
@@ -1869,21 +1872,105 @@ mod variable_reuse {
     /// method's only literal.
     #[test]
     fn parameters_are_never_replaced_as_undeclared_temps() {
-        use crate::decompile::simplify::repair::repair_register_reuse_scalars_with_params;
-        let params: std::collections::HashSet<String> = ["this", "i0", "arr1", "arr2", "s1"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        use crate::decompile::simplify::repair::repair_register_reuse_scalars_with_webs;
+        let webs = WebNames {
+            params: ["this", "i0", "arr1", "arr2", "s1"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ..Default::default()
+        };
         let body = concat!(
             "        f2.e.e(arr1, \"permissions\");\n",
             "        f2.e.e(arr2, \"grantResults\");\n",
             "        super.onRequestPermissionsResult(i0, arr1, arr2);\n",
         );
-        let out = repair_register_reuse_scalars_with_params(body, &params);
+        let out = repair_register_reuse_scalars_with_webs(body, &webs);
         assert_eq!(out.trim_end(), body.trim_end(), "{out}");
         let body = concat!("        s0 = \"error\";\n", "        v0.put(s0, s1);\n");
-        let out = repair_register_reuse_scalars_with_params(body, &params);
+        let out = repair_register_reuse_scalars_with_webs(body, &webs);
         assert!(out.contains("v0.put(s0, s1);"), "{out}");
+    }
+
+    fn webs(inlinable: &[&str], frozen: &[&str]) -> WebNames {
+        let set = |names: &[&str]| -> std::collections::HashSet<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        };
+        WebNames {
+            inlinable: set(inlinable),
+            frozen: set(frozen),
+            ..Default::default()
+        }
+    }
+
+    /// S2 (001173 a()): an inlinable constant is inlined whatever the form of its name.
+    #[test]
+    fn inlinable_constant_is_inlined_whatever_its_name() {
+        let body = concat!(
+            "        String s12_r3_3 = \"Max WebSocket attempts reached, falling back to TCP\";\n",
+            "        android.util.Log.d(\"ConnectionService\", s12_r3_3);\n",
+        );
+        let webs = webs(&["s12_r3_3"], &["s12_r3_3"]);
+        let out = inline_global_literal_temps_with_webs(body, &webs);
+        assert!(
+            out.contains(
+                "android.util.Log.d(\"ConnectionService\", \"Max WebSocket attempts reached, falling back to TCP\");"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("s12_r3_3"), "{out}");
+    }
+
+    /// S2 (001155 t()): a variable assigned in the try and in the catch, read after the
+    /// join, is one web with two definitions: not inlinable, the text stays as emitted.
+    #[test]
+    fn frozen_name_across_try_and_catch_is_left_alone() {
+        use crate::decompile::simplify::repair::{
+            repair_register_reuse_scalars_with_webs, repair_self_referential_call_args_with_webs,
+        };
+        let body = concat!(
+            "        try {\n",
+            "            s1 = this.getString(i0);\n",
+            "        } catch (Exception e) {\n",
+            "            s1 = \"System Service\";\n",
+            "        }\n",
+            "        android.util.Log.d(\"T\", s1);\n",
+        );
+        let webs = webs(&[], &["s1", "e", "i0"]);
+        let out = inline_global_literal_temps_with_webs(body, &webs);
+        let out = cleanup_decompiler_artifacts_with_webs(&out, &webs);
+        let out = repair_register_reuse_scalars_with_webs(&out, &webs);
+        let out = repair_self_referential_call_args_with_webs(&out, &webs);
+        assert_eq!(out.trim_end(), body.trim_end(), "{out}");
+    }
+
+    /// S2/S4 (000128 c()): a frozen name read without definition is never replaced by a
+    /// literal; it stays visible.
+    #[test]
+    fn frozen_name_is_never_replaced_by_register_reuse_repairs() {
+        use crate::decompile::simplify::repair::repair_register_reuse_scalars_with_webs;
+        let body = concat!("        i0 = 0;\n", "        this.a(local2, local1);\n");
+        let webs = webs(&[], &["i0", "local1", "local2"]);
+        let out = repair_register_reuse_scalars_with_webs(body, &webs);
+        assert!(out.contains("this.a(local2, local1);"), "{out}");
+    }
+
+    /// S3 (000392 b()): the exception of a catch clause is never replaced by a literal.
+    #[test]
+    fn catch_variable_is_never_replaced_by_a_literal() {
+        let body = concat!(
+            "        try {\n",
+            "            s1 = \"RESP:IDIOT:STOPPED\";\n",
+            "            p0.e(s1);\n",
+            "        } catch (Exception e) {\n",
+            "            p0.e(\"RESP:IDIOT:ERROR:\" + e.getMessage());\n",
+            "        }\n",
+        );
+        let webs = webs(&["s1"], &["s1", "e"]);
+        let out = inline_global_literal_temps_with_webs(body, &webs);
+        let out = cleanup_decompiler_artifacts_with_webs(&out, &webs);
+        assert!(out.contains("p0.e(\"RESP:IDIOT:ERROR:\" + e.getMessage());"), "{out}");
+        assert!(out.contains("p0.e(\"RESP:IDIOT:STOPPED\");"), "{out}");
     }
 
     /// D7 (001173 onCreate): `new` + argument set-up + `<init>` → one `new T(args)` placed

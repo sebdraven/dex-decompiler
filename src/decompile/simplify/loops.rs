@@ -427,7 +427,7 @@ pub(crate) fn fold_array_alloc_length_sum(body: &str) -> String {
     out
 }
 
-pub(crate) fn fold_array_length_assigns(body: &str) -> String {
+pub(crate) fn fold_array_length_assigns_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
     let mut length_init_count: HashMap<String, usize> = HashMap::new();
     for line in &lines {
@@ -438,7 +438,9 @@ pub(crate) fn fold_array_length_assigns(body: &str) -> String {
     let mut folds: Vec<(String, String)> = Vec::new();
     for line in &lines {
         if let Some((var, arr)) = parse_array_length_assign(line) {
-            folds.push((var, arr));
+            if webs.may_substitute(&var) {
+                folds.push((var, arr));
+            }
         }
     }
     if folds.is_empty() {

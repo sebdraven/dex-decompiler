@@ -94,11 +94,17 @@ pub(crate) fn inline_static_field_refs(body: &str) -> String {
 ///
 /// Live ranges stop at the next assignment to the same name, so reused temps like
 /// `s0 = "…"; …; s0 = this.foo;` are handled correctly.
+#[cfg(test)]
 pub(crate) fn cleanup_decompiler_artifacts(body: &str) -> String {
+    cleanup_decompiler_artifacts_with_webs(body, &WebNames::default())
+}
+
+/// A web's name is inlined only when it is an inlinable constant, whatever its form.
+pub(crate) fn cleanup_decompiler_artifacts_with_webs(body: &str, webs: &WebNames) -> String {
     let mut current = fold_immediate_overwrites(body);
     // Cast/call chains need multiple rounds: view→cast→getText→toString.
     for _ in 0..8 {
-        let next = cleanup_decompiler_artifacts_once(&current);
+        let next = cleanup_decompiler_artifacts_once_with_webs(&current, webs);
         if next == current {
             break;
         }
@@ -183,7 +189,12 @@ pub(crate) fn fold_immediate_overwrites(body: &str) -> String {
     out
 }
 
+#[cfg(test)]
 pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
+    cleanup_decompiler_artifacts_once_with_webs(body, &WebNames::default())
+}
+
+fn cleanup_decompiler_artifacts_once_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
 
     struct InlineCand {
@@ -257,7 +268,11 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
     // *latest* live range in this pass — otherwise skipping both defs leaves a dangling use.
     let mut latest_inline_by_var: HashMap<String, usize> = HashMap::new();
     for (i, c) in cands.iter().enumerate() {
-        if !is_temp_like_name(&c.var) || c.use_count == 0 {
+        let inlinable = webs.is_inlinable(&c.var);
+        if !webs.may_substitute(&c.var)
+            || !(inlinable || is_temp_like_name(&c.var))
+            || c.use_count == 0
+        {
             continue;
         }
         if has_index_increment_after(&lines, c.def_idx, &c.var) {
@@ -271,7 +286,8 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
         }
         // Allow `i`/`j`/`k` only for filled-array sizes/indices (`new T[i]`, `a[k]=…`).
         // Never inline them into loop tests or expressions like `j++ / i`.
-        if matches!(c.var.as_str(), "i" | "j" | "k")
+        if !inlinable
+            && matches!(c.var.as_str(), "i" | "j" | "k")
             && !all_uses_are_array_index_or_size(&lines, &c.var, c.def_idx, c.end_idx)
         {
             continue;
@@ -279,11 +295,11 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
         if all_uses_are_length_member(&lines, &c.var, c.def_idx, c.end_idx) {
             continue;
         }
-        let want = c.use_count == 1 || is_cheap_literal_rhs(&c.val);
+        let want = inlinable || c.use_count == 1 || is_cheap_literal_rhs(&c.val);
         if !want {
             continue;
         }
-        if !def_reaches_uses_alone(&lines, c.def_idx, c.end_idx, &c.var)
+        if !(inlinable || def_reaches_uses_alone(&lines, c.def_idx, c.end_idx, &c.var))
             || literal_used_as_receiver(&lines, c.def_idx, c.end_idx, &c.var, &c.val)
         {
             continue;
@@ -299,7 +315,10 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
     // reuse, not stores the source kept. Only bare reassignments (not `int y =`).
     let mut bare_inline: HashSet<usize> = HashSet::new();
     for (i, c) in cands.iter().enumerate() {
-        if is_temp_like_name(&c.var) || !is_bare_reassign(lines[c.def_idx], &c.var) {
+        if !webs.may_substitute(&c.var)
+            || is_temp_like_name(&c.var)
+            || !is_bare_reassign(lines[c.def_idx], &c.var)
+        {
             continue;
         }
         let index_lit = c.use_count == 1
@@ -326,7 +345,8 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
             let used_after_def = lines[c.def_idx + 1..]
                 .iter()
                 .any(|l| ident_used_as_rvalue(l, &c.var));
-            (inline_set.contains(i) && (temp || bare_inline.contains(i)))
+            (inline_set.contains(i)
+                && (temp || bare_inline.contains(i) || webs.is_inlinable(&c.var)))
                 || (temp
                     && c.use_count == 0
                     && !used_after_def
@@ -337,6 +357,7 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
                     // Keep unused `double f = -5.0` / `float fff = -5.0f` for source fidelity.
                     && !is_typed_fp_or_long_const_decl(lines[c.def_idx]))
                 || (!temp
+                    && webs.substitution(&c.var).is_none()
                     && c.use_count == 0
                     && is_bare_reassign(lines[c.def_idx], &c.var)
                     && is_cheap_literal_rhs(&c.val))
@@ -601,7 +622,9 @@ fn only_use_is_whole_rhs(lines: &[&str], var: &str, def_idx: usize, end_idx: usi
 
 /// Inline temps assigned exactly once to a cheap literal across the whole method body.
 /// Inline temps assigned exactly once to a cheap literal across the whole method body.
-pub(crate) fn inline_global_literal_temps(body: &str) -> String {
+/// An inlinable constant is inlined whatever its name (`s12_r3_3`); another web's name
+/// never is.
+pub(crate) fn inline_global_literal_temps_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
     let mut assigns: HashMap<String, (usize, String)> = HashMap::new();
     let mut assign_counts: HashMap<String, usize> = HashMap::new();
@@ -609,20 +632,21 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
         let Some((var, val)) = parse_simple_assign_line(line) else {
             continue;
         };
-        if !is_cheap_literal_rhs(&val) {
+        if !is_cheap_literal_rhs(&val) || !webs.may_substitute(&var) {
             continue;
         }
+        let inlinable = webs.is_inlinable(&var);
         // Temps, or single-use debug consts used only as call args (`dist = 4`).
         // Do not globally inline `i`/`j`/`k` — cleanup handles filled-array
         // index/size live ranges; global inlining breaks loop tests (`while (i < j)`).
-        if matches!(var.as_str(), "i" | "j" | "k") {
+        if !inlinable && matches!(var.as_str(), "i" | "j" | "k") {
             continue;
         }
-        if !is_temp_like_name(&var) && var != "dist" {
+        if !inlinable && !is_temp_like_name(&var) && var != "dist" {
             continue;
         }
         // Keep unused `double yvwx2 = …` / float literals for source fidelity.
-        if is_typed_fp_or_long_const_decl(line) {
+        if !inlinable && is_typed_fp_or_long_const_decl(line) {
             continue;
         }
         if lines.iter().any(|l| is_index_increment(l, &var)) {
@@ -642,7 +666,7 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
             .iter()
             .enumerate()
             .any(|(j, l)| j != idx && line_kills_var(l, &var))
-            || !def_reaches_uses_alone(&lines, idx, lines.len(), &var)
+            || !(inlinable || def_reaches_uses_alone(&lines, idx, lines.len(), &var))
             || literal_used_as_receiver(&lines, idx, lines.len(), &var, &val)
         {
             continue;
@@ -707,17 +731,15 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
 /// `i = i0 + 1` / `int j = i1 + 1` after SSA unify → `i++` / `j++`.
 /// `i0 = i * i;` without a prior declaration → `int i0 = i * i;` (when inlining did not apply).
 pub(crate) fn fix_undeclared_temp_assigns(body: &str) -> String {
-    fix_undeclared_temp_assigns_with_params(body, &HashSet::new())
+    fix_undeclared_temp_assigns_with_webs(body, &WebNames::default())
 }
 
-/// `params` are declared by the signature: reassigning one is not a declaration
-/// (`p0 = 0;` must not become `int p0 = 0;`, R2).
-pub(crate) fn fix_undeclared_temp_assigns_with_params(
-    body: &str,
-    params: &HashSet<String>,
-) -> String {
+/// Parameters are declared by the signature: reassigning one is not a declaration
+/// (`p0 = 0;` must not become `int p0 = 0;`, R2). A web's name may get its missing
+/// declaration whatever its form.
+pub(crate) fn fix_undeclared_temp_assigns_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut declared: HashSet<String> = params.clone();
+    let mut declared: HashSet<String> = webs.params.clone();
     let mut out = String::new();
     for (idx, line) in lines.iter().enumerate() {
         let binding = strip_trailing_comment(line);
@@ -725,8 +747,8 @@ pub(crate) fn fix_undeclared_temp_assigns_with_params(
         let mut current = line.to_string();
         if let Some((var, rhs)) = parse_simple_assign_line(line) {
             // `i`/`j`/`k` are usually parameters or already-declared indexes — don't shadow them.
-            if is_temp_like_name(&var)
-                && !matches!(var.as_str(), "i" | "j" | "k")
+            let temp = is_temp_like_name(&var) && !matches!(var.as_str(), "i" | "j" | "k");
+            if (temp || webs.frozen.contains(&var))
                 && !declared.contains(&var)
                 && !is_simple_call_expr(&rhs)
             {

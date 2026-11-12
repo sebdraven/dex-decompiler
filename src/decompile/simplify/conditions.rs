@@ -5,10 +5,10 @@ use std::collections::{HashMap, HashSet};
 use super::util::*;
 
 /// Fold string-literal equals temps into `if` conditions and collapse `!(!x)`.
-pub(crate) fn fold_equals_into_conditions(body: &str) -> String {
+pub(crate) fn fold_equals_into_conditions_with_webs(body: &str, webs: &WebNames) -> String {
     let mut current = body.to_string();
     for _ in 0..6 {
-        let next = fold_equals_into_conditions_once(&current);
+        let next = fold_equals_into_conditions_once(&current, webs);
         let next = collapse_double_not_conditions(&next);
         if next == current {
             break;
@@ -18,7 +18,7 @@ pub(crate) fn fold_equals_into_conditions(body: &str) -> String {
     current
 }
 
-pub(crate) fn fold_equals_into_conditions_once(body: &str) -> String {
+fn fold_equals_into_conditions_once(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
     let mut skip: HashSet<usize> = HashSet::new();
     let mut replacements: HashMap<usize, String> = HashMap::new();
@@ -32,12 +32,18 @@ pub(crate) fn fold_equals_into_conditions_once(body: &str) -> String {
         let Some((bvar, equals_expr)) = parse_equals_assign(lines[i]) else {
             continue;
         };
+        if !webs.may_substitute(&bvar) {
+            continue;
+        }
         // Optional preceding lit assign used once in equals_expr.
         let mut lit_idx: Option<usize> = None;
         let mut equals_expr = equals_expr;
         if i > 0 {
             if let Some((lvar, lval)) = parse_simple_assign_line(lines[i - 1]) {
-                if is_string_literal(&lval) && ident_occurs(&equals_expr, &lvar) {
+                if is_string_literal(&lval)
+                    && webs.may_substitute(&lvar)
+                    && ident_occurs(&equals_expr, &lvar)
+                {
                     equals_expr = replace_ident_as_expr(&equals_expr, &lvar, &lval);
                     lit_idx = Some(i - 1);
                 }
@@ -520,10 +526,10 @@ pub(crate) fn flatten_else_if_once(body: &str) -> String {
 /// }
 /// ```
 /// into `if ("a".equals(uri.getScheme()) && "b".equals(uri.getHost())) { BODY }`
-pub(crate) fn merge_nested_uri_component_checks(body: &str) -> String {
+pub(crate) fn merge_nested_uri_component_checks_with_webs(body: &str, webs: &WebNames) -> String {
     let mut current = body.to_string();
     for _ in 0..4 {
-        let next = merge_nested_uri_component_checks_once(&current);
+        let next = merge_nested_uri_component_checks_once(&current, webs);
         if next == current {
             break;
         }
@@ -541,12 +547,15 @@ pub(crate) fn is_uri_component_getter(rhs: &str) -> bool {
         || r.ends_with(".getFragment()")
 }
 
-pub(crate) fn merge_nested_uri_component_checks_once(body: &str) -> String {
+fn merge_nested_uri_component_checks_once(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
     for i in 0..lines.len().saturating_sub(1) {
         let Some((var1, getter1)) = parse_simple_assign_line(lines[i]) else {
             continue;
         };
+        if !webs.may_substitute(&var1) {
+            continue;
+        }
         if !is_uri_component_getter(&getter1) {
             continue;
         }
@@ -651,7 +660,7 @@ pub(crate) fn merge_nested_uri_component_checks_once(body: &str) -> String {
 /// before reassignment (or only used in that if condition).
 /// Inline `path = uri.getPath();` into a following equals-if when `path` is not used afterward
 /// before reassignment (or only used in that if condition).
-pub(crate) fn inline_single_use_into_equals_if(body: &str) -> String {
+pub(crate) fn inline_single_use_into_equals_if_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
     let mut skip: HashSet<usize> = HashSet::new();
     let mut replacements: HashMap<usize, String> = HashMap::new();
@@ -662,6 +671,9 @@ pub(crate) fn inline_single_use_into_equals_if(body: &str) -> String {
         let Some((var, getter)) = parse_simple_assign_line(lines[i]) else {
             continue;
         };
+        if !webs.may_substitute(&var) {
+            continue;
+        }
         if !is_uri_component_getter(&getter) && !getter.contains(".getQueryParameter(") {
             continue;
         }

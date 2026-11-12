@@ -437,9 +437,22 @@ enum NameOwner {
     /// Method-wide name of a register: goes to the first of its webs that asks.
     Reg(u32),
     Web(DefKey),
+    /// `CATCH_VAR`: shared by every move-exception web, never claimed by another web.
+    Catch,
 }
 
+/// Variable of every emitted catch clause; the move-exception web takes this name.
+const CATCH_VAR: &str = "e";
+
 impl MethodNameState {
+    fn name_exception(&mut self, web: DefKey) -> String {
+        self.owners
+            .entry(CATCH_VAR.to_string())
+            .or_insert(NameOwner::Catch);
+        self.web_names.insert(web, CATCH_VAR.to_string());
+        CATCH_VAR.to_string()
+    }
+
     /// A name belongs to one web (R1). A register's method-wide name goes to the first of
     /// its webs that asks; any other web gets `name_rN`, then `name_rN_k`.
     fn claim(&mut self, name: &str, web: DefKey) -> String {
@@ -2134,9 +2147,8 @@ impl<'a> Decompiler<'a> {
             {
                 eprintln!("=== PRE-SIMPLIFY bfs ===\n{out}\n=== END PRE-SIMPLIFY ===");
             }
-            let params: Vec<String> =
-                self.param_display_names_by_reg(encoded, code).into_values().collect();
-            out = simplify::simplify_method_body_with_params(&out, is_constructor, &params);
+            let webs = self.simplify_webs(encoded, code);
+            out = simplify::simplify_method_body_with_webs(&out, is_constructor, &webs);
             out = self.wrap_caught_postinc_div(&out, &instructions, encoded, code);
             out = simplify::restore_string_switch(&out);
             if let Some(enclosing) = class_name {
@@ -3024,8 +3036,8 @@ impl<'a> Decompiler<'a> {
                 }
                 writeln!(
                     full,
-                    "            }} catch ({} e) {{",
-                    typed_handlers[re_idx].type_name
+                    "            }} catch ({} {}) {{",
+                    typed_handlers[re_idx].type_name, CATCH_VAR
                 )
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 full.push_str(&typed_handlers[re_idx].body);
@@ -3036,8 +3048,8 @@ impl<'a> Decompiler<'a> {
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 writeln!(
                     full,
-                    "        }} catch ({} e) {{",
-                    typed_handlers[ex_idx].type_name
+                    "        }} catch ({} {}) {{",
+                    typed_handlers[ex_idx].type_name, CATCH_VAR
                 )
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 full.push_str(&typed_handlers[ex_idx].body);
@@ -3053,7 +3065,7 @@ impl<'a> Decompiler<'a> {
                 }
 
                 for h in &typed_handlers {
-                    writeln!(full, "        }} catch ({} e) {{", h.type_name)
+                    writeln!(full, "        }} catch ({} {}) {{", h.type_name, CATCH_VAR)
                         .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     full.push_str(&h.body);
                     if !h.body.ends_with('\n') {
@@ -3097,7 +3109,7 @@ impl<'a> Decompiler<'a> {
                             )?;
                         }
                         let cleaned = strip_finally_exception_noise(&handler_body);
-                        writeln!(full, "        }} catch (Throwable e) {{")
+                        writeln!(full, "        }} catch (Throwable {}) {{", CATCH_VAR)
                             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                         full.push_str(&cleaned);
                         if !cleaned.ends_with('\n') {
@@ -3183,7 +3195,7 @@ impl<'a> Decompiler<'a> {
                 .get_type(type_addr.type_idx)
                 .map_err(|e| DexDecompilerError::Parse(e.to_string()))
                 .map(|d| shorten_java_names(&java::descriptor_to_java(&d)))?;
-            writeln!(out, "        }} catch ({} e) {{", type_name)
+            writeln!(out, "        }} catch ({} {}) {{", type_name, CATCH_VAR)
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             writeln!(
                 out,
@@ -3205,7 +3217,7 @@ impl<'a> Decompiler<'a> {
                 )
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             } else {
-                writeln!(out, "        }} catch (Throwable e) {{")
+                writeln!(out, "        }} catch (Throwable {}) {{", CATCH_VAR)
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 writeln!(
                     out,
@@ -3388,9 +3400,8 @@ impl<'a> Decompiler<'a> {
                 .get_method_info(encoded.method_idx)
                 .map(|info| info.name == "<init>")
                 .unwrap_or(false);
-            let params: Vec<String> =
-                self.param_display_names_by_reg(encoded, code).into_values().collect();
-            out = simplify::simplify_method_body_with_params(&out, is_constructor, &params);
+            let webs = self.simplify_webs(encoded, code);
+            out = simplify::simplify_method_body_with_webs(&out, is_constructor, &webs);
             out = simplify::restore_string_switch(&out);
             if let Some(enclosing) = class_name {
                 out = self.inline_anonymous_classes(&out, enclosing)?;
@@ -5295,6 +5306,7 @@ impl<'a> Decompiler<'a> {
     ) {
         let mut cfg = cfg.clone();
         let mut exceptional_edges = Vec::new();
+        let mut tries = Vec::new();
         if code.tries_size > 0 {
             if let Some(pairs) = try_handler_pairs(self.dex.data.as_ref(), encoded.code_off, code)
             {
@@ -5309,6 +5321,7 @@ impl<'a> Decompiler<'a> {
                         starts.push(catch_all * 2);
                     }
                     leaders.extend(starts.iter().copied());
+                    tries.push((start, end));
                     ranges.push((start, end, starts));
                 }
                 cfg.split_at_offsets(&leaders);
@@ -5320,7 +5333,8 @@ impl<'a> Decompiler<'a> {
         let registers_size = code.registers_size as u32;
         let param_base = registers_size.saturating_sub(code.ins_size as u32);
         let entry_regs: Vec<u32> = (param_base..registers_size).collect();
-        let webs = DefWebs::build(&cfg, instructions, &exceptional_edges, &entry_regs);
+        let webs = DefWebs::build(&cfg, instructions, &exceptional_edges, &entry_regs)
+            .with_tries(tries);
         *self.method_webs.borrow_mut() = Some((code.insns_off, webs));
         *self.method_names.borrow_mut() = MethodNameState {
             insns_off: code.insns_off,
@@ -5350,6 +5364,12 @@ impl<'a> Decompiler<'a> {
                     state.owners.entry(name.clone()).or_insert(NameOwner::Reg(*reg));
                 }
             }
+        }
+        if code.tries_size > 0 {
+            state
+                .owners
+                .entry(CATCH_VAR.to_string())
+                .or_insert(NameOwner::Catch);
         }
     }
 
@@ -5557,6 +5577,9 @@ impl<'a> Decompiler<'a> {
         if let Some(name) = self.method_names.borrow().web_names.get(&web) {
             return name.clone();
         }
+        if self.is_exception_web(web) {
+            return self.method_names.borrow_mut().name_exception(web);
+        }
         let reserved = self.method_names.borrow().owners.contains_key(current);
         let name = if current != "this" && (is_counter_name(current) || reserved) {
             self.claim_temp_name(current, web)
@@ -5574,6 +5597,9 @@ impl<'a> Decompiler<'a> {
     fn web_local_name(&self, web: DefKey, reg: u32, ty: Option<&str>) -> String {
         if let Some(name) = self.method_names.borrow().web_names.get(&web) {
             return name.clone();
+        }
+        if self.is_exception_web(web) {
+            return self.method_names.borrow_mut().name_exception(web);
         }
         let prefix = match ty.map(type_infer::type_prefix) {
             None | Some("v") => "local",
@@ -5605,6 +5631,112 @@ impl<'a> Decompiler<'a> {
 
     fn claim_temp_name(&self, name: &str, web: DefKey) -> String {
         self.method_names.borrow_mut().claim(name, web)
+    }
+
+    fn is_exception_web(&self, web: DefKey) -> bool {
+        self.method_webs
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, webs)| webs.is_exception_web(web))
+    }
+
+    /// What the bytecode says about the body's names: parameters, the name of every web,
+    /// and among those the single-use constants that a text pass may inline.
+    fn simplify_webs(&self, encoded: &EncodedMethod, code: &CodeItem) -> simplify::WebNames {
+        let mut names = simplify::WebNames {
+            params: self
+                .param_display_names_by_reg(encoded, code)
+                .into_values()
+                .collect(),
+            ..Default::default()
+        };
+        let webs_slot = self.method_webs.borrow();
+        let Some((webs_off, webs)) = webs_slot.as_ref() else {
+            return names;
+        };
+        let state = self.method_names.borrow();
+        if *webs_off != code.insns_off || state.insns_off != code.insns_off {
+            return names;
+        }
+        let mut webs_by_name: HashMap<&str, Vec<DefKey>> = HashMap::new();
+        for (web, name) in &state.web_names {
+            webs_by_name.entry(name.as_str()).or_default().push(*web);
+        }
+        for (name, owners) in webs_by_name {
+            if let [web] = owners.as_slice() {
+                if webs.inlinable_const(*web) && !names.params.contains(name) {
+                    names.inlinable.insert(name.to_string());
+                }
+            }
+            names.frozen.insert(name.to_string());
+        }
+        names
+    }
+
+    /// A check-cast read once, by an instruction of this block, is written at that use:
+    /// the cast keeps its variable (same web), `p1 = (T) p1;` would only retype it.
+    /// Versions follow `ir_def_reg`, as `SsaRenamePass` numbers them.
+    fn inline_single_use_casts(
+        &self,
+        stmts: Vec<IrStmt>,
+        seq: &[Instruction],
+        code: &CodeItem,
+    ) -> Vec<IrStmt> {
+        let mut casts: Vec<VarId> = Vec::new();
+        {
+            let webs_slot = self.method_webs.borrow();
+            let Some((webs_off, webs)) = webs_slot.as_ref() else {
+                return stmts;
+            };
+            if *webs_off != code.insns_off {
+                return stmts;
+            }
+            let in_seq: HashSet<u32> = seq.iter().map(|ins| ins.offset as u32).collect();
+            let mut versions: HashMap<u32, u32> = HashMap::new();
+            for ins in seq {
+                let Some(reg) = self.ir_def_reg(ins) else {
+                    continue;
+                };
+                let ver = versions.entry(reg).or_insert(0);
+                *ver += 1;
+                let off = ins.offset as u32;
+                if ins.mnemonic() == "check-cast"
+                    && webs.use_count(reg, off) == 1
+                    && webs.use_sites(reg, off).iter().all(|site| in_seq.contains(site))
+                {
+                    casts.push(VarId::new(reg, *ver));
+                }
+            }
+        }
+        let mut stmts = stmts;
+        for vid in casts {
+            let Some(at) = stmts
+                .iter()
+                .position(|s| matches!(s, IrStmt::Assign { dst, .. } if *dst == vid))
+            else {
+                continue;
+            };
+            let IrStmt::Assign {
+                rhs: IrExpr::Raw(cast),
+                ..
+            } = &stmts[at]
+            else {
+                continue;
+            };
+            let cast = cast.clone();
+            let var = format!("v{}_{}", vid.reg, vid.ver);
+            let mut replaced = false;
+            for stmt in stmts.iter_mut().skip(at + 1) {
+                if substitute_ir_var(stmt, vid, &var, &cast) {
+                    replaced = true;
+                    break;
+                }
+            }
+            if replaced {
+                stmts.remove(at);
+            }
+        }
+        stmts
     }
 
     /// Instruction list for a block (for method_used_regs or emit_block_instructions).
@@ -6019,6 +6151,7 @@ impl<'a> Decompiler<'a> {
         } else {
             self.default_pass_runner().run(stmts)
         };
+        let stmts = self.inline_single_use_casts(stmts, &seq, code);
         let mut type_map = self.infer_types_for(encoded, code, &stmts);
         if let Some(reg_types) = self.method_reg_types.borrow().as_ref() {
             let debug_types = self.method_debug_types.borrow();
@@ -8814,6 +8947,57 @@ fn try_lambda_expression_body(body: &str) -> Option<String> {
     None
 }
 
+/// Replaces the read of `vid` (`var` in IR text) in `stmt` by `expr`, parenthesized as a
+/// receiver or array (`((T) x).f()`). Whether a read was replaced.
+fn substitute_ir_var(stmt: &mut IrStmt, vid: VarId, var: &str, expr: &str) -> bool {
+    fn in_expr(e: &mut IrExpr, vid: VarId, var: &str, expr: &str) -> bool {
+        if matches!(e, IrExpr::Var(v) if *v == vid) {
+            *e = IrExpr::Raw(expr.to_string());
+            return true;
+        }
+        match e {
+            IrExpr::Call { target, args } => in_text(target, var, expr) | in_text(args, var, expr),
+            IrExpr::Raw(s) => in_text(s, var, expr),
+            IrExpr::Var(_) | IrExpr::PendingResult => false,
+        }
+    }
+    fn in_text(s: &mut String, var: &str, expr: &str) -> bool {
+        let out = ir::map_outside_literals(s.as_str(), |code| {
+            let bytes = code.as_bytes();
+            let mut out = String::with_capacity(code.len());
+            let mut last = 0;
+            for (at, _) in code.match_indices(var) {
+                let end = at + var.len();
+                let before_ok =
+                    at == 0 || !(is_ident_char(bytes[at - 1]) || bytes[at - 1] == b'.');
+                let after = bytes.get(end).copied();
+                if !before_ok || after.is_some_and(is_ident_char) {
+                    continue;
+                }
+                out.push_str(&code[last..at]);
+                if matches!(after, Some(b'.') | Some(b'[')) {
+                    out.push_str(&format!("({expr})"));
+                } else {
+                    out.push_str(expr);
+                }
+                last = end;
+            }
+            out.push_str(&code[last..]);
+            out
+        });
+        let changed = out != *s;
+        *s = out;
+        changed
+    }
+    match stmt {
+        IrStmt::Assign { rhs, .. } => in_expr(rhs, vid, var, expr),
+        IrStmt::Expr { expr: e, .. } => in_expr(e, vid, var, expr),
+        IrStmt::Return { value: Some(e), .. } => in_expr(e, vid, var, expr),
+        IrStmt::Raw(s) => in_text(s, var, expr),
+        IrStmt::Return { value: None, .. } | IrStmt::Phi { .. } => false,
+    }
+}
+
 fn replace_ident_in_body(body: &str, from: &str, to: &str) -> String {
     if from == to || from.is_empty() {
         return body.to_string();
@@ -10696,6 +10880,18 @@ mod tests {
         assert_ne!(reuse, "p0");
         assert_ne!(reuse, temp);
         assert_eq!(state.claim("p0", entry), "p0");
+    }
+
+    /// S3: every move-exception web takes the name of the emitted catch clause; any other
+    /// web asking for it gets its own name.
+    #[test]
+    fn exception_web_takes_the_catch_clause_name() {
+        let mut state = MethodNameState::default();
+        state.owners.insert(CATCH_VAR.into(), NameOwner::Catch);
+        assert_eq!(state.name_exception((1, 2)), CATCH_VAR);
+        assert_eq!(state.name_exception((3, 8)), CATCH_VAR);
+        assert_eq!(state.web_names.get(&(1, 2)).map(String::as_str), Some(CATCH_VAR));
+        assert_ne!(state.claim(CATCH_VAR, (0, 4)), CATCH_VAR);
     }
 
     #[test]

@@ -478,6 +478,39 @@ pub(crate) fn is_class_literal(s: &str) -> bool {
     ty.split('.').all(|p| !p.is_empty() && is_java_ident(p))
 }
 
+/// What the bytecode decided about the names of a body (def-use webs).
+#[derive(Default)]
+pub(crate) struct WebNames {
+    /// Parameters and `this`: defined on entry.
+    pub(crate) params: HashSet<String>,
+    /// Constants read once, in the region of their definition.
+    pub(crate) inlinable: HashSet<String>,
+    /// Name of a web: no text pass replaces it by a value unless it is inlinable.
+    pub(crate) frozen: HashSet<String>,
+}
+
+impl WebNames {
+    /// `Some(true)`: the bytecode allows replacing `name` by its value, whatever its form;
+    /// `Some(false)`: it forbids it; `None`: unknown to the webs, the text heuristics decide.
+    pub(crate) fn substitution(&self, name: &str) -> Option<bool> {
+        if self.inlinable.contains(name) {
+            Some(true)
+        } else if self.frozen.contains(name) || self.params.contains(name) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn may_substitute(&self, name: &str) -> bool {
+        self.substitution(name) != Some(false)
+    }
+
+    pub(crate) fn is_inlinable(&self, name: &str) -> bool {
+        self.substitution(name) == Some(true)
+    }
+}
+
 /// Numeric, `null`, boolean or char literal: never an object receiver (`0.x`, `null.f()`).
 /// String literals are legitimate receivers (`"RESP:".concat(s)`).
 pub(crate) fn is_non_object_literal(v: &str) -> bool {

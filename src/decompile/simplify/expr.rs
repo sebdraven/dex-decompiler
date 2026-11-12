@@ -832,10 +832,10 @@ fn strip_box_value_of(expr: &str) -> String {
 
 /// `int[] a = new int[]{1,2,3}; foo(a)` → `foo(new int[]{1,2,3})` when `a` is only used in calls
 /// (not as a row of `new T[][]{ a, … }`, which fold_2d handles).
-pub(crate) fn inline_filled_array_into_calls(body: &str) -> String {
+pub(crate) fn inline_filled_array_into_calls_with_webs(body: &str, webs: &WebNames) -> String {
     let mut current = body.to_string();
     for _ in 0..8 {
-        let next = inline_filled_array_into_calls_once(&current);
+        let next = inline_filled_array_into_calls_once(&current, webs);
         if next == current {
             break;
         }
@@ -844,13 +844,14 @@ pub(crate) fn inline_filled_array_into_calls(body: &str) -> String {
     current
 }
 
-fn inline_filled_array_into_calls_once(body: &str) -> String {
+fn inline_filled_array_into_calls_once(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
     for i in 0..lines.len() {
         let Some((var, rhs)) = parse_simple_assign_line(lines[i]) else {
             continue;
         };
-        if !is_temp_like_name(&var) || !is_filled_array_literal(&rhs) {
+        if !is_temp_like_name(&var) || !is_filled_array_literal(&rhs) || !webs.may_substitute(&var)
+        {
             continue;
         }
         let mut use_idxs: Vec<usize> = Vec::new();
