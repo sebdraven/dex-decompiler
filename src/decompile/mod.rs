@@ -430,7 +430,12 @@ struct MethodNameState {
     owners: HashMap<String, NameOwner>,
     /// Web → its name in this method.
     web_names: HashMap<DefKey, String>,
+    /// Web → Java type inferred for it in the emitted body.
+    web_types: HashMap<DefKey, String>,
 }
+
+/// Owner key for the SSA versions of a register that no web accounts for.
+const NO_WEB: u32 = u32::MAX - 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NameOwner {
@@ -607,6 +612,38 @@ impl<'a> Decompiler<'a> {
             }
         }
         types
+    }
+
+    /// Java type `reg` holds just before `off`, read off the instructions defining it;
+    /// `None` unless every reaching definition gives the same one.
+    fn def_type_at(&self, instructions: &[Instruction], off: u32, reg: u32) -> Option<String> {
+        let webs_slot = self.method_webs.borrow();
+        let (_, webs) = webs_slot.as_ref()?;
+        let mut found: Option<String> = None;
+        for def in webs.reaching(off, reg) {
+            let idx = instructions
+                .binary_search_by_key(&def, |ins| ins.offset as u32)
+                .ok()?;
+            let ty = match instructions[idx].mnemonic() {
+                "array-length" => "int".to_string(),
+                "instance-of" | "iget-boolean" | "sget-boolean" | "aget-boolean" => {
+                    "boolean".to_string()
+                }
+                "move-result" => {
+                    let invoke = &instructions[idx.checked_sub(1)?];
+                    if !invoke.mnemonic().starts_with("invoke-") {
+                        return None;
+                    }
+                    self.invoke_return_type(invoke.operands())?
+                }
+                _ => return None,
+            };
+            match &found {
+                Some(prev) if *prev != ty => return None,
+                _ => found = Some(ty),
+            }
+        }
+        found
     }
 
     /// Declared Java return type of an invoke's `method@N` operand (`None` for void).
@@ -4779,9 +4816,19 @@ impl<'a> Decompiler<'a> {
             return;
         }
         for block in &mut cfg.blocks {
+            let Some(&switch_off) = block.instruction_offsets.last() else {
+                continue;
+            };
             if let BlockEnd::Switch { condition, .. } = &mut block.end {
-                // Already folded to `arr[idx]` / `arr[vN.ordinal()]` — rename regs inside.
-                *condition = replace_register_names(condition, &names);
+                // Already folded to `arr[idx]` / `arr[vN.ordinal()]` — rename regs inside,
+                // each with the name of the web it holds at the switch.
+                let mut local = names.clone();
+                for reg in regs_mentioned_in_operands(condition) {
+                    if let Some(name) = local.get_mut(&reg) {
+                        *name = self.web_name_at(switch_off, reg, name);
+                    }
+                }
+                *condition = replace_register_names(condition, &local);
             }
         }
     }
@@ -5062,6 +5109,21 @@ impl<'a> Decompiler<'a> {
 
             // Same per-web names as the emitted body (D1, D5, R1).
             if let Some(&branch_off) = cfg.blocks[block_id].instruction_offsets.last() {
+                // The tested value's type comes from its definitions, not from the register.
+                let tested: Vec<u32> = self
+                    .method_webs
+                    .borrow()
+                    .as_ref()
+                    .map(|(_, webs)| webs.reads(branch_off).to_vec())
+                    .unwrap_or_default();
+                for reg in tested {
+                    if let Some(ty) = self.def_type_at(instructions, branch_off, reg) {
+                        local_types.insert(reg, ty);
+                        if let Some(name) = merged.get(&reg) {
+                            local_names.entry(reg).or_insert_with(|| name.clone());
+                        }
+                    }
+                }
                 self.apply_condition_web_names(&mut merged, branch_off, &local_types, encoded, code);
                 let mentioned = match &cfg.blocks[block_id].end {
                     BlockEnd::Conditional { condition, .. } => {
@@ -5326,7 +5388,11 @@ impl<'a> Decompiler<'a> {
                 }
                 cfg.split_at_offsets(&leaders);
                 for (start, end, starts) in ranges {
-                    exceptional_edges.extend(cfg.exceptional_edges_for_range(start, end, &starts));
+                    exceptional_edges.extend(
+                        cfg.exceptional_edges_for_range(start, end, &starts)
+                            .into_iter()
+                            .map(|(from, to)| (from, to, start, end)),
+                    );
                 }
             }
         }
@@ -5477,26 +5543,33 @@ impl<'a> Decompiler<'a> {
         };
         let mut vids: Vec<VarId> = name_map.keys().copied().collect();
         vids.sort_by_key(|v| (v.reg, v.ver));
+        let mut orphans: Vec<VarId> = Vec::new();
         for vid in vids {
             let reg = vid.reg;
             let defs = if vid.ver == 0 {
                 incoming(reg)
             } else {
-                match defs_by_reg
+                defs_by_reg
                     .get(&reg)
                     .and_then(|d| d.get(vid.ver as usize - 1))
-                {
-                    Some(&off) => BTreeSet::from([off]),
-                    None => continue,
-                }
+                    .map(|&off| BTreeSet::from([off]))
+                    .unwrap_or_default()
             };
             let web_set: BTreeSet<DefKey> = defs.iter().map(|&d| webs.web(reg, d)).collect();
-            let Some(&web) = web_set.iter().next() else {
-                continue;
-            };
             let Some(name) = name_map.get_mut(&vid) else {
                 continue;
             };
+            let Some(&web) = web_set.iter().next() else {
+                orphans.push(vid);
+                continue;
+            };
+            if let Some(ty) = type_map.get(&vid) {
+                self.method_names
+                    .borrow_mut()
+                    .web_types
+                    .entry(web)
+                    .or_insert_with(|| ty.clone());
+            }
             if (param_base..registers_size).contains(&reg) {
                 if defs.iter().any(|&d| webs.shares_entry(reg, d)) {
                     if let Some(p) = param_names.get(&reg) {
@@ -5521,6 +5594,15 @@ impl<'a> Decompiler<'a> {
                 Some(n) => n,
                 None => self.web_name(web, name),
             };
+        }
+        // Versions no web accounts for never take a name a web owns.
+        for vid in orphans {
+            let Some(name) = name_map.get_mut(&vid) else {
+                continue;
+            };
+            if name.as_str() != "this" && !param_names.values().any(|p| p == name.as_str()) {
+                *name = self.claim_temp_name(name, (vid.reg, NO_WEB));
+            }
         }
     }
 
@@ -5550,6 +5632,13 @@ impl<'a> Decompiler<'a> {
                 continue;
             };
             let web = webs.web(reg, def);
+            if let Some(ty) = types.get(&reg) {
+                self.method_names
+                    .borrow_mut()
+                    .web_types
+                    .entry(web)
+                    .or_insert_with(|| ty.clone());
+            }
             let is_param = (param_base..registers_size).contains(&reg);
             if is_param && defs.iter().any(|&d| webs.shares_entry(reg, d)) {
                 if let Some(p) = param_names.get(&reg) {
@@ -5570,9 +5659,8 @@ impl<'a> Decompiler<'a> {
         }
     }
 
-    /// Name shared by every definition and use of `web`: the first one named wins. A
-    /// synthetic or reserved (parameter) name must be claimed: it belongs to one web.
-    /// Copies of `this` keep `this`.
+    /// Name shared by every definition and use of `web`: the first one named wins. Every
+    /// name is claimed, synthetic or not: it belongs to one web. Copies of `this` keep `this`.
     fn web_name(&self, web: DefKey, current: &str) -> String {
         if let Some(name) = self.method_names.borrow().web_names.get(&web) {
             return name.clone();
@@ -5580,8 +5668,7 @@ impl<'a> Decompiler<'a> {
         if self.is_exception_web(web) {
             return self.method_names.borrow_mut().name_exception(web);
         }
-        let reserved = self.method_names.borrow().owners.contains_key(current);
-        let name = if current != "this" && (is_counter_name(current) || reserved) {
+        let name = if current != "this" {
             self.claim_temp_name(current, web)
         } else {
             current.to_string()
@@ -5668,7 +5755,34 @@ impl<'a> Decompiler<'a> {
                     names.inlinable.insert(name.to_string());
                 }
             }
+            let known: BTreeSet<&str> = owners
+                .iter()
+                .filter_map(|w| state.web_types.get(w).map(|t| t.as_str()))
+                .collect();
+            let ty = match known.len() {
+                1 => known.first().map(|t| shorten_type(t)),
+                0 if owners.iter().any(|w| webs.has_object_def(*w)) => Some("Object".to_string()),
+                _ => None,
+            };
+            if let Some(ty) = ty {
+                names.types.insert(name.to_string(), ty);
+            }
             names.frozen.insert(name.to_string());
+        }
+        let by_reg = self.param_display_names_by_reg(encoded, code);
+        if let Ok(info) = self.dex.get_method_info(encoded.method_idx) {
+            let param_types: Vec<String> = info
+                .params
+                .iter()
+                .map(|p| java::descriptor_to_java(p))
+                .collect();
+            let is_static = (encoded.access_flags & 0x8) != 0;
+            let regs = param_registers(code, is_static, &param_types);
+            for (reg, ty) in regs.iter().zip(&param_types) {
+                if let Some(name) = by_reg.get(reg) {
+                    names.types.insert(name.clone(), shorten_type(ty));
+                }
+            }
         }
         names
     }
@@ -8458,27 +8572,32 @@ fn polish_boolean_condition(
             .then(|| local_types.get(reg).map(|t| t.as_str()))
             .flatten()
     });
-    let is_bool = ty == Some("boolean") || looks_like_boolean_temp(name);
-    if is_bool {
-        return if is_eq {
+    let ty = if looks_like_boolean_temp(name) {
+        Some("boolean")
+    } else {
+        ty.or((!looks_like_primitive_temp(name)).then_some("Object"))
+    };
+    ty.and_then(|t| typed_zero_test(name, is_eq, t))
+        .unwrap_or_else(|| condition.to_string())
+}
+
+/// `name == 0` / `name != 0` read with the type of `name`: `!name` / `name` for a boolean,
+/// `== null` / `!= null` for a reference; `None` for another primitive.
+pub(crate) fn typed_zero_test(name: &str, is_eq: bool, ty: &str) -> Option<String> {
+    if ty.trim() == "boolean" {
+        return Some(if is_eq {
             format!("!{}", name)
         } else {
             name.to_string()
-        };
+        });
     }
-    let is_primitive_temp = looks_like_primitive_temp(name);
-    let is_ref = match ty {
-        Some(t) => is_reference_java_type(t),
-        None => !is_primitive_temp,
-    };
-    if is_ref {
-        return if is_eq {
+    is_reference_java_type(ty).then(|| {
+        if is_eq {
             format!("{} == null", name)
         } else {
             format!("{} != null", name)
-        };
-    }
-    condition.to_string()
+        }
+    })
 }
 
 fn looks_like_boolean_temp(name: &str) -> bool {
@@ -10892,6 +11011,41 @@ mod tests {
         assert_eq!(state.name_exception((3, 8)), CATCH_VAR);
         assert_eq!(state.web_names.get(&(1, 2)).map(String::as_str), Some(CATCH_VAR));
         assert_ne!(state.claim(CATCH_VAR, (0, 4)), CATCH_VAR);
+    }
+
+    /// T3 (001173 a()): three constants loaded in turn into v1, each read once, the first
+    /// one inside a try whose handler reads v1: three webs, three names.
+    #[test]
+    fn three_consts_on_one_register_get_three_names() {
+        let bytecode = [
+            0x1a, 0x01, 0x00, 0x00, // 00: const-string v1, string@0
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 04: invoke-virtual {v1}
+            0x1a, 0x01, 0x01, 0x00, // 0a: const-string v1, string@1
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 0e: invoke-virtual {v1}
+            0x12, 0x01, // 14: const/4 v1, 0
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 16: invoke-virtual {v1}
+            0x0e, 0x00, // 1c: return-void
+            0x0d, 0x00, // 1e: move-exception v0
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 20: invoke-virtual {v1}
+            0x0e, 0x00, // 26: return-void
+        ];
+        let instructions = decode_all(&bytecode, 0).unwrap();
+        let condition_for = |ins: &Instruction| format_condition(ins.mnemonic(), ins.operands());
+        let mut cfg = MethodCfg::build(&instructions, &bytecode, 0, &condition_for);
+        cfg.split_at_offsets(&[0x1e]);
+        let edges: Vec<def_webs::ExcEdge> = cfg
+            .exceptional_edges_for_range(0, 0x0a, &[0x1e])
+            .into_iter()
+            .map(|(from, to)| (from, to, 0, 0x0a))
+            .collect();
+        let webs = DefWebs::build(&cfg, &instructions, &edges, &[]);
+        let mut state = MethodNameState::default();
+        state.owners.insert("s1".into(), NameOwner::Reg(1));
+        let names: BTreeSet<String> = [0x00, 0x0a, 0x14]
+            .iter()
+            .map(|&def| state.claim("s1", webs.web(1, def)))
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
     }
 
     #[test]

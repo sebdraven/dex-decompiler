@@ -379,7 +379,7 @@ pub(crate) fn simplify_method_body_with_webs(
     // `.setJavaScriptEnabled(1)` → `.setJavaScriptEnabled(true)` for boolean-looking APIs.
     out = polish_booleanish_int_args(&out);
     // `obj == 0` / `!= 0` → null when the name looks like a reference.
-    out = polish_null_comparisons_in_body(&out);
+    out = polish_null_comparisons_in_body_with_webs(&out, webs);
     // `x instanceof T == 0/null` → `!(x instanceof T)`, then flip if-eqz skip layout.
     out = polish_instanceof_comparisons_in_body(&out);
     out = flip_negated_instanceof_if_else(&out);

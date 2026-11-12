@@ -748,9 +748,10 @@ pub(crate) fn fix_undeclared_temp_assigns_with_webs(body: &str, webs: &WebNames)
         if let Some((var, rhs)) = parse_simple_assign_line(line) {
             // `i`/`j`/`k` are usually parameters or already-declared indexes — don't shadow them.
             let temp = is_temp_like_name(&var) && !matches!(var.as_str(), "i" | "j" | "k");
+            let web_type = webs.types.get(&var).filter(|_| webs.frozen.contains(&var));
             if (temp || webs.frozen.contains(&var))
                 && !declared.contains(&var)
-                && !is_simple_call_expr(&rhs)
+                && (web_type.is_some() || !is_simple_call_expr(&rhs))
             {
                 if let Some(eq) = t.find(" = ") {
                     let lhs = t[..eq].trim();
@@ -758,8 +759,11 @@ pub(crate) fn fix_undeclared_temp_assigns_with_webs(body: &str, webs: &WebNames)
                         let indent = leading_indent(line);
                         let comment = line.get(binding.len()..).unwrap_or("");
                         let stmt = t.trim_end_matches(';');
-                        // The type comes from the definition, `int` only when nothing says otherwise (D2).
-                        let ty = evident_type_of_rhs(&rhs).unwrap_or_else(|| "int".to_string());
+                        // The web's type, else what the definition shows, `int` last (D2, T1).
+                        let ty = web_type
+                            .cloned()
+                            .or_else(|| evident_type_of_rhs(&rhs))
+                            .unwrap_or_else(|| "int".to_string());
                         current = format!("{}{} {};", indent, ty, stmt);
                         current.push_str(comment);
                     }

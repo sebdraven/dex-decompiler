@@ -1973,6 +1973,40 @@ mod variable_reuse {
         assert!(out.contains("p0.e(\"RESP:IDIOT:STOPPED\");"), "{out}");
     }
 
+    fn typed(names: &[(&str, &str)]) -> WebNames {
+        let mut webs = webs(&[], &names.iter().map(|(n, _)| *n).collect::<Vec<_>>());
+        webs.types = names
+            .iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect();
+        webs
+    }
+
+    /// T1 (001155 o()): a web's name is declared with the web's type, not `int`, even when
+    /// the definition does not show it.
+    #[test]
+    fn frozen_name_is_declared_with_its_web_type() {
+        let webs = typed(&[("s3_r0", "String")]);
+        let out = fix_undeclared_temp_assigns_with_webs("        s3_r0 = s3 + s5;\n", &webs);
+        assert!(out.contains("String s3_r0 = s3 + s5;"), "{out}");
+    }
+
+    /// T2 (001155 n(), onCreate): a zero test on a web's name follows its type: `== 0` for
+    /// an int, `!x` for a boolean, `== null` for a reference.
+    #[test]
+    fn zero_test_follows_the_web_type() {
+        let webs = typed(&[("length", "int"), ("s1_r2", "boolean"), ("obj1", "View")]);
+        let body = concat!(
+            "        if (length == 0) {\n",
+            "        if (s1_r2 == 0) {\n",
+            "        if (obj1 != 0) {\n",
+        );
+        let out = polish_null_comparisons_in_body_with_webs(body, &webs);
+        assert!(out.contains("if (length == 0) {"), "{out}");
+        assert!(out.contains("if (!s1_r2) {"), "{out}");
+        assert!(out.contains("if (obj1 != null) {"), "{out}");
+    }
+
     /// D7 (001173 onCreate): `new` + argument set-up + `<init>` → one `new T(args)` placed
     /// after the arguments it uses.
     #[test]

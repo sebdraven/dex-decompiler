@@ -810,13 +810,13 @@ pub(crate) fn polish_booleanish_int_args(body: &str) -> String {
     out
 }
 
-pub(crate) fn polish_null_comparisons_in_body(body: &str) -> String {
+pub(crate) fn polish_null_comparisons_in_body_with_webs(body: &str, webs: &WebNames) -> String {
     let mut out = String::new();
     for (idx, line) in body.lines().enumerate() {
         let mut current = line.to_string();
         // if (x == 0) / if (x != 0)
         if let Some(cond) = parse_if_condition(line) {
-            let new_cond = polish_null_in_condition(&cond);
+            let new_cond = polish_null_in_condition(&cond, webs);
             if new_cond != cond {
                 current = format!("{}if ({}) {{", leading_indent(line), new_cond);
             }
@@ -834,11 +834,20 @@ pub(crate) fn polish_null_comparisons_in_body(body: &str) -> String {
     out
 }
 
-pub(crate) fn polish_null_in_condition(cond: &str) -> String {
+/// A name the webs know is read with its type (`!z`, `x == null`), or left as `== 0`
+/// when that type is primitive or unknown; other names keep the naming heuristics.
+pub(crate) fn polish_null_in_condition(cond: &str, webs: &WebNames) -> String {
     let c = cond.trim();
     for (suf, null_suf) in [(" == 0", " == null"), (" != 0", " != null")] {
         if let Some(name) = c.strip_suffix(suf) {
             let name = name.trim();
+            if is_java_ident(name) && webs.substitution(name).is_some() {
+                return webs
+                    .types
+                    .get(name)
+                    .and_then(|ty| crate::decompile::typed_zero_test(name, suf == " == 0", ty))
+                    .unwrap_or_else(|| c.to_string());
+            }
             if is_java_ident(name)
                 && !looks_like_primitive_local(name)
                 && !looks_like_boolean_local(name)

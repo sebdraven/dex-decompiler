@@ -487,6 +487,8 @@ pub(crate) struct WebNames {
     pub(crate) inlinable: HashSet<String>,
     /// Name of a web: no text pass replaces it by a value unless it is inlinable.
     pub(crate) frozen: HashSet<String>,
+    /// Java type of a web's name or a parameter, when the bytecode tells it.
+    pub(crate) types: HashMap<String, String>,
 }
 
 impl WebNames {

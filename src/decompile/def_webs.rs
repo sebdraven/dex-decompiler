@@ -25,6 +25,7 @@ pub(crate) struct DefWebs {
     use_sites: HashMap<DefKey, Vec<u32>>,
     const_defs: HashSet<u32>,
     exception_defs: HashSet<u32>,
+    object_defs: HashSet<u32>,
     /// Catch handler entries a block belongs to; empty when it is reachable without a throw.
     handlers_of: Vec<BTreeSet<BlockId>>,
     /// Protected byte ranges `[start, end)`.
@@ -58,13 +59,17 @@ fn union(parent: &mut HashMap<DefKey, DefKey>, a: DefKey, b: DefKey) {
     }
 }
 
+/// (protected block, handler block, try start, try end): the handler is entered from any
+/// instruction of the block inside `[start, end)`.
+pub(crate) type ExcEdge = (BlockId, BlockId, u32, u32);
+
 impl DefWebs {
-    /// `exceptional_edges` connect protected blocks to handlers: every definition made
-    /// anywhere in the protected block may reach the handler.
+    /// A handler receives the definitions live just before an instruction of the try
+    /// range, never those made after its last protected instruction.
     pub(crate) fn build(
         cfg: &MethodCfg,
         instructions: &[Instruction],
-        exceptional_edges: &[(BlockId, BlockId)],
+        exceptional_edges: &[ExcEdge],
         entry_regs: &[u32],
     ) -> Self {
         let rw: HashMap<u32, (Vec<u32>, Vec<u32>)> = instructions
@@ -94,12 +99,11 @@ impl DefWebs {
                 preds[to].push(from);
             }
         }
-        let mut exc_preds: Vec<Vec<BlockId>> = vec![Vec::new(); n];
-        for &(from, to) in exceptional_edges {
-            if from < n && to < n && !exc_preds[to].contains(&from) {
-                exc_preds[to].push(from);
-            }
-        }
+        let exc_edges: Vec<ExcEdge> = exceptional_edges
+            .iter()
+            .copied()
+            .filter(|&(from, to, _, _)| from < n && to < n && from != to)
+            .collect();
         let mut succs: Vec<Vec<BlockId>> = vec![Vec::new(); n];
         for (to, from_list) in preds.iter().enumerate() {
             for &from in from_list {
@@ -117,7 +121,7 @@ impl DefWebs {
         }
         let mut handlers_of: Vec<BTreeSet<BlockId>> = vec![BTreeSet::new(); n];
         let handler_entries: BTreeSet<BlockId> =
-            exceptional_edges.iter().map(|&(_, to)| to).collect();
+            exc_edges.iter().map(|&(_, to, _, _)| to).collect();
         for &h in &handler_entries {
             let mut stack = vec![h];
             while let Some(b) = stack.pop() {
@@ -130,8 +134,21 @@ impl DefWebs {
         let mut const_defs = HashSet::new();
         let mut exception_defs = HashSet::new();
         let mut check_casts = HashSet::new();
+        let mut object_defs = HashSet::new();
         for ins in instructions {
             let off = ins.offset as u32;
+            if matches!(
+                ins.mnemonic(),
+                "const-string"
+                    | "const-string/jumbo"
+                    | "new-instance"
+                    | "move-result-object"
+                    | "iget-object"
+                    | "sget-object"
+                    | "check-cast"
+            ) {
+                object_defs.insert(off);
+            }
             match ins.mnemonic() {
                 "const" | "const/4" | "const/16" | "const-string" | "const-string/jumbo"
                 | "const-class" => {
@@ -156,7 +173,7 @@ impl DefWebs {
 
         let mut block_in: Vec<RegDefs> = vec![RegDefs::new(); n];
         let mut block_out: Vec<RegDefs> = vec![RegDefs::new(); n];
-        let mut block_all: Vec<RegDefs> = vec![RegDefs::new(); n];
+        let mut exc_out: Vec<RegDefs> = vec![RegDefs::new(); exc_edges.len()];
         let mut changed = true;
         while changed {
             changed = false;
@@ -169,23 +186,38 @@ impl DefWebs {
                 for &p in &preds[bid] {
                     merge(&mut inn, &block_out[p]);
                 }
-                for &p in &exc_preds[bid] {
-                    merge(&mut inn, &block_all[p]);
+                for (e, &(_, to, _, _)) in exc_edges.iter().enumerate() {
+                    if to == bid {
+                        merge(&mut inn, &exc_out[e]);
+                    }
                 }
+                let leaving: Vec<usize> = (0..exc_edges.len())
+                    .filter(|&e| exc_edges[e].0 == bid)
+                    .collect();
+                let mut thrown: Vec<RegDefs> = vec![RegDefs::new(); leaving.len()];
                 let mut out = inn.clone();
-                let mut all = inn.clone();
                 for off in &block_offsets[bid] {
+                    for (k, &e) in leaving.iter().enumerate() {
+                        let (_, _, start, end) = exc_edges[e];
+                        if start <= *off && *off < end {
+                            merge(&mut thrown[k], &out);
+                        }
+                    }
                     if let Some((_, writes)) = rw.get(off) {
                         for &w in writes {
                             out.insert(w, BTreeSet::from([*off]));
-                            all.entry(w).or_default().insert(*off);
                         }
                     }
                 }
-                if inn != block_in[bid] || out != block_out[bid] || all != block_all[bid] {
+                for (k, &e) in leaving.iter().enumerate() {
+                    if thrown[k] != exc_out[e] {
+                        exc_out[e] = std::mem::take(&mut thrown[k]);
+                        changed = true;
+                    }
+                }
+                if inn != block_in[bid] || out != block_out[bid] {
                     block_in[bid] = inn;
                     block_out[bid] = out;
-                    block_all[bid] = all;
                     changed = true;
                 }
             }
@@ -243,6 +275,7 @@ impl DefWebs {
             use_sites,
             const_defs,
             exception_defs,
+            object_defs,
             handlers_of,
             tries: Vec::new(),
         }
@@ -307,6 +340,13 @@ impl DefWebs {
     pub(crate) fn is_exception_web(&self, web: DefKey) -> bool {
         let mut members = self.members(web).peekable();
         members.peek().is_some() && members.all(|(_, def)| self.exception_defs.contains(&def))
+    }
+
+    /// One definition of `web` produces an object (string, new instance, object result,
+    /// object field, cast).
+    pub(crate) fn has_object_def(&self, web: DefKey) -> bool {
+        self.members(web)
+            .any(|(_, def)| self.object_defs.contains(&def))
     }
 
     /// The only definition of `web` is a constant, read once, inside the same try ranges
@@ -414,8 +454,35 @@ mod tests {
         let instructions = dex_bytecode::decode_all(bytecode, 0).expect("decode");
         let mut cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_no_branch);
         cfg.split_at_offsets(&[handler]);
-        let edges = cfg.exceptional_edges_for_range(start, end, &[handler]);
+        let edges: Vec<ExcEdge> = cfg
+            .exceptional_edges_for_range(start, end, &[handler])
+            .into_iter()
+            .map(|(from, to)| (from, to, start, end))
+            .collect();
         DefWebs::build(&cfg, &instructions, &edges, &[]).with_tries(vec![(start, end)])
+    }
+
+    /// T3 (001173 a()): three constants loaded in turn into v1, each read once. The try
+    /// covers only the first; its handler reads v1. Only the first constant can reach the
+    /// handler, so the three stay three webs.
+    #[test]
+    fn values_set_after_the_try_range_never_reach_its_handler() {
+        let bytecode = [
+            0x1a, 0x01, 0x00, 0x00, // 0: const-string v1, string@0
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 4: invoke-virtual {v1}
+            0x1a, 0x01, 0x01, 0x00, // 10: const-string v1, string@1
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 14: invoke-virtual {v1}
+            0x12, 0x01, // 20: const/4 v1, 0
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 22: invoke-virtual {v1}
+            0x0e, 0x00, // 28: return-void
+            0x0d, 0x00, // 30: move-exception v0
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 32: invoke-virtual {v1}
+            0x0e, 0x00, // 38: return-void
+        ];
+        let w = webs_with_try(&bytecode, 0, 10, 30);
+        assert_eq!(w.reaching(32, 1), BTreeSet::from([0]));
+        let webs: BTreeSet<DefKey> = [0, 10, 20].iter().map(|&d| w.web(1, d)).collect();
+        assert_eq!(webs.len(), 3);
     }
 
     /// S1 (000128 c()): a cast parameter is still the parameter: same web as the entry
