@@ -500,23 +500,13 @@ fn enclosing_loop_header(lines: &[&str], idx: usize) -> Option<usize> {
 
 /// A numeric / null / boolean / char literal can never be a receiver: `0.x`, `null.f()`.
 fn literal_used_as_receiver(lines: &[&str], def_idx: usize, end_idx: usize, var: &str, val: &str) -> bool {
-    let v = val.trim();
-    let non_object = is_numeric_literal(v)
-        || matches!(v, "null" | "true" | "false")
-        || (v.starts_with('\'') && v.ends_with('\''));
-    if !non_object {
+    if !is_non_object_literal(val) {
         return false;
     }
     let stop = (end_idx + 1).min(lines.len());
-    lines[def_idx + 1..stop].iter().any(|l| {
-        let t = strip_trailing_comment(l);
-        t.match_indices(var).any(|(at, _)| {
-            let bytes = t.as_bytes();
-            let before_ok = at == 0 || !(is_ident_byte(bytes[at - 1]) || bytes[at - 1] == b'.');
-            let next = bytes.get(at + var.len()).copied();
-            before_ok && matches!(next, Some(b'.') | Some(b'['))
-        })
-    })
+    lines[def_idx + 1..stop]
+        .iter()
+        .any(|l| ident_is_receiver(&strip_trailing_comment(l), var))
 }
 
 /// The only reads of `var` in the live range are `expr[var]` or `new T[var]`.
@@ -717,8 +707,17 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
 /// `i = i0 + 1` / `int j = i1 + 1` after SSA unify → `i++` / `j++`.
 /// `i0 = i * i;` without a prior declaration → `int i0 = i * i;` (when inlining did not apply).
 pub(crate) fn fix_undeclared_temp_assigns(body: &str) -> String {
+    fix_undeclared_temp_assigns_with_params(body, &HashSet::new())
+}
+
+/// `params` are declared by the signature: reassigning one is not a declaration
+/// (`p0 = 0;` must not become `int p0 = 0;`, R2).
+pub(crate) fn fix_undeclared_temp_assigns_with_params(
+    body: &str,
+    params: &HashSet<String>,
+) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut declared: HashSet<String> = HashSet::new();
+    let mut declared: HashSet<String> = params.clone();
     let mut out = String::new();
     for (idx, line) in lines.iter().enumerate() {
         let binding = strip_trailing_comment(line);

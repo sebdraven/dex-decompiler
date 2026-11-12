@@ -1,5 +1,6 @@
 //! Main simplify pipeline: invoke patterns + pass orchestration.
 
+use std::collections::HashSet;
 use std::fmt::Write;
 
 use super::cleanup::*;
@@ -17,6 +18,17 @@ use super::util::*;
 /// Also collapses "if (cond) { return a; } else { return b; }" into "return cond ? a : b;" (JADX-style).
 /// When `is_constructor` is true, "receiver.<init>();" (no args) is simplified to "super();".
 pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
+    simplify_method_body_with_params(body, is_constructor, &[])
+}
+
+/// `params`: parameter names (and `this`) of the method. Defined on entry, they are never
+/// treated as dropped or undeclared temps (R2, R4).
+pub fn simplify_method_body_with_params(
+    body: &str,
+    is_constructor: bool,
+    params: &[String],
+) -> String {
+    let params: HashSet<String> = params.iter().cloned().collect();
     let body = restore_synchronized_from_monitors(body);
     let body = fold_running_arithmetic(&body);
     let body = repair_self_ref_postinc_div(&body);
@@ -302,7 +314,7 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     // Remove bare "var; /* move-exception */" lines and inline single-use temps (consts / simple copies).
     out = inline_global_literal_temps(&out);
     out = repair_self_sized_new_array(&out);
-    out = repair_register_reuse_scalars(&out);
+    out = repair_register_reuse_scalars_with_params(&out, &params);
     out = repair_loop_length_index_shadow(&out);
     out = repair_loop_bound_reassigns(&out);
     out = restore_array_store_postincrement(&out);
@@ -311,7 +323,7 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     out = fold_instanceof_into_conditions(&out);
     out = cleanup_decompiler_artifacts(&out);
     out = repair_self_referential_call_args(&out);
-    out = fix_undeclared_temp_assigns(&out);
+    out = fix_undeclared_temp_assigns_with_params(&out, &params);
     // Merge `x = new T(); x.<init>(args);` → `x = new T(args);`
     out = merge_constructor_calls(&out);
     // Fold `lit; x = lit.equals(y); if (x)` and collapse `!(!z)` conditions.
@@ -379,7 +391,7 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     out = restore_counting_for_loop(&out);
     out = hoist_loop_bound_length_decl(&out);
     out = repair_missing_loop_else_break(&out);
-    out = repair_register_reuse_scalars(&out);
+    out = repair_register_reuse_scalars_with_params(&out, &params);
     // Only in constructors: simplify "receiver.<init>();" (no args) to "super();".
     if is_constructor {
         let mut simplified = String::new();
@@ -411,7 +423,7 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     }
     // Rebase indentation to consistent 4-space levels (fixes over-indented bodies).
     out = normalize_java_indent(&out);
-    out = repair_register_reuse_scalars(&out);
+    out = repair_register_reuse_scalars_with_params(&out, &params);
     out = repair_loop_length_index_shadow(&out);
     out = repair_loop_bound_reassigns(&out);
     out = restore_array_store_postincrement(&out);

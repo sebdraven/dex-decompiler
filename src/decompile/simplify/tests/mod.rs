@@ -1828,6 +1828,64 @@ mod variable_reuse {
         assert!(out.contains("int i6 = i0 + 1;"), "{out}");
     }
 
+    /// R2 (000128 f()): reassigning a parameter is not a declaration (`int p0 = 0;`).
+    #[test]
+    fn reassigned_parameter_is_not_redeclared() {
+        let params: std::collections::HashSet<String> = ["p0".to_string()].into_iter().collect();
+        let out = fix_undeclared_temp_assigns_with_params("        p0 = 0;\n", &params);
+        assert!(!out.contains("int p0"), "{out}");
+        assert!(out.contains("p0 = 0;"), "{out}");
+    }
+
+    /// R3 (001155 onCreate): `local6 = local6.edit()` never becomes `2131230978.edit()`.
+    #[test]
+    fn self_referential_repairs_never_put_a_number_as_receiver() {
+        use crate::decompile::simplify::repair::{
+            repair_register_reuse_scalars, repair_self_referential_call_args,
+        };
+        let body = concat!(
+            "        local6 = 2131230978;\n",
+            "        this.findViewById(local6);\n",
+            "        local6 = local6.edit();\n",
+        );
+        let out = repair_register_reuse_scalars(body);
+        assert!(!out.contains("2131230978.edit()"), "{out}");
+        let out = repair_self_referential_call_args(body);
+        assert!(!out.contains("2131230978.edit()"), "{out}");
+    }
+
+    /// R3: a string literal stays a legitimate receiver.
+    #[test]
+    fn string_literal_receiver_is_allowed() {
+        assert!(!is_non_object_literal("\"RESP:\""));
+        assert!(is_non_object_literal("2131230978"));
+        assert!(is_non_object_literal("null"));
+        assert!(ident_is_receiver("local6.edit()", "local6"));
+        assert!(!ident_is_receiver("this.local6", "local6"));
+    }
+
+    /// R4 (001155 onRequestPermissionsResult, 000137 b()): a parameter never assigned in the
+    /// body is not a dropped temp: `arr1` must not become `1`, `s1` must not become the
+    /// method's only literal.
+    #[test]
+    fn parameters_are_never_replaced_as_undeclared_temps() {
+        use crate::decompile::simplify::repair::repair_register_reuse_scalars_with_params;
+        let params: std::collections::HashSet<String> = ["this", "i0", "arr1", "arr2", "s1"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let body = concat!(
+            "        f2.e.e(arr1, \"permissions\");\n",
+            "        f2.e.e(arr2, \"grantResults\");\n",
+            "        super.onRequestPermissionsResult(i0, arr1, arr2);\n",
+        );
+        let out = repair_register_reuse_scalars_with_params(body, &params);
+        assert_eq!(out.trim_end(), body.trim_end(), "{out}");
+        let body = concat!("        s0 = \"error\";\n", "        v0.put(s0, s1);\n");
+        let out = repair_register_reuse_scalars_with_params(body, &params);
+        assert!(out.contains("v0.put(s0, s1);"), "{out}");
+    }
+
     /// D7 (001173 onCreate): `new` + argument set-up + `<init>` → one `new T(args)` placed
     /// after the arguments it uses.
     #[test]

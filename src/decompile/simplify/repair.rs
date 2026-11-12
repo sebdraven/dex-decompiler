@@ -204,10 +204,18 @@ pub(crate) fn repair_ssa_temp_increments(body: &str) -> String {
 }
 
 /// Fix scalar uses of names that belong to later array locals, and undeclared temps in calls.
-/// Fix scalar uses of names that belong to later array locals, and undeclared temps in calls.
 pub(crate) fn repair_register_reuse_scalars(body: &str) -> String {
+    repair_register_reuse_scalars_with_params(body, &HashSet::new())
+}
+
+/// `params`: parameter names (and `this`). They are defined on entry, so a parameter
+/// never assigned in the body is not a dropped temp (`arr1` must not become `1`, R4).
+pub(crate) fn repair_register_reuse_scalars_with_params(
+    body: &str,
+    params: &HashSet<String>,
+) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut assigned: HashSet<String> = HashSet::new();
+    let mut assigned: HashSet<String> = params.clone();
     let mut array_decls: HashMap<String, usize> = HashMap::new();
     for (i, line) in lines.iter().enumerate() {
         let binding = strip_trailing_comment(line);
@@ -284,6 +292,10 @@ pub(crate) fn repair_register_reuse_scalars(body: &str) -> String {
                             } else {
                                 None
                             }
+                        });
+                        // `local6 = local6.edit()` must not become `2131230978.edit()` (R3).
+                        let lit = lit.filter(|l| {
+                            !(is_non_object_literal(l) && ident_is_receiver(rhs, lhs_var))
                         });
                         if let Some(lit) = lit {
                             let patched = replace_ident_as_expr(rhs, lhs_var, &lit);
@@ -364,6 +376,9 @@ pub(crate) fn repair_self_referential_call_args(body: &str) -> String {
                             None
                         }
                     });
+                    // `local6 = local6.edit()` must not become `2131230978.edit()` (R3).
+                    let lit =
+                        lit.filter(|l| !(is_non_object_literal(l) && ident_is_receiver(rhs, lhs_var)));
                     if let Some(lit) = lit {
                         let patched = replace_ident_as_expr(rhs, lhs_var, &lit);
                         if patched != rhs && !patched.contains(';') {

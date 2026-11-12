@@ -478,6 +478,28 @@ pub(crate) fn is_class_literal(s: &str) -> bool {
     ty.split('.').all(|p| !p.is_empty() && is_java_ident(p))
 }
 
+/// Numeric, `null`, boolean or char literal: never an object receiver (`0.x`, `null.f()`).
+/// String literals are legitimate receivers (`"RESP:".concat(s)`).
+pub(crate) fn is_non_object_literal(v: &str) -> bool {
+    let v = v.trim();
+    is_numeric_literal(v)
+        || matches!(v, "null" | "true" | "false")
+        || (v.len() >= 3 && v.starts_with('\'') && v.ends_with('\''))
+}
+
+/// `var` is the receiver of a member access or an index in `text` (`var.f`, `var[i]`).
+pub(crate) fn ident_is_receiver(text: &str, var: &str) -> bool {
+    if var.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    text.match_indices(var).any(|(at, _)| {
+        let before_ok = at == 0 || !(is_ident_byte(bytes[at - 1]) || bytes[at - 1] == b'.');
+        let next = bytes.get(at + var.len()).copied();
+        before_ok && matches!(next, Some(b'.') | Some(b'['))
+    })
+}
+
 /// `(Type) expr` — Type starts with uppercase letter / package.
 pub(crate) fn is_numeric_literal(s: &str) -> bool {
     let s = s.trim();

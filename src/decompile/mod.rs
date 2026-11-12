@@ -34,7 +34,7 @@ pub mod value_flow;
 use crate::error::{DexDecompilerError, Result};
 use crate::java;
 use cfg::{BlockEnd, BlockId, MethodCfg};
-use def_webs::{DefKey, DefWebs};
+use def_webs::{DefKey, DefWebs, ENTRY_DEF};
 use dex_bytecode::{decode_all, Instruction};
 use dex_parser::{ClassDef, CodeItem, DexFile, EncodedMethod, NO_INDEX};
 use ir::{Expr as IrExpr, Stmt as IrStmt, VarId};
@@ -417,7 +417,7 @@ pub struct Decompiler<'a> {
     method_return_index: RefCell<Option<MethodReturnIndex>>,
     /// Def-use webs of the method being decompiled, keyed by its `insns_off`.
     method_webs: RefCell<Option<(usize, DefWebs)>>,
-    /// Per-method temp-name ownership, so two variables never share a synthetic name.
+    /// Per-method name ownership, so two variables (webs) never share a synthetic name.
     method_names: RefCell<MethodNameState>,
     /// Invoke offset (as printed in IR comments) → declared Java return type.
     call_return_types: RefCell<HashMap<u32, String>>,
@@ -426,10 +426,42 @@ pub struct Decompiler<'a> {
 #[derive(Default)]
 struct MethodNameState {
     insns_off: usize,
-    /// Synthetic name → register that claimed it first.
-    owners: HashMap<String, u32>,
-    /// Web → name chosen for a reused parameter register.
+    /// Reserved or claimed name → its single owner.
+    owners: HashMap<String, NameOwner>,
+    /// Web → its name in this method.
     web_names: HashMap<DefKey, String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameOwner {
+    /// Method-wide name of a register: goes to the first of its webs that asks.
+    Reg(u32),
+    Web(DefKey),
+}
+
+impl MethodNameState {
+    /// A name belongs to one web (R1). A register's method-wide name goes to the first of
+    /// its webs that asks; any other web gets `name_rN`, then `name_rN_k`.
+    fn claim(&mut self, name: &str, web: DefKey) -> String {
+        let mut candidate = name.to_string();
+        let mut k = 0u32;
+        loop {
+            match self.owners.get(&candidate).copied() {
+                None => break,
+                Some(NameOwner::Web(owner)) if owner == web => return candidate,
+                Some(NameOwner::Reg(reg)) if reg == web.0 => break,
+                Some(_) => {}
+            }
+            candidate = if k == 0 {
+                format!("{}_r{}", name, web.0)
+            } else {
+                format!("{}_r{}_{}", name, web.0, k)
+            };
+            k += 1;
+        }
+        self.owners.insert(candidate.clone(), NameOwner::Web(web));
+        candidate
+    }
 }
 
 impl<'a> Decompiler<'a> {
@@ -2020,7 +2052,7 @@ impl<'a> Decompiler<'a> {
             insns_bytes,
             class_name,
         );
-        self.seed_name_owners();
+        self.seed_name_owners(encoded, code);
         self.rename_condition_registers(&mut cfg, &instructions, encoded, code);
         self.rename_switch_conditions(&mut cfg);
         if cfg.block_count() == 0 {
@@ -2102,7 +2134,9 @@ impl<'a> Decompiler<'a> {
             {
                 eprintln!("=== PRE-SIMPLIFY bfs ===\n{out}\n=== END PRE-SIMPLIFY ===");
             }
-            out = simplify::simplify_method_body(&out, is_constructor);
+            let params: Vec<String> =
+                self.param_display_names_by_reg(encoded, code).into_values().collect();
+            out = simplify::simplify_method_body_with_params(&out, is_constructor, &params);
             out = self.wrap_caught_postinc_div(&out, &instructions, encoded, code);
             out = simplify::restore_string_switch(&out);
             if let Some(enclosing) = class_name {
@@ -3354,7 +3388,9 @@ impl<'a> Decompiler<'a> {
                 .get_method_info(encoded.method_idx)
                 .map(|info| info.name == "<init>")
                 .unwrap_or(false);
-            out = simplify::simplify_method_body(&out, is_constructor);
+            let params: Vec<String> =
+                self.param_display_names_by_reg(encoded, code).into_values().collect();
+            out = simplify::simplify_method_body_with_params(&out, is_constructor, &params);
             out = simplify::restore_string_switch(&out);
             if let Some(enclosing) = class_name {
                 out = self.inline_anonymous_classes(&out, enclosing)?;
@@ -5013,18 +5049,18 @@ impl<'a> Decompiler<'a> {
                 }
             }
 
-            // Same per-web names as the emitted body (D1, D5).
+            // Same per-web names as the emitted body (D1, D5, R1).
             if let Some(&branch_off) = cfg.blocks[block_id].instruction_offsets.last() {
                 self.apply_condition_web_names(&mut merged, branch_off, &local_types, encoded, code);
-            }
-            let mentioned = match &cfg.blocks[block_id].end {
-                BlockEnd::Conditional { condition, .. } => regs_mentioned_in_operands(condition),
-                _ => Vec::new(),
-            };
-            for reg in mentioned {
-                if let Some(name) = merged.get_mut(&reg) {
-                    if is_counter_name(name) {
-                        *name = self.claim_temp_name(name, reg);
+                let mentioned = match &cfg.blocks[block_id].end {
+                    BlockEnd::Conditional { condition, .. } => {
+                        regs_mentioned_in_operands(condition)
+                    }
+                    _ => Vec::new(),
+                };
+                for reg in mentioned {
+                    if let Some(name) = merged.get_mut(&reg) {
+                        *name = self.web_name_at(branch_off, reg, name);
                     }
                 }
             }
@@ -5292,14 +5328,27 @@ impl<'a> Decompiler<'a> {
         };
     }
 
-    /// Method-wide names (`prepare_method_reg_types`) own their temp names first.
-    fn seed_name_owners(&self) {
+    /// Parameter names and `this` belong to their entry web from the start (R2); the
+    /// method-wide temp names of `prepare_method_reg_types` are held for their register.
+    fn seed_name_owners(&self, encoded: &EncodedMethod, code: &CodeItem) {
+        let params = self.param_display_names_by_reg(encoded, code);
+        let webs_slot = self.method_webs.borrow();
         let mut state = self.method_names.borrow_mut();
+        if let Some((_, webs)) = webs_slot.as_ref() {
+            let mut by_reg: Vec<(&u32, &String)> = params.iter().collect();
+            by_reg.sort();
+            for (reg, name) in by_reg {
+                let entry = NameOwner::Web(webs.web(*reg, ENTRY_DEF));
+                state.owners.insert(name.clone(), entry);
+            }
+        }
         if let Some(names) = self.method_reg_names.borrow().as_ref() {
             let mut by_reg: Vec<(&u32, &String)> = names.iter().collect();
             by_reg.sort();
             for (reg, name) in by_reg {
-                state.owners.entry(name.clone()).or_insert(*reg);
+                if is_counter_name(name) {
+                    state.owners.entry(name.clone()).or_insert(NameOwner::Reg(*reg));
+                }
             }
         }
     }
@@ -5443,11 +5492,15 @@ impl<'a> Decompiler<'a> {
                     continue;
                 }
             }
-            if web_set.len() == 1 {
-                *name = self.web_name(web, name, reg);
-            } else if is_counter_name(name) {
-                *name = self.claim_temp_name(name, reg);
-            }
+            // Several webs reach (no read to probe): reuse a name one of them already has,
+            // else the name goes to the first web only.
+            let known = web_set
+                .iter()
+                .find_map(|w| self.method_names.borrow().web_names.get(w).cloned());
+            *name = match known {
+                Some(n) => n,
+                None => self.web_name(web, name),
+            };
         }
     }
 
@@ -5491,19 +5544,22 @@ impl<'a> Decompiler<'a> {
             {
                 self.web_local_name(web, reg, types.get(&reg).map(|s| s.as_str()))
             } else {
-                self.web_name(web, &name, reg)
+                self.web_name(web, &name)
             };
             names.insert(reg, named);
         }
     }
 
-    /// Name shared by every definition and use of `web`: the first one named wins.
-    fn web_name(&self, web: DefKey, current: &str, reg: u32) -> String {
+    /// Name shared by every definition and use of `web`: the first one named wins. A
+    /// synthetic or reserved (parameter) name must be claimed: it belongs to one web.
+    /// Copies of `this` keep `this`.
+    fn web_name(&self, web: DefKey, current: &str) -> String {
         if let Some(name) = self.method_names.borrow().web_names.get(&web) {
             return name.clone();
         }
-        let name = if is_counter_name(current) {
-            self.claim_temp_name(current, reg)
+        let reserved = self.method_names.borrow().owners.contains_key(current);
+        let name = if current != "this" && (is_counter_name(current) || reserved) {
+            self.claim_temp_name(current, web)
         } else {
             current.to_string()
         };
@@ -5523,7 +5579,7 @@ impl<'a> Decompiler<'a> {
             None | Some("v") => "local",
             Some(p) => p,
         };
-        let name = self.claim_temp_name(&format!("{}{}", prefix, reg), reg);
+        let name = self.claim_temp_name(&format!("{}{}", prefix, reg), web);
         self.method_names
             .borrow_mut()
             .web_names
@@ -5531,18 +5587,24 @@ impl<'a> Decompiler<'a> {
         name
     }
 
-    /// The first register to use a synthetic name owns it; others get `name_rN`.
-    fn claim_temp_name(&self, name: &str, reg: u32) -> String {
-        let mut state = self.method_names.borrow_mut();
-        let owner = state.owners.get(name).copied();
-        match owner {
-            Some(owner) if owner != reg => format!("{}_r{}", name, reg),
-            Some(_) => name.to_string(),
-            None => {
-                state.owners.insert(name.to_string(), reg);
-                name.to_string()
-            }
-        }
+    /// Name of the web `reg` holds just before `off` (operands folded into a condition).
+    fn web_name_at(&self, off: u32, reg: u32, current: &str) -> String {
+        let web = {
+            let webs_slot = self.method_webs.borrow();
+            let Some((_, webs)) = webs_slot.as_ref() else {
+                return current.to_string();
+            };
+            let defs = webs.reaching(off, reg);
+            let Some(&def) = defs.iter().next() else {
+                return current.to_string();
+            };
+            webs.web(reg, def)
+        };
+        self.web_name(web, current)
+    }
+
+    fn claim_temp_name(&self, name: &str, web: DefKey) -> String {
+        self.method_names.borrow_mut().claim(name, web)
     }
 
     /// Instruction list for a block (for method_used_regs or emit_block_instructions).
@@ -10594,6 +10656,46 @@ mod tests {
             other => panic!("expected conditional, got {other:?}"),
         }
         assert!(!cfg.folded_const_offsets.contains(&4));
+    }
+
+    /// R1: a register defined twice by two independent webs gets two names.
+    #[test]
+    fn two_webs_of_one_register_get_distinct_names() {
+        let bytecode = [
+            0x12, 0x00, // 00: const/4 v0, 0
+            0x6e, 0x10, 0x00, 0x00, 0x00, 0x00, // 02: invoke-virtual {v0}
+            0x12, 0x10, // 08: const/4 v0, 1
+            0x6e, 0x10, 0x00, 0x00, 0x00, 0x00, // 0a: invoke-virtual {v0}
+            0x0e, 0x00, // 10: return-void
+        ];
+        let instructions = decode_all(&bytecode, 0).unwrap();
+        let condition_for = |ins: &Instruction| format_condition(ins.mnemonic(), ins.operands());
+        let cfg = MethodCfg::build(&instructions, &bytecode, 0, &condition_for);
+        let webs = DefWebs::build(&cfg, &instructions, &[], &[]);
+        let (first, second) = (webs.web(0, 0), webs.web(0, 8));
+        assert_ne!(first, second);
+        let mut state = MethodNameState::default();
+        state.owners.insert("local6".into(), NameOwner::Reg(0));
+        let a = state.claim("local6", first);
+        let b = state.claim("local6", second);
+        assert_eq!(a, "local6");
+        assert_ne!(a, b);
+        assert_eq!(state.claim("local6", first), a);
+        assert_eq!(state.claim("local6", second), b);
+    }
+
+    /// R2: a temp that would take a parameter's name is renamed; the parameter keeps it.
+    #[test]
+    fn temp_never_takes_a_parameter_name() {
+        let entry: DefKey = (3, ENTRY_DEF);
+        let mut state = MethodNameState::default();
+        state.owners.insert("p0".into(), NameOwner::Web(entry));
+        let temp = state.claim("p0", (1, 4));
+        assert_ne!(temp, "p0");
+        let reuse = state.claim("p0", (3, 6));
+        assert_ne!(reuse, "p0");
+        assert_ne!(reuse, temp);
+        assert_eq!(state.claim("p0", entry), "p0");
     }
 
     #[test]
