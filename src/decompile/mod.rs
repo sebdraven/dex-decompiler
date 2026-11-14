@@ -4826,7 +4826,8 @@ impl<'a> Decompiler<'a> {
                 // Already folded to `arr[idx]` / `arr[vN.ordinal()]` — rename regs inside,
                 // each with the name of the web it holds at the switch.
                 let mut local = names.clone();
-                for reg in regs_mentioned_in_operands(condition) {
+                let mentioned = regs_mentioned_in_operands(condition);
+                for reg in self.regs_in_def_order(switch_off, mentioned) {
                     if let Some(name) = local.get_mut(&reg) {
                         *name = self.web_name_at(switch_off, reg, name);
                     }
@@ -5134,7 +5135,7 @@ impl<'a> Decompiler<'a> {
                     }
                     _ => Vec::new(),
                 };
-                for reg in mentioned {
+                for reg in self.regs_in_def_order(branch_off, mentioned) {
                     if let Some(name) = merged.get_mut(&reg) {
                         *name = self.web_name_at(branch_off, reg, name);
                     }
@@ -5274,11 +5275,20 @@ impl<'a> Decompiler<'a> {
 
         // One stable display name per register, preferring names whose SSA type matches the
         // method-level type (so `permissions` wins over a prior string temp on the same reg).
-        let mut names_by_reg: HashMap<u32, String> = HashMap::new();
-        let mut used_names: HashSet<String> = HashSet::new();
+        let mut names_by_reg: DetHashMap<u32, String> = DetHashMap::default();
+        let mut used_names: DetHashSet<String> = DetHashSet::default();
         let mut regs: Vec<u32> = name_map.keys().map(|v| v.reg).collect();
         regs.sort_unstable();
         regs.dedup();
+        // The `_N` counter below follows the bytecode: first definition address, then register.
+        let mut first_def: DetHashMap<u32, u32> = DetHashMap::default();
+        for ins in instructions {
+            let (_, writes) = read_write::instruction_reads_writes(ins.mnemonic(), ins.operands());
+            for w in writes {
+                first_def.entry(w).or_insert(ins.offset as u32);
+            }
+        }
+        regs.sort_by_key(|reg| (first_def.get(reg).copied().unwrap_or(ENTRY_DEF), *reg));
         // Equal scores: the smallest version wins.
         let mut entries: Vec<(&VarId, &String)> = name_map.iter().collect();
         entries.sort();
@@ -5547,20 +5557,26 @@ impl<'a> Decompiler<'a> {
                 .map(|off| webs.reaching(off, reg))
                 .unwrap_or_default()
         };
-        let mut vids: Vec<VarId> = name_map.keys().copied().collect();
-        vids.sort_by_key(|v| (v.reg, v.ver));
-        let mut orphans: Vec<VarId> = Vec::new();
-        for vid in vids {
-            let reg = vid.reg;
-            let defs = if vid.ver == 0 {
-                incoming(reg)
+        let defs_of = |vid: VarId| -> BTreeSet<u32> {
+            if vid.ver == 0 {
+                incoming(vid.reg)
             } else {
                 defs_by_reg
-                    .get(&reg)
+                    .get(&vid.reg)
                     .and_then(|d| d.get(vid.ver as usize - 1))
                     .map(|&off| BTreeSet::from([off]))
                     .unwrap_or_default()
-            };
+            }
+        };
+        // Names are claimed in bytecode order: definition address, then register.
+        let mut vids: Vec<(VarId, BTreeSet<u32>)> =
+            name_map.keys().map(|&vid| (vid, defs_of(vid))).collect();
+        vids.sort_by_key(|(vid, defs)| {
+            (defs.first().copied().unwrap_or(ENTRY_DEF), vid.reg, vid.ver)
+        });
+        let mut orphans: Vec<VarId> = Vec::new();
+        for (vid, defs) in vids {
+            let reg = vid.reg;
             let web_set: BTreeSet<DefKey> = defs.iter().map(|&d| webs.web(reg, d)).collect();
             let Some(name) = name_map.get_mut(&vid) else {
                 continue;
@@ -5632,7 +5648,7 @@ impl<'a> Decompiler<'a> {
         let registers_size = code.registers_size as u32;
         let param_base = registers_size.saturating_sub(code.ins_size as u32);
         let param_names = self.param_display_names_by_reg(encoded, code);
-        for &reg in webs.reads(branch_off) {
+        for reg in self.regs_in_def_order(branch_off, webs.reads(branch_off).to_vec()) {
             let defs = webs.reaching(branch_off, reg);
             let Some(&def) = defs.iter().next() else {
                 continue;
@@ -5720,6 +5736,20 @@ impl<'a> Decompiler<'a> {
             webs.web(reg, def)
         };
         self.web_name(web, current)
+    }
+
+    /// `regs` read at `off`, in the order their names are claimed: address of the reaching
+    /// definition, then register.
+    fn regs_in_def_order(&self, off: u32, mut regs: Vec<u32>) -> Vec<u32> {
+        regs.sort_unstable();
+        regs.dedup();
+        if let Some((_, webs)) = self.method_webs.borrow().as_ref() {
+            regs.sort_by_key(|&reg| {
+                let def = webs.reaching(off, reg).first().copied().unwrap_or(ENTRY_DEF);
+                (def, reg)
+            });
+        }
+        regs
     }
 
     fn claim_temp_name(&self, name: &str, web: DefKey) -> String {
