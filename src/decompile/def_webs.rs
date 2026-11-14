@@ -167,14 +167,14 @@ impl DefWebs {
                 _ => {}
             }
         }
-        let mut seed = RegDefs::new();
+        let mut seed = RegDefs::default();
         for &reg in entry_regs {
             seed.entry(reg).or_default().insert(ENTRY_DEF);
         }
 
-        let mut block_in: Vec<RegDefs> = vec![RegDefs::new(); n];
-        let mut block_out: Vec<RegDefs> = vec![RegDefs::new(); n];
-        let mut exc_out: Vec<RegDefs> = vec![RegDefs::new(); exc_edges.len()];
+        let mut block_in: Vec<RegDefs> = vec![RegDefs::default(); n];
+        let mut block_out: Vec<RegDefs> = vec![RegDefs::default(); n];
+        let mut exc_out: Vec<RegDefs> = vec![RegDefs::default(); exc_edges.len()];
         let mut changed = true;
         while changed {
             changed = false;
@@ -182,7 +182,7 @@ impl DefWebs {
                 let mut inn = if bid == cfg.entry {
                     seed.clone()
                 } else {
-                    RegDefs::new()
+                    RegDefs::default()
                 };
                 for &p in &preds[bid] {
                     merge(&mut inn, &block_out[p]);
@@ -195,7 +195,7 @@ impl DefWebs {
                 let leaving: Vec<usize> = (0..exc_edges.len())
                     .filter(|&e| exc_edges[e].0 == bid)
                     .collect();
-                let mut thrown: Vec<RegDefs> = vec![RegDefs::new(); leaving.len()];
+                let mut thrown: Vec<RegDefs> = vec![RegDefs::default(); leaving.len()];
                 let mut out = inn.clone();
                 for off in &block_offsets[bid] {
                     for (k, &e) in leaving.iter().enumerate() {
