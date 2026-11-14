@@ -52,6 +52,7 @@ use simplify::is_temp_like_name;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
+use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use type_infer::{
     build_var_names_with_regs, enrich_types_with_field_index, infer_types_cached,
     is_primitive_java_type, FieldTypeIndex, MethodReturnIndex, preferred_debug_type_for_reg,
@@ -61,6 +62,10 @@ use value_flow::{
     build_api_return_sources, build_insn_labels, build_instruction_rw_map, build_invoke_method_map,
     ValueFlowAnalysisOwned,
 };
+
+/// Hash tables with fixed keys: iteration order depends on the contents only, never on the run.
+pub(crate) type DetHashMap<K, V> = HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
+pub(crate) type DetHashSet<T> = HashSet<T, BuildHasherDefault<DefaultHasher>>;
 
 /// Decompilation strategy (jadx-inspired).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
