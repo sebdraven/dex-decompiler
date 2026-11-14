@@ -13,7 +13,8 @@ pub(super) fn decompile(bytecode: &[u8]) -> String {
 }
 
 /// Every method body of this module (determinism replays them).
-pub(super) const CASES: [&[u8]; 3] = [D1_LITERAL_JOIN, D1_MOVE_RESULT_IF, D6_FOLDED_CONST];
+pub(super) const CASES: [&[u8]; 4] =
+    [D1_LITERAL_JOIN, D1_MOVE_RESULT_IF, D6_FOLDED_CONST, CMPL_DOUBLE_IF_LTZ];
 
 const D1_LITERAL_JOIN: &[u8] = &[
     0x12, 0x01, // 00: const/4 v1, 0
@@ -40,6 +41,15 @@ const D6_FOLDED_CONST: &[u8] = &[
     0x0e, 0x00, // 06: return-void
     0xd8, 0x01, 0x00, 0x01, // 08: add-int/lit8 v1, v0, 1
     0x38, 0x01, 0x03, 0x00, // 0c: if-eqz v1, +3 -> 12
+    0x0e, 0x00, // 10: return-void
+    0x0e, 0x00, // 12: return-void
+];
+
+const CMPL_DOUBLE_IF_LTZ: &[u8] = &[
+    0x16, 0x00, 0x01, 0x00, // 00: const-wide/16 v0, 1
+    0x2f, 0x00, 0x00, 0x00, // 04: cmpl-double v0, v0, v0
+    0x3a, 0x00, 0x05, 0x00, // 08: if-ltz v0, +5 -> 12
+    0x16, 0x00, 0x02, 0x00, // 0c: const-wide/16 v0, 2
     0x0e, 0x00, // 10: return-void
     0x0e, 0x00, // 12: return-void
 ];
@@ -84,4 +94,14 @@ fn d6_constant_folded_into_if_stays_defined_for_its_other_use() {
     let java = decompile(D6_FOLDED_CONST);
     let missing = undeclared_locals(&java);
     assert!(missing.is_empty(), "undeclared {missing:?} in:\n{java}");
+}
+
+/// A cmpl-double result is `int`, although its register holds a double before and after
+/// (`float f2 = (d5 < 0.9) ? -1 : …`, `byte[] l0 = …`).
+#[test]
+fn cmp_result_is_declared_int() {
+    let java = decompile(CMPL_DOUBLE_IF_LTZ);
+    let decl = Regex::new(r"(?m)^\s*([\w.$\[\]<>]+)\s+\w+\s*=\s*\(.*\)\s*\?\s*-1\s*:").unwrap();
+    let ty = decl.captures(&java).map(|c| c[1].to_string());
+    assert_eq!(ty.as_deref(), Some("int"), "{java}");
 }

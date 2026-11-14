@@ -625,7 +625,8 @@ impl<'a> Decompiler<'a> {
                 .binary_search_by_key(&def, |ins| ins.offset as u32)
                 .ok()?;
             let ty = match instructions[idx].mnemonic() {
-                "array-length" => "int".to_string(),
+                "array-length" | "cmpl-float" | "cmpg-float" | "cmpl-double" | "cmpg-double"
+                | "cmp-long" => "int".to_string(),
                 "instance-of" | "iget-boolean" | "sget-boolean" | "aget-boolean" => {
                     "boolean".to_string()
                 }

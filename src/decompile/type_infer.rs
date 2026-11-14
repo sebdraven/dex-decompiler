@@ -167,6 +167,8 @@ pub(crate) fn infer_types_cached(
         }
     }
 
+    seed_cmp_results(&mut types, stmts);
+
     // Propagate: Assign(dst, rhs) from Var, Call, or Raw (literal / first var in text). Fixpoint.
     let max_iters = stmts.len().saturating_mul(2).max(4);
     for _ in 0..max_iters {
@@ -317,12 +319,13 @@ pub fn enrich_types_with_register_map_and_debug(
 /// (avoids rebuilding owner→field→type for every CFG block).
 pub(crate) fn enrich_types_with_field_index(
     dex: &DexFile,
-    type_map: &mut HashMap<VarId, String>,
-    reg_types: &HashMap<u32, String>,
-    debug_types: Option<&HashMap<u32, String>>,
+    type_map: &mut DetHashMap<VarId, String>,
+    reg_types: &DetHashMap<u32, String>,
+    debug_types: Option<&DetHashMap<u32, String>>,
     stmts: &[IrStmt],
     field_types: &FieldTypeIndex,
 ) {
+    seed_cmp_results(type_map, stmts);
     for stmt in stmts {
         if let IrStmt::Assign { dst, rhs, .. } = stmt {
             if let Some(dbg) = debug_types.and_then(|m| m.get(&dst.reg)) {
@@ -861,6 +864,39 @@ fn var_between(s: &str, start: usize, end: usize) -> Option<VarId> {
 
 fn var_id_at_start(s: &str) -> Option<VarId> {
     parse_var_id(s)
+}
+
+/// A cmpl/cmpg/cmp-long result is `int` at its definition, whatever else its register
+/// holds; nothing later may retype it.
+fn seed_cmp_results(types: &mut DetHashMap<VarId, String>, stmts: &[IrStmt]) {
+    for stmt in stmts {
+        if let Some(dst) = cmp_result_def(stmt) {
+            types.insert(dst, "int".to_string());
+        }
+    }
+}
+
+/// Variable defined by a raw `cmp*` line (`format_cmp`):
+/// `vA = (vB < vC) ? -1 : ((vB > vC) ? 1 : 0);` or `vA = (vB > vC) ? 1 : ((vB < vC) ? -1 : 0);`.
+fn cmp_result_def(stmt: &IrStmt) -> Option<VarId> {
+    let IrStmt::Raw(text) = stmt else {
+        return None;
+    };
+    let (lhs, rhs) = text.split_once(" = ")?;
+    let rhs = rhs.split(';').next()?.trim();
+    let is_cmp = (rhs.contains(") ? -1 : ((") && rhs.ends_with(") ? 1 : 0)"))
+        || (rhs.contains(") ? 1 : ((") && rhs.ends_with(") ? -1 : 0)"));
+    if !is_cmp {
+        return None;
+    }
+    let lhs = lhs.trim();
+    let dst = parse_var_id(lhs)?;
+    let exact = if dst.ver == 0 {
+        format!("v{}", dst.reg)
+    } else {
+        format!("v{}_{}", dst.reg, dst.ver)
+    };
+    (exact == lhs).then_some(dst)
 }
 
 fn parse_var_id(s: &str) -> Option<VarId> {
