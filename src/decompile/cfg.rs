@@ -2,7 +2,9 @@
 //! Used to emit structured Java (if/else, while/for).
 
 use dex_bytecode::{basic_blocks, explicit_successors, Instruction};
+use crate::decompile::DetHashSet;
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
 /// Parse packed/sparse-switch payload at expected offset; return (case_value, target_byte_offset) for each case.
 /// Target offset is in the same space as block start_offset (byte offset in code buffer).
@@ -599,7 +601,7 @@ impl MethodCfg {
     /// A single `move` reached by normal fallthrough and by a catch `goto` is the
     /// delayed store of `j++` (`foo4`), not a loop. The catch edge is the only back edge.
     pub fn unmark_handler_copy_joins(&mut self, instructions: &[Instruction]) {
-        let handler_blocks: HashSet<BlockId> = instructions
+        let handler_blocks: DetHashSet<BlockId> = instructions
             .iter()
             .filter(|ins| ins.mnemonic() == "move-exception")
             .filter_map(|ins| self.block_id_at_offset(ins.offset))
@@ -693,8 +695,7 @@ impl MethodCfg {
         target: BlockId,
         exclude: Option<BlockId>,
     ) -> bool {
-        use std::collections::HashSet;
-        let mut visited = HashSet::new();
+        let mut visited = DetHashSet::default();
         let mut stack = vec![start];
         while let Some(bid) = stack.pop() {
             if bid == target {
@@ -748,7 +749,7 @@ impl MethodCfg {
             .collect();
         for tail in back_edges {
             let mut stack = vec![tail];
-            let mut visited = HashSet::new();
+            let mut visited = DetHashSet::default();
             while let Some(bid) = stack.pop() {
                 if bid == header || !visited.insert(bid) {
                     continue;
@@ -789,11 +790,11 @@ impl MethodCfg {
 
     /// Walk fall-through predecessors outside the loop to include multi-block exit chains
     /// (e.g. `const/4; return` where the branch targets the return block).
-    pub fn exit_chain_head(
+    pub fn exit_chain_head<S: BuildHasher>(
         &self,
         exit: BlockId,
         loop_header: Option<BlockId>,
-        emitted: &HashSet<BlockId>,
+        emitted: &HashSet<BlockId, S>,
     ) -> BlockId {
         let mut head = exit;
         loop {
@@ -885,14 +886,14 @@ fn back_edge_sources(cfg: &MethodCfg, header: BlockId) -> Vec<BlockId> {
 /// True if `target` is reachable from a handler block without entering `avoid`.
 fn reachable_from_handlers(
     cfg: &MethodCfg,
-    handlers: &HashSet<BlockId>,
+    handlers: &DetHashSet<BlockId>,
     target: BlockId,
     avoid: BlockId,
 ) -> bool {
     if handlers.contains(&target) {
         return true;
     }
-    let mut seen = HashSet::new();
+    let mut seen = DetHashSet::default();
     let mut stack: Vec<BlockId> = handlers.iter().copied().collect();
     while let Some(bid) = stack.pop() {
         if bid == avoid || !seen.insert(bid) {

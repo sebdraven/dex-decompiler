@@ -1,6 +1,6 @@
 //! Inline temps and remove decompiler artifacts.
 
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
 
 use super::util::*;
 
@@ -118,8 +118,8 @@ pub(crate) fn cleanup_decompiler_artifacts_with_webs(body: &str, webs: &WebNames
 /// without reading it (jadx `CodeShrinkVisitor`).
 pub(crate) fn fold_immediate_overwrites(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip: HashSet<usize> = HashSet::new();
-    let mut replace: HashMap<usize, String> = HashMap::new();
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
+    let mut replace: DetHashMap<usize, String> = DetHashMap::default();
     let mut i = 0usize;
     while i + 1 < lines.len() {
         let Some((var, rhs1)) = parse_simple_assign_line(lines[i]) else {
@@ -266,7 +266,7 @@ fn cleanup_decompiler_artifacts_once_with_webs(body: &str, webs: &WebNames) -> S
     // *latest* live range in this pass — otherwise skipping both defs leaves a dangling use.
     // When the same temp name is reused (`i0 = layout; …; i0 = button;`), only inline the
     // *latest* live range in this pass — otherwise skipping both defs leaves a dangling use.
-    let mut latest_inline_by_var: HashMap<String, usize> = HashMap::new();
+    let mut latest_inline_by_var: DetHashMap<String, usize> = DetHashMap::default();
     for (i, c) in cands.iter().enumerate() {
         let inlinable = webs.is_inlinable(&c.var);
         if !webs.may_substitute(&c.var)
@@ -313,7 +313,7 @@ fn cleanup_decompiler_artifacts_once_with_webs(body: &str, webs: &WebNames) -> S
     }
     // `y = 6; arr[y] = 1` and `y = this.pouet(); this.value2 = y` are register
     // reuse, not stores the source kept. Only bare reassignments (not `int y =`).
-    let mut bare_inline: HashSet<usize> = HashSet::new();
+    let mut bare_inline: DetHashSet<usize> = DetHashSet::default();
     for (i, c) in cands.iter().enumerate() {
         if !webs.may_substitute(&c.var)
             || is_temp_like_name(&c.var)
@@ -332,12 +332,12 @@ fn cleanup_decompiler_artifacts_once_with_webs(body: &str, webs: &WebNames) -> S
             bare_inline.insert(i);
         }
     }
-    let inline_set: HashSet<usize> = latest_inline_by_var
+    let inline_set: DetHashSet<usize> = latest_inline_by_var
         .values()
         .copied()
         .chain(bare_inline.iter().copied())
         .collect();
-    let skip_indices: HashSet<usize> = cands
+    let skip_indices: DetHashSet<usize> = cands
         .iter()
         .enumerate()
         .filter(|(i, c)| {
@@ -626,8 +626,8 @@ fn only_use_is_whole_rhs(lines: &[&str], var: &str, def_idx: usize, end_idx: usi
 /// never is.
 pub(crate) fn inline_global_literal_temps_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut assigns: HashMap<String, (usize, String)> = HashMap::new();
-    let mut assign_counts: HashMap<String, usize> = HashMap::new();
+    let mut assigns: DetHashMap<String, (usize, String)> = DetHashMap::default();
+    let mut assign_counts: DetHashMap<String, usize> = DetHashMap::default();
     for (idx, line) in lines.iter().enumerate() {
         let Some((var, val)) = parse_simple_assign_line(line) else {
             continue;
@@ -687,11 +687,11 @@ pub(crate) fn inline_global_literal_temps_with_webs(body: &str, webs: &WebNames)
         .cloned()
         .collect();
     inline_vars.sort();
-    let inline_vars: HashSet<String> = inline_vars.into_iter().collect();
+    let inline_vars: DetHashSet<String> = inline_vars.into_iter().collect();
     if inline_vars.is_empty() {
         return body.to_string();
     }
-    let skip: HashSet<usize> = assigns
+    let skip: DetHashSet<usize> = assigns
         .iter()
         .filter(|(v, _)| inline_vars.contains(*v))
         .map(|(_, (idx, _))| *idx)
@@ -739,7 +739,7 @@ pub(crate) fn fix_undeclared_temp_assigns(body: &str) -> String {
 /// declaration whatever its form.
 pub(crate) fn fix_undeclared_temp_assigns_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut declared: HashSet<String> = webs.params.clone();
+    let mut declared: DetHashSet<String> = webs.params.clone();
     let mut out = String::new();
     for (idx, line) in lines.iter().enumerate() {
         let binding = strip_trailing_comment(line);
@@ -836,8 +836,8 @@ pub(crate) fn merge_constructor_calls(body: &str) -> String {
     if lines.len() < 2 {
         return body.to_string();
     }
-    let mut skip: HashSet<usize> = HashSet::new();
-    let mut replacements: HashMap<usize, String> = HashMap::new();
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
+    let mut replacements: DetHashMap<usize, String> = DetHashMap::default();
     for i in 0..lines.len() {
         if skip.contains(&i) {
             continue;

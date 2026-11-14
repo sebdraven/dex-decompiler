@@ -3,7 +3,7 @@
 use crate::decompile::ir::{Expr as IrExpr, Stmt as IrStmt, VarId};
 use crate::java;
 use dex_parser::{CodeItem, DexFile, EncodedMethod};
-use std::collections::HashMap;
+use crate::decompile::DetHashMap;
 
 /// Well-known JDK / Android API return types when the method isn't resolved from DEX ids.
 fn known_api_return_type(target: &str) -> Option<&'static str> {
@@ -70,7 +70,7 @@ pub fn infer_types(
     encoded: &EncodedMethod,
     code: &CodeItem,
     stmts: &[IrStmt],
-) -> HashMap<VarId, String> {
+) -> DetHashMap<VarId, String> {
     let field_types = FieldTypeIndex::build(dex);
     let return_index = MethodReturnIndex::build(dex);
     infer_types_cached(dex, encoded, code, stmts, &field_types, &return_index)
@@ -85,8 +85,8 @@ pub(crate) fn infer_types_cached(
     stmts: &[IrStmt],
     field_types: &FieldTypeIndex,
     return_index: &MethodReturnIndex,
-) -> HashMap<VarId, String> {
-    let mut types: HashMap<VarId, String> = HashMap::new();
+) -> DetHashMap<VarId, String> {
+    let mut types: DetHashMap<VarId, String> = DetHashMap::default();
     let info = match dex.get_method_info(encoded.method_idx) {
         Ok(i) => i,
         Err(_) => return types,
@@ -215,12 +215,12 @@ pub(crate) fn infer_types_cached(
 
 /// Fast lookup of invoke return types: `Class.method` → [(arity, java_type), …].
 pub(crate) struct MethodReturnIndex {
-    by_key: HashMap<String, Vec<(usize, String)>>,
+    by_key: DetHashMap<String, Vec<(usize, String)>>,
 }
 
 impl MethodReturnIndex {
     pub(crate) fn build(dex: &DexFile) -> Self {
-        let mut by_key: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+        let mut by_key: DetHashMap<String, Vec<(usize, String)>> = DetHashMap::default();
         let n = dex.header.method_ids_size;
         for idx in 0..n {
             let Ok(mi) = dex.get_method_info(idx) else {
@@ -290,8 +290,8 @@ fn raw_looks_like_wide_or_float_literal(s: &str) -> bool {
 /// Assign RHS types (so `aget` can pick up array element types across blocks).
 pub fn enrich_types_with_register_map(
     dex: &DexFile,
-    type_map: &mut HashMap<VarId, String>,
-    reg_types: &HashMap<u32, String>,
+    type_map: &mut DetHashMap<VarId, String>,
+    reg_types: &DetHashMap<u32, String>,
     stmts: &[IrStmt],
 ) {
     enrich_types_with_register_map_and_debug(dex, type_map, reg_types, None, stmts);
@@ -299,9 +299,9 @@ pub fn enrich_types_with_register_map(
 
 pub fn enrich_types_with_register_map_and_debug(
     dex: &DexFile,
-    type_map: &mut HashMap<VarId, String>,
-    reg_types: &HashMap<u32, String>,
-    debug_types: Option<&HashMap<u32, String>>,
+    type_map: &mut DetHashMap<VarId, String>,
+    reg_types: &DetHashMap<u32, String>,
+    debug_types: Option<&DetHashMap<u32, String>>,
     stmts: &[IrStmt],
 ) {
     let field_types = FieldTypeIndex::build(dex);
@@ -436,12 +436,12 @@ fn vars_in_stmt(stmt: &IrStmt) -> Vec<VarId> {
 
 /// owner Java name → field name → Java type.
 pub(crate) struct FieldTypeIndex {
-    by_owner: HashMap<String, HashMap<String, String>>,
+    by_owner: DetHashMap<String, DetHashMap<String, String>>,
 }
 
 impl FieldTypeIndex {
     pub(crate) fn build(dex: &DexFile) -> Self {
-        let mut by_owner: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut by_owner: DetHashMap<String, DetHashMap<String, String>> = DetHashMap::default();
         let n = dex.header.field_ids_size;
         for idx in 0..n {
             let Ok(fi) = dex.get_field_info(idx) else {
@@ -514,7 +514,7 @@ fn infer_field_load_type(
     dex: &DexFile,
     fields: &FieldTypeIndex,
     s: &str,
-    types: &HashMap<VarId, String>,
+    types: &DetHashMap<VarId, String>,
 ) -> Option<String> {
     let s = s.trim();
     if s.is_empty()
@@ -558,7 +558,7 @@ fn infer_typed_raw(
     dex: &DexFile,
     fields: &FieldTypeIndex,
     s: &str,
-    types: &HashMap<VarId, String>,
+    types: &DetHashMap<VarId, String>,
 ) -> Option<String> {
     if let Some(ty) = infer_field_load_type(dex, fields, s, types) {
         if !is_reg_token(&ty) {
@@ -569,7 +569,7 @@ fn infer_typed_raw(
 }
 
 /// Infer type from Raw RHS: string literal, new-array "new Type[size]", new-instance, literal, or first variable reference's type.
-fn infer_type_from_raw(s: &str, types: &HashMap<VarId, String>) -> Option<String> {
+fn infer_type_from_raw(s: &str, types: &DetHashMap<VarId, String>) -> Option<String> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -767,8 +767,8 @@ pub enum SemanticRole {
 }
 
 /// Detect semantic roles from Raw IR strings: "v0 = v1[v2];" -> v1=Array, v2=Index; "v0 = v1.length;" -> v1=Array, v0=Length.
-fn collect_semantic_roles(stmts: &[IrStmt]) -> HashMap<VarId, SemanticRole> {
-    let mut roles = HashMap::new();
+fn collect_semantic_roles(stmts: &[IrStmt]) -> DetHashMap<VarId, SemanticRole> {
+    let mut roles = DetHashMap::default();
     for s in stmts {
         let (assign_dst, raw) = match s {
             IrStmt::Assign {
@@ -930,20 +930,20 @@ fn parse_var_id(s: &str) -> Option<VarId> {
 #[cfg(test)]
 fn build_var_names(
     stmts: &[IrStmt],
-    type_map: &HashMap<VarId, String>,
+    type_map: &DetHashMap<VarId, String>,
     ins_size: u32,
     is_static: bool,
-) -> HashMap<VarId, String> {
+) -> DetHashMap<VarId, String> {
     build_var_names_with_regs(stmts, type_map, ins_size, ins_size, is_static)
 }
 
 pub fn build_var_names_with_regs(
     stmts: &[IrStmt],
-    type_map: &HashMap<VarId, String>,
+    type_map: &DetHashMap<VarId, String>,
     registers_size: u32,
     ins_size: u32,
     is_static: bool,
-) -> HashMap<VarId, String> {
+) -> DetHashMap<VarId, String> {
     let return_var = stmts.iter().find_map(|s| {
         if let IrStmt::Return {
             value: Some(IrExpr::Var(v)),
@@ -956,8 +956,8 @@ pub fn build_var_names_with_regs(
         }
     });
     let roles = collect_semantic_roles(stmts);
-    let mut names = HashMap::new();
-    let mut counters: HashMap<&'static str, u32> = HashMap::new();
+    let mut names = DetHashMap::default();
+    let mut counters: DetHashMap<&'static str, u32> = DetHashMap::default();
     let mut index_counter = 0u32;
     let param_base = registers_size.saturating_sub(ins_size);
     for s in stmts {
@@ -1019,13 +1019,13 @@ pub fn build_var_names_with_regs(
 /// Prefer one display name for SSA versions of the same Dalvik register **when types match**.
 /// Keeps `arr0` shared across untyped/typed array uses, but does **not** collapse
 /// Activity → View → TextView → String onto one debug name like `email`.
-fn unify_names_by_register(names: &mut HashMap<VarId, String>, type_map: &HashMap<VarId, String>) {
+fn unify_names_by_register(names: &mut DetHashMap<VarId, String>, type_map: &DetHashMap<VarId, String>) {
     // Union-find over VarIds that share a register and compatible types.
     let mut vars: Vec<VarId> = names.keys().copied().collect();
     vars.sort();
-    let mut parent: HashMap<VarId, VarId> = vars.iter().map(|v| (*v, *v)).collect();
+    let mut parent: DetHashMap<VarId, VarId> = vars.iter().map(|v| (*v, *v)).collect();
 
-    fn find(parent: &mut HashMap<VarId, VarId>, x: VarId) -> VarId {
+    fn find(parent: &mut DetHashMap<VarId, VarId>, x: VarId) -> VarId {
         let mut root = x;
         while parent.get(&root).copied().unwrap_or(root) != root {
             root = parent[&root];
@@ -1038,7 +1038,7 @@ fn unify_names_by_register(names: &mut HashMap<VarId, String>, type_map: &HashMa
         }
         root
     }
-    fn union(parent: &mut HashMap<VarId, VarId>, a: VarId, b: VarId) {
+    fn union(parent: &mut DetHashMap<VarId, VarId>, a: VarId, b: VarId) {
         let ra = find(parent, a);
         let rb = find(parent, b);
         if ra != rb {
@@ -1073,7 +1073,7 @@ fn unify_names_by_register(names: &mut HashMap<VarId, String>, type_map: &HashMa
     }
 
     // Pick best name per cluster; on a tie the smallest version wins.
-    let mut best: HashMap<VarId, String> = HashMap::new();
+    let mut best: DetHashMap<VarId, String> = DetHashMap::default();
     for vid in &vars {
         let name = &names[vid];
         let root = find(&mut parent, *vid);
@@ -1137,7 +1137,7 @@ pub(crate) fn is_primitive_java_type(t: &str) -> bool {
 /// (`String host` then `const/4 0` as `resolveActivity` flags).
 pub(crate) fn preferred_debug_type_for_reg<'a>(
     reg: u32,
-    type_map: &'a HashMap<VarId, String>,
+    type_map: &'a DetHashMap<VarId, String>,
 ) -> Option<&'a str> {
     let mut latest: Option<(u32, &'a str)> = None;
     // Several object types: the latest version's, not the map's last one.
@@ -1230,13 +1230,13 @@ fn var_ids_in_text(s: &str) -> Vec<VarId> {
 
 fn name_for_var(
     v: VarId,
-    type_map: &HashMap<VarId, String>,
+    type_map: &DetHashMap<VarId, String>,
     return_var: Option<VarId>,
     param_base: u32,
     ins_size: u32,
     is_static: bool,
-    roles: &HashMap<VarId, SemanticRole>,
-    counters: &mut HashMap<&'static str, u32>,
+    roles: &DetHashMap<VarId, SemanticRole>,
+    counters: &mut DetHashMap<&'static str, u32>,
     index_counter: &mut u32,
 ) -> String {
     if return_var == Some(v) {
@@ -1356,9 +1356,9 @@ pub fn param_names_by_register(
     ins_size: u32,
     is_static: bool,
     param_types: &[String],
-) -> HashMap<u32, String> {
+) -> DetHashMap<u32, String> {
     let param_base = registers_size.saturating_sub(ins_size);
-    let mut map = HashMap::new();
+    let mut map = DetHashMap::default();
     let mut slot = 0u32;
     if !is_static {
         map.insert(param_base, "this".to_string());
@@ -1393,13 +1393,13 @@ mod tests {
     #[test]
     fn instance_field_is_not_typed_as_register() {
         use crate::decompile::ir::VarId;
-        let mut types = std::collections::HashMap::new();
+        let mut types = DetHashMap::default();
         types.insert(
             VarId::new(24, 0),
             "tests.androguard.TestActivity".into(),
         );
         assert_eq!(infer_type_from_raw("v24.value", &types), None);
-        let mut arith = std::collections::HashMap::new();
+        let mut arith = DetHashMap::default();
         arith.insert(VarId::new(22, 0), "int".into());
         assert_eq!(infer_type_from_raw("v22 * 2", &arith).as_deref(), Some("int"));
         assert_eq!(infer_type_from_raw("1.0", &types).as_deref(), Some("double"));
@@ -1433,7 +1433,7 @@ mod tests {
                 comment: None,
             },
         ];
-        let mut type_map = std::collections::HashMap::new();
+        let mut type_map = DetHashMap::default();
         type_map.insert(VarId::new(0, 1), "int".into());
         let names = build_var_names(&stmts, &type_map, 0, true);
         assert_eq!(names.get(&VarId::new(0, 1)), Some(&"result".to_string()));
@@ -1457,7 +1457,7 @@ mod tests {
                 comment: None,
             },
         ];
-        let mut type_map = std::collections::HashMap::new();
+        let mut type_map = DetHashMap::default();
         type_map.insert(VarId::new(0, 1), "int[]".into());
         type_map.insert(VarId::new(1, 1), "int".into());
         let names = build_var_names_with_regs(&stmts, &type_map, 4, 0, true);
@@ -1511,7 +1511,7 @@ mod tests {
                 comment: None,
             },
         ];
-        let mut type_map = std::collections::HashMap::new();
+        let mut type_map = DetHashMap::default();
         type_map.insert(VarId::new(0, 0), "com.example.MainActivity".into());
         type_map.insert(VarId::new(0, 1), "android.view.View".into());
         type_map.insert(VarId::new(0, 2), "TextView".into());
@@ -1553,7 +1553,7 @@ mod tests {
                 comment: None,
             },
         ];
-        let type_map = std::collections::HashMap::new();
+        let type_map = DetHashMap::default();
         let names = build_var_names(&stmts, &type_map, 0, true);
         assert_eq!(names.get(&VarId::new(1, 0)), Some(&"arr0".to_string()));
         assert_eq!(names.get(&VarId::new(2, 0)), Some(&"i".to_string()));
@@ -1608,10 +1608,10 @@ mod tests {
     #[test]
     fn unify_names_does_not_collapse_const_onto_length() {
         use crate::decompile::ir::VarId;
-        let mut names = std::collections::HashMap::new();
+        let mut names = DetHashMap::default();
         names.insert(VarId::new(0, 1), "i0".into());
         names.insert(VarId::new(0, 2), "length".into());
-        let mut types = std::collections::HashMap::new();
+        let mut types = DetHashMap::default();
         types.insert(VarId::new(0, 1), "int".into());
         types.insert(VarId::new(0, 2), "int".into());
         unify_names_by_register(&mut names, &types);
@@ -1622,10 +1622,10 @@ mod tests {
     #[test]
     fn unify_names_still_shares_length_across_ssa_versions() {
         use crate::decompile::ir::VarId;
-        let mut names = std::collections::HashMap::new();
+        let mut names = DetHashMap::default();
         names.insert(VarId::new(0, 1), "length".into());
         names.insert(VarId::new(0, 2), "length".into());
-        let mut types = std::collections::HashMap::new();
+        let mut types = DetHashMap::default();
         types.insert(VarId::new(0, 1), "int".into());
         types.insert(VarId::new(0, 2), "int".into());
         unify_names_by_register(&mut names, &types);
@@ -1635,7 +1635,7 @@ mod tests {
 
     #[test]
     fn preferred_debug_type_prefers_string_over_later_int() {
-        let mut types = std::collections::HashMap::new();
+        let mut types = DetHashMap::default();
         types.insert(VarId::new(0, 1), "java.lang.String".into());
         types.insert(VarId::new(0, 2), "int".into());
         assert_eq!(
@@ -1655,7 +1655,7 @@ mod tests {
     #[test]
     fn substitute_names_prefers_latest_ssa_version() {
         use crate::decompile::ir::{substitute_names_in_text_pub, VarId};
-        let mut names = HashMap::new();
+        let mut names = DetHashMap::default();
         names.insert(VarId::new(3, 1), "obj0".into());
         names.insert(VarId::new(3, 2), "obj1".into());
         let out = substitute_names_in_text_pub("v3 != 0", &names);

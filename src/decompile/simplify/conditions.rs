@@ -1,6 +1,6 @@
 //! Condition folding, else-if chains, and boolean polish passes.
 
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
 
 use super::util::*;
 
@@ -20,8 +20,8 @@ pub(crate) fn fold_equals_into_conditions_with_webs(body: &str, webs: &WebNames)
 
 fn fold_equals_into_conditions_once(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip: HashSet<usize> = HashSet::new();
-    let mut replacements: HashMap<usize, String> = HashMap::new();
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
+    let mut replacements: DetHashMap<usize, String> = DetHashMap::default();
 
     for i in 0..lines.len() {
         if skip.contains(&i) {
@@ -136,8 +136,8 @@ pub(crate) fn fold_instanceof_into_conditions(body: &str) -> String {
 
 pub(crate) fn fold_instanceof_into_conditions_once(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip: HashSet<usize> = HashSet::new();
-    let mut replacements: HashMap<usize, String> = HashMap::new();
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
+    let mut replacements: DetHashMap<usize, String> = DetHashMap::default();
 
     for i in 0..lines.len() {
         if skip.contains(&i) {
@@ -271,7 +271,7 @@ pub(crate) fn collapse_double_not(cond: &str) -> String {
 /// Drop `name = "lit";` when the next statement is `if ("lit".equals(…))` / negated form.
 pub(crate) fn drop_string_lits_folded_into_if(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip: HashSet<usize> = HashSet::new();
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
     for i in 0..lines.len().saturating_sub(1) {
         let Some((var, lit)) = parse_simple_assign_line(lines[i]) else {
             continue;
@@ -320,7 +320,7 @@ pub(crate) fn drop_string_lits_folded_into_if(body: &str) -> String {
     if skip.is_empty() {
         return body.to_string();
     }
-    rebuild_lines(&lines, &skip, &HashMap::new(), body.ends_with('\n'))
+    rebuild_lines(&lines, &skip, &DetHashMap::default(), body.ends_with('\n'))
 }
 
 /// Flip `if (!(pred)) { THEN } else { ELSE }` → `if (pred) { ELSE } else { THEN }`
@@ -662,8 +662,8 @@ fn merge_nested_uri_component_checks_once(body: &str, webs: &WebNames) -> String
 /// before reassignment (or only used in that if condition).
 pub(crate) fn inline_single_use_into_equals_if_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip: HashSet<usize> = HashSet::new();
-    let mut replacements: HashMap<usize, String> = HashMap::new();
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
+    let mut replacements: DetHashMap<usize, String> = DetHashMap::default();
     for i in 0..lines.len() {
         if skip.contains(&i) {
             continue;
@@ -1141,7 +1141,7 @@ pub(crate) fn looks_like_primitive_local(name: &str) -> bool {
 /// `while (…) { continue; }` back-edges still round-trip in tests / empty loop bodies.
 pub(crate) fn remove_trailing_continues(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip = std::collections::HashSet::new();
+    let mut skip = DetHashSet::default();
     for i in 0..lines.len() {
         if lines[i].trim() != "continue;" {
             continue;

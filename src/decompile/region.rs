@@ -4,7 +4,9 @@
 //! walks the tree to produce Java if/else and while.
 
 use crate::decompile::cfg::{BlockEnd, BlockId, MethodCfg};
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
+use std::collections::HashSet;
+use std::hash::BuildHasher;
 
 /// Single-entry single-exit style region for structured emission.
 #[derive(Debug, Clone)]
@@ -563,7 +565,7 @@ fn resolve_then_start(
     branch_target: BlockId,
     fall_through: BlockId,
     loop_header: Option<BlockId>,
-    emitted: &HashSet<BlockId>,
+    emitted: &DetHashSet<BlockId>,
 ) -> BlockId {
     if loop_header == Some(branch_target) {
         return branch_target;
@@ -850,7 +852,7 @@ pub fn for_loop_pattern(
 /// Build a region tree from the CFG starting at entry.
 /// Uses the same structure as the current emit (loop headers -> Loop, conditionals -> If, rest -> Seq).
 pub fn build_regions(cfg: &MethodCfg, entry: BlockId) -> Option<Region> {
-    let mut emitted = HashSet::new();
+    let mut emitted = DetHashSet::default();
     build_regions_rec(cfg, entry, None, &mut emitted, None)
 }
 
@@ -861,16 +863,17 @@ pub fn build_regions_with_peeled_tails(cfg: &MethodCfg, entry: BlockId) -> Optio
 
 /// Like build_regions but only includes blocks in `allowed`. Used for try body (only try-range blocks)
 /// or catch body (only handler-range blocks). Successors outside `allowed` are treated as exit.
-pub fn build_regions_filtered(
+pub fn build_regions_filtered<S: BuildHasher>(
     cfg: &MethodCfg,
     entry: BlockId,
-    allowed: &HashSet<BlockId>,
+    allowed: &HashSet<BlockId, S>,
 ) -> Option<Region> {
     if !allowed.contains(&entry) {
         return None;
     }
-    let mut emitted = HashSet::new();
-    build_regions_rec(cfg, entry, None, &mut emitted, Some(allowed))
+    let allowed: DetHashSet<BlockId> = allowed.iter().copied().collect();
+    let mut emitted = DetHashSet::default();
+    build_regions_rec(cfg, entry, None, &mut emitted, Some(&allowed))
 }
 
 fn build_if_branches(
@@ -878,8 +881,8 @@ fn build_if_branches(
     then_start: BlockId,
     fall_through: BlockId,
     loop_header: Option<BlockId>,
-    emitted: &mut HashSet<BlockId>,
-    allowed: Option<&HashSet<BlockId>>,
+    emitted: &mut DetHashSet<BlockId>,
+    allowed: Option<&DetHashSet<BlockId>>,
     exit_target: bool,
 ) -> (Region, Region) {
     if exit_target {
@@ -903,10 +906,10 @@ fn build_if_branches_until(
     cfg: &MethodCfg,
     then_start: BlockId,
     fall_through: BlockId,
-    stop_at: &HashSet<BlockId>,
+    stop_at: &DetHashSet<BlockId>,
     loop_header: Option<BlockId>,
-    emitted: &mut HashSet<BlockId>,
-    allowed: Option<&HashSet<BlockId>>,
+    emitted: &mut DetHashSet<BlockId>,
+    allowed: Option<&DetHashSet<BlockId>>,
     exit_target: bool,
 ) -> (Region, Region) {
     if exit_target {
@@ -994,7 +997,7 @@ fn switch_join_block(
     cases: &[(i32, BlockId)],
     default_block: BlockId,
 ) -> Option<BlockId> {
-    let mut arms: HashSet<BlockId> = cases.iter().map(|(_, b)| *b).collect();
+    let mut arms: DetHashSet<BlockId> = cases.iter().map(|(_, b)| *b).collect();
     arms.insert(default_block);
     if arms.len() < 2 {
         return None;
@@ -1037,8 +1040,8 @@ fn block_successors(cfg: &MethodCfg, bid: BlockId) -> Vec<BlockId> {
 }
 
 /// Blocks reached by leaving `start`, not including `start` itself.
-fn reachable_after(cfg: &MethodCfg, start: BlockId) -> HashSet<BlockId> {
-    let mut seen = HashSet::new();
+fn reachable_after(cfg: &MethodCfg, start: BlockId) -> DetHashSet<BlockId> {
+    let mut seen = DetHashSet::default();
     let mut stack = block_successors(cfg, start);
     while let Some(b) = stack.pop() {
         if !seen.insert(b) || seen.len() > 64 {
@@ -1057,12 +1060,12 @@ fn switch_common_exit(
     cases: &[(i32, BlockId)],
     default_block: BlockId,
 ) -> Option<BlockId> {
-    let mut arms: HashSet<BlockId> = cases.iter().map(|(_, b)| *b).collect();
+    let mut arms: DetHashSet<BlockId> = cases.iter().map(|(_, b)| *b).collect();
     arms.insert(default_block);
     if arms.len() < 2 {
         return None;
     }
-    let mut inter: Option<HashSet<BlockId>> = None;
+    let mut inter: Option<DetHashSet<BlockId>> = None;
     for &arm in &arms {
         let reach = reachable_after(cfg, arm);
         inter = Some(match inter {
@@ -1092,8 +1095,8 @@ fn build_regions_rec(
     cfg: &MethodCfg,
     block_id: BlockId,
     loop_header: Option<BlockId>,
-    emitted: &mut HashSet<BlockId>,
-    allowed: Option<&HashSet<BlockId>>,
+    emitted: &mut DetHashSet<BlockId>,
+    allowed: Option<&DetHashSet<BlockId>>,
 ) -> Option<Region> {
     if emitted.contains(&block_id) {
         return None;
@@ -1189,7 +1192,7 @@ fn build_regions_rec(
             };
 
             if let Some(join_id) = diamond_join {
-                let stop_at: HashSet<BlockId> = std::iter::once(join_id).collect();
+                let stop_at: DetHashSet<BlockId> = std::iter::once(join_id).collect();
                 let else_r = build_regions_rec_until(
                     cfg,
                     *fall_through,
@@ -1269,12 +1272,12 @@ fn build_regions_rec(
         } => {
             let join = switch_join_block(cfg, cases, *default_block)
                 .or_else(|| switch_common_exit(cfg, cases, *default_block));
-            let mut stop_at: HashSet<BlockId> = cases
+            let mut stop_at: DetHashSet<BlockId> = cases
                 .iter()
                 .map(|(_, bid)| *bid)
                 .chain(std::iter::once(*default_block))
                 .collect();
-            let mut outlined: HashMap<BlockId, BlockId> = HashMap::new();
+            let mut outlined: DetHashMap<BlockId, BlockId> = DetHashMap::default();
             if let Some(j) = join {
                 stop_at.insert(j);
                 let mut arms: Vec<BlockId> = cases.iter().map(|(_, b)| *b).collect();
@@ -1288,7 +1291,7 @@ fn build_regions_rec(
             }
             // Several cases can share one target (`case 1: case 2: body`).
             // Only the last label owns the body; earlier ones are bare labels.
-            let mut owner_at: HashMap<BlockId, usize> = HashMap::new();
+            let mut owner_at: DetHashMap<BlockId, usize> = DetHashMap::default();
             for (i, (_, bid)) in cases.iter().enumerate() {
                 owner_at.insert(*bid, i);
             }
@@ -1373,10 +1376,10 @@ fn build_regions_rec(
 fn build_regions_rec_until(
     cfg: &MethodCfg,
     block_id: BlockId,
-    stop_at: &HashSet<BlockId>,
+    stop_at: &DetHashSet<BlockId>,
     loop_header: Option<BlockId>,
-    emitted: &mut HashSet<BlockId>,
-    allowed: Option<&HashSet<BlockId>>,
+    emitted: &mut DetHashSet<BlockId>,
+    allowed: Option<&DetHashSet<BlockId>>,
 ) -> Option<Region> {
     if stop_at.contains(&block_id) {
         return None;
@@ -1519,8 +1522,8 @@ fn build_regions_rec_until(
 fn build_loop_body(
     cfg: &MethodCfg,
     header_id: BlockId,
-    emitted: &mut HashSet<BlockId>,
-    allowed: Option<&HashSet<BlockId>>,
+    emitted: &mut DetHashSet<BlockId>,
+    allowed: Option<&DetHashSet<BlockId>>,
 ) -> Region {
     let block = &cfg.blocks[header_id];
     let block_reg = Region::Block(header_id);

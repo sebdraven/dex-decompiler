@@ -4,6 +4,7 @@ use super::cleanup::*;
 use super::conditions::*;
 use super::loops::*;
 use super::util::*;
+use crate::decompile::DetHashSet;
 use super::{
     java_string_hash_code, merge_duplicate_finally, normalize_java_indent, restore_string_switch,
     simplify_method_body,
@@ -1893,7 +1894,7 @@ mod variable_reuse {
     }
 
     fn webs(inlinable: &[&str], frozen: &[&str]) -> WebNames {
-        let set = |names: &[&str]| -> std::collections::HashSet<String> {
+        let set = |names: &[&str]| -> DetHashSet<String> {
             names.iter().map(|n| n.to_string()).collect()
         };
         WebNames {

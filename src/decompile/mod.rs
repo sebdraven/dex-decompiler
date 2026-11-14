@@ -90,7 +90,7 @@ pub struct DecompilerOptions {
     /// Prefer DEX debug_info local/parameter names when present (default: true).
     pub use_debug_names: bool,
     /// Optional resource id → `R.type.name` (from `resources.arsc` / R classes).
-    pub resource_map: Option<std::collections::HashMap<u32, String>>,
+    pub resource_map: Option<HashMap<u32, String>>,
 }
 
 impl Default for DecompilerOptions {
@@ -296,9 +296,10 @@ fn is_java_ident(name: &str) -> bool {
 
 /// Merge `debug_info.parameter_names` with `DBG_START_LOCAL` names on param registers.
 /// Locals fill gaps so the signature matches the body (`grantResults` vs `arr2`).
-fn debug_param_names_from_tables(
+/// `register_names` comes from dex-parser (std hasher); lookups only.
+fn debug_param_names_from_tables<S: BuildHasher>(
     parameter_names: &[Option<String>],
-    register_names: &HashMap<u32, String>,
+    register_names: &HashMap<u32, String, S>,
     param_base: u32,
     is_static: bool,
     param_types: &[String],
@@ -327,9 +328,9 @@ fn debug_param_names_from_tables(
 
 /// Names already used in an `if (` / `else if (` condition are in scope.
 /// Prevents `if (b == 10) { int b = b + 1; }` when `b` is a prior SSA version.
-fn mark_condition_idents_declared(condition: &str, declared: &mut HashSet<String>) {
+fn mark_condition_idents_declared(condition: &str, declared: &mut DetHashSet<String>) {
     let mut cur = String::new();
-    let flush = |cur: &mut String, declared: &mut HashSet<String>| {
+    let flush = |cur: &mut String, declared: &mut DetHashSet<String>| {
         if cur.is_empty() {
             return;
         }
@@ -384,15 +385,15 @@ pub struct Decompiler<'a> {
     mode: DecompilationMode,
     use_debug_names: bool,
     /// Registers that have φ-nodes in the current method (shared Java names across versions).
-    phi_regs: RefCell<HashSet<u32>>,
+    phi_regs: RefCell<DetHashSet<u32>>,
     /// Lazy index: class_name -> (dex_slot, ClassDef). Slot 0 = primary `dex`, 1+ = `extra_dexes`.
-    class_def_index: RefCell<Option<HashMap<String, (usize, ClassDef)>>>,
+    class_def_index: RefCell<Option<DetHashMap<String, (usize, ClassDef)>>>,
     /// Lazy index: enclosing_class -> (inner_class_name, constructor_param_count) for inner classes extending Thread.
-    inner_thread_index: RefCell<Option<HashMap<String, Vec<(String, usize)>>>>,
+    inner_thread_index: RefCell<Option<DetHashMap<String, Vec<(String, usize)>>>>,
     /// Lazy index: enclosing -> (inner, ctor_params, superclass_or_iface) for general anonymous inlining.
-    inner_anon_index: RefCell<Option<HashMap<String, Vec<(String, usize, String)>>>>,
+    inner_anon_index: RefCell<Option<DetHashMap<String, Vec<(String, usize, String)>>>>,
     /// Cache: inner_class_name -> decompiled run() body (before capture replacement). Avoids re-decompiling same run().
-    inner_run_body_cache: RefCell<HashMap<String, String>>,
+    inner_run_body_cache: RefCell<DetHashMap<String, String>>,
     /// Nesting depth for lambda body inlining (avoid recursive explode).
     lambda_inline_depth: RefCell<u32>,
     /// Literal → `Class.FIELD` replacements for the class currently being decompiled.
@@ -404,11 +405,11 @@ pub struct Decompiler<'a> {
     /// Extra DEXes for cross-DEX inner/anonymous class lookup (APK multi-dex).
     extra_dexes: Vec<&'a DexFile>,
     /// Register → Java type for the method currently being decompiled (cross-block enrichment).
-    method_reg_types: RefCell<Option<HashMap<u32, String>>>,
+    method_reg_types: RefCell<Option<DetHashMap<u32, String>>>,
     /// Register → preferred Java name for the method (stable across CFG blocks).
-    method_reg_names: RefCell<Option<HashMap<u32, String>>>,
+    method_reg_names: RefCell<Option<DetHashMap<u32, String>>>,
     /// Register → Java type from DEX debug locals (`float`, `double`, …).
-    method_debug_types: RefCell<Option<HashMap<u32, String>>>,
+    method_debug_types: RefCell<Option<DetHashMap<u32, String>>>,
     /// Return type of the method currently being decompiled (`long`, `double`, …).
     method_return_type: RefCell<Option<String>>,
     /// Lazy DEX-wide field owner→name→type index (amortized across methods / CFG blocks).
@@ -420,18 +421,18 @@ pub struct Decompiler<'a> {
     /// Per-method name ownership, so two variables (webs) never share a synthetic name.
     method_names: RefCell<MethodNameState>,
     /// Invoke offset (as printed in IR comments) → declared Java return type.
-    call_return_types: RefCell<HashMap<u32, String>>,
+    call_return_types: RefCell<DetHashMap<u32, String>>,
 }
 
 #[derive(Default)]
 struct MethodNameState {
     insns_off: usize,
     /// Reserved or claimed name → its single owner.
-    owners: HashMap<String, NameOwner>,
+    owners: DetHashMap<String, NameOwner>,
     /// Web → its name in this method.
-    web_names: HashMap<DefKey, String>,
+    web_names: DetHashMap<DefKey, String>,
     /// Web → Java type inferred for it in the emitted body.
-    web_types: HashMap<DefKey, String>,
+    web_types: DetHashMap<DefKey, String>,
 }
 
 /// Owner key for the SSA versions of a register that no web accounts for.
@@ -494,11 +495,11 @@ impl<'a> Decompiler<'a> {
             rename_map: None,
             mode: DecompilationMode::Restructure,
             use_debug_names: true,
-            phi_regs: RefCell::new(HashSet::new()),
+            phi_regs: RefCell::new(DetHashSet::default()),
             class_def_index: RefCell::new(None),
             inner_thread_index: RefCell::new(None),
             inner_anon_index: RefCell::new(None),
-            inner_run_body_cache: RefCell::new(HashMap::new()),
+            inner_run_body_cache: RefCell::new(DetHashMap::default()),
             lambda_inline_depth: RefCell::new(0),
             const_field_reps: RefCell::new(Vec::new()),
             resource_reps,
@@ -512,7 +513,7 @@ impl<'a> Decompiler<'a> {
             method_return_index: RefCell::new(None),
             method_webs: RefCell::new(None),
             method_names: RefCell::new(MethodNameState::default()),
-            call_return_types: RefCell::new(HashMap::new()),
+            call_return_types: RefCell::new(DetHashMap::default()),
         }
     }
 
@@ -529,11 +530,11 @@ impl<'a> Decompiler<'a> {
             rename_map: options.rename_map,
             mode: options.mode,
             use_debug_names: options.use_debug_names,
-            phi_regs: RefCell::new(HashSet::new()),
+            phi_regs: RefCell::new(DetHashSet::default()),
             class_def_index: RefCell::new(None),
             inner_thread_index: RefCell::new(None),
             inner_anon_index: RefCell::new(None),
-            inner_run_body_cache: RefCell::new(HashMap::new()),
+            inner_run_body_cache: RefCell::new(DetHashMap::default()),
             lambda_inline_depth: RefCell::new(0),
             const_field_reps: RefCell::new(Vec::new()),
             resource_reps,
@@ -547,7 +548,7 @@ impl<'a> Decompiler<'a> {
             method_return_index: RefCell::new(None),
             method_webs: RefCell::new(None),
             method_names: RefCell::new(MethodNameState::default()),
-            call_return_types: RefCell::new(HashMap::new()),
+            call_return_types: RefCell::new(DetHashMap::default()),
         }
     }
 
@@ -577,7 +578,7 @@ impl<'a> Decompiler<'a> {
         encoded: &EncodedMethod,
         code: &CodeItem,
         stmts: &[IrStmt],
-    ) -> HashMap<VarId, String> {
+    ) -> DetHashMap<VarId, String> {
         self.ensure_type_indexes();
         let fields = self.field_type_index.borrow();
         let returns = self.method_return_index.borrow();
@@ -664,9 +665,9 @@ impl<'a> Decompiler<'a> {
     /// Enrich per-block types from method-wide / debug maps, reusing the field index.
     fn enrich_types_for(
         &self,
-        type_map: &mut HashMap<VarId, String>,
-        reg_types: &HashMap<u32, String>,
-        debug_types: Option<&HashMap<u32, String>>,
+        type_map: &mut DetHashMap<VarId, String>,
+        reg_types: &DetHashMap<u32, String>,
+        debug_types: Option<&DetHashMap<u32, String>>,
         stmts: &[IrStmt],
     ) {
         self.ensure_type_indexes();
@@ -747,7 +748,7 @@ impl<'a> Decompiler<'a> {
         if self.class_def_index.borrow().is_some() {
             return Ok(());
         }
-        let mut map = HashMap::new();
+        let mut map = DetHashMap::default();
         let mut ingest = |slot: usize, dex: &DexFile| -> Result<()> {
             for class_def_result in dex.class_defs() {
                 let class_def =
@@ -782,7 +783,7 @@ impl<'a> Decompiler<'a> {
             return Ok(());
         }
         let thread_java = java::descriptor_to_java("Ljava/lang/Thread;");
-        let mut map: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        let mut map: DetHashMap<String, Vec<(String, usize)>> = DetHashMap::default();
         let mut ingest = |dex: &DexFile| -> Result<()> {
             for class_def_result in dex.class_defs() {
                 let class_def =
@@ -1055,7 +1056,6 @@ impl<'a> Decompiler<'a> {
         progress: Option<&(dyn Fn(usize, usize, &str) + Sync)>,
     ) -> Result<()> {
         use rayon::prelude::*;
-        use std::collections::HashSet;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         if dexes.is_empty() {
@@ -1067,7 +1067,7 @@ impl<'a> Decompiler<'a> {
 
         // (dex_index, ClassDef, class_name)
         let mut jobs: Vec<(usize, ClassDef, String)> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: DetHashSet<String> = DetHashSet::default();
         for (di, dex) in dexes.iter().enumerate() {
             let probe = Decompiler::with_options(dex, options.clone());
             for (class_def, class_name) in probe.collect_included_classes()? {
@@ -1285,7 +1285,7 @@ impl<'a> Decompiler<'a> {
                 .collect();
             *self.accessor_reps.borrow_mut() =
                 accessors::build_accessor_replacements(self.dex, &class_name, &methods);
-            let init_by_idx: HashMap<u32, &const_fields::StaticInit> =
+            let init_by_idx: DetHashMap<u32, &const_fields::StaticInit> =
                 static_inits.iter().map(|s| (s.field_idx, s)).collect();
 
             if is_enum {
@@ -1374,7 +1374,7 @@ impl<'a> Decompiler<'a> {
                     }
                 }
             }
-            let field_names: HashSet<String> = instance_fields
+            let field_names: DetHashSet<String> = instance_fields
                 .iter()
                 .map(|(_, _, name)| name.clone())
                 .collect();
@@ -2156,7 +2156,7 @@ impl<'a> Decompiler<'a> {
 
         if out.is_none() {
             let mut fallback = String::new();
-            let mut declared = HashSet::new();
+            let mut declared = DetHashSet::default();
             self.seed_declared_from_params(&mut declared, code, encoded);
             if let Some(root) = build_regions(&cfg, cfg.entry) {
                 self.emit_region(
@@ -2454,7 +2454,7 @@ impl<'a> Decompiler<'a> {
         if self.inner_anon_index.borrow().is_some() {
             return Ok(());
         }
-        let mut map: HashMap<String, Vec<(String, usize, String)>> = HashMap::new();
+        let mut map: DetHashMap<String, Vec<(String, usize, String)>> = DetHashMap::default();
         let mut ingest = |dex: &DexFile| -> Result<()> {
             for class_def_result in dex.class_defs() {
                 let class_def =
@@ -2710,7 +2710,7 @@ impl<'a> Decompiler<'a> {
         instructions: &[Instruction],
         code: &CodeItem,
         encoded: &EncodedMethod,
-        global_used_regs: &HashSet<u32>,
+        global_used_regs: &DetHashSet<u32>,
         class_name: Option<&str>,
     ) -> Result<String> {
         let data = self.dex.data.as_ref();
@@ -2733,7 +2733,7 @@ impl<'a> Decompiler<'a> {
         pairs.sort_by_key(|(t, _)| t.start_addr);
         let code_end_byte = (code.insns_size as u32) * 2;
 
-        let blocks_overlapping = |lo: u32, hi: u32| -> HashSet<BlockId> {
+        let blocks_overlapping = |lo: u32, hi: u32| -> DetHashSet<BlockId> {
             cfg.blocks
                 .iter()
                 .enumerate()
@@ -2750,7 +2750,7 @@ impl<'a> Decompiler<'a> {
         };
 
         let mut full = String::new();
-        let mut declared = HashSet::new();
+        let mut declared = DetHashSet::default();
         self.seed_declared_from_params(&mut declared, code, encoded);
         let mut cursor: u32 = 0;
 
@@ -3280,7 +3280,7 @@ impl<'a> Decompiler<'a> {
         class_name: Option<&str>,
     ) -> Result<String> {
         let code_insns = code.insns_slice(&*self.dex.data);
-        let mut block_ir: HashMap<BlockId, Vec<IrStmt>> = HashMap::new();
+        let mut block_ir: DetHashMap<BlockId, Vec<IrStmt>> = DetHashMap::default();
         for bid in 0..cfg.block_count() {
             let seq = self.block_instruction_seq(cfg, instructions, bid, None, false, None);
             let stmts =
@@ -3296,7 +3296,7 @@ impl<'a> Decompiler<'a> {
         strip_phis(&mut block_ir);
 
         let mut out = String::new();
-        let mut declared = HashSet::new();
+        let mut declared = DetHashSet::default();
         self.seed_declared_from_params(&mut declared, code, encoded);
         let global_used_regs = self.method_used_regs(cfg, instructions, code.insns_off, code_insns);
         for bid in 0..cfg.block_count() {
@@ -3337,7 +3337,7 @@ impl<'a> Decompiler<'a> {
         _encoded: &EncodedMethod,
     ) {
         let code_insns = code.insns_slice(&*self.dex.data);
-        let mut block_ir: HashMap<BlockId, Vec<IrStmt>> = HashMap::new();
+        let mut block_ir: DetHashMap<BlockId, Vec<IrStmt>> = DetHashMap::default();
         for bid in 0..cfg.block_count() {
             let seq = self.block_instruction_seq(cfg, instructions, bid, None, false, None);
             let Ok(stmts) =
@@ -3356,8 +3356,8 @@ impl<'a> Decompiler<'a> {
     /// Share one Java name across SSA versions of φ-web registers **only when types match**.
     fn apply_phi_register_names(
         &self,
-        name_map: &mut HashMap<VarId, String>,
-        type_map: &HashMap<VarId, String>,
+        name_map: &mut DetHashMap<VarId, String>,
+        type_map: &DetHashMap<VarId, String>,
     ) {
         let phi_regs = self.phi_regs.borrow();
         if phi_regs.is_empty() {
@@ -3425,7 +3425,7 @@ impl<'a> Decompiler<'a> {
         self.apply_debug_names_to_name_map(&mut name_map, &type_map, code, encoded);
         self.apply_signature_param_names(&mut name_map, encoded, code);
         self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
-        let mut declared = HashSet::new();
+        let mut declared = DetHashSet::default();
         for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), &mut declared) {
             if !line.is_empty() {
                 writeln!(&mut out, "        {}", line)
@@ -3495,8 +3495,8 @@ impl<'a> Decompiler<'a> {
         indent: usize,
         skip_goto_to: Option<BlockId>,
         break_target: Option<BlockId>,
-        declared: &mut HashSet<String>,
-        global_used_regs: Option<&HashSet<u32>>,
+        declared: &mut DetHashSet<String>,
+        global_used_regs: Option<&DetHashSet<u32>>,
         emit_range: Option<(u32, u32)>,
         class_name: Option<&str>,
     ) -> Result<bool> {
@@ -4449,7 +4449,7 @@ impl<'a> Decompiler<'a> {
         dex: Option<&DexFile>,
         webs: Option<&DefWebs>,
     ) {
-        let mut mutated = HashSet::new();
+        let mut mutated = DetHashSet::default();
         for ins in instructions {
             let m = ins.mnemonic();
             if matches!(
@@ -4516,7 +4516,7 @@ impl<'a> Decompiler<'a> {
                 &local_webs
             }
         };
-        let mut folded: HashSet<u32> = HashSet::new();
+        let mut folded: DetHashSet<u32> = DetHashSet::default();
         for (bid, block) in cfg.blocks.iter_mut().enumerate() {
             if let BlockEnd::Conditional {
                 ref mut condition, ..
@@ -4527,12 +4527,12 @@ impl<'a> Decompiler<'a> {
                     continue;
                 };
                 // Register named in the condition → offset where its value is read.
-                let mut consumer: HashMap<u32, u32> = webs
+                let mut consumer: DetHashMap<u32, u32> = webs
                     .reads(branch_off)
                     .iter()
                     .map(|&reg| (reg, branch_off))
                     .collect();
-                let only_def_reaching = |consumer: &HashMap<u32, u32>, reg: u32, def: u32| {
+                let only_def_reaching = |consumer: &DetHashMap<u32, u32>, reg: u32, def: u32| {
                     consumer
                         .get(&reg)
                         .is_some_and(|&at| webs.reaching(at, reg) == BTreeSet::from([def]))
@@ -4572,7 +4572,7 @@ impl<'a> Decompiler<'a> {
                                 if !only_def_reaching(&consumer, reg, off) {
                                     continue;
                                 }
-                                let mut map = HashMap::new();
+                                let mut map = DetHashMap::default();
                                 map.insert(reg, parts[1].to_string());
                                 let next = replace_register_names(condition, &map);
                                 if next != *condition {
@@ -4603,7 +4603,7 @@ impl<'a> Decompiler<'a> {
                             if !only_def_reaching(&consumer, dst, off) || !same_value(src, off) {
                                 continue;
                             }
-                            let mut map = HashMap::new();
+                            let mut map = DetHashMap::default();
                             map.insert(dst, format!("v{}", src));
                             let next = replace_register_names(condition, &map);
                             if next != *condition {
@@ -4637,7 +4637,7 @@ impl<'a> Decompiler<'a> {
                                     .map(|d| resolve_one(d, parts[2]))
                                     .unwrap_or_else(|| parts[2].to_string());
                                 let expr = format!("{} instanceof {}", src, ty);
-                                let mut map = HashMap::new();
+                                let mut map = DetHashMap::default();
                                 map.insert(dst, expr);
                                 let next = replace_register_names(condition, &map);
                                 if next != *condition {
@@ -4656,7 +4656,7 @@ impl<'a> Decompiler<'a> {
                 }
             }
         }
-        cfg.folded_const_offsets = folded;
+        cfg.folded_const_offsets = folded.into_iter().collect();
     }
 
     /// `iget v0, this, field; if-lez v0` → condition `this.field`, and the same for
@@ -4682,7 +4682,7 @@ impl<'a> Decompiler<'a> {
             let Some((iget_off, expr)) = self.field_expr_reaching(instructions, probe, reg) else {
                 continue;
             };
-            let mut map = HashMap::new();
+            let mut map = DetHashMap::default();
             map.insert(reg, expr);
             match &mut block.end {
                 BlockEnd::Conditional { condition, .. } | BlockEnd::Switch { condition, .. } => {
@@ -4799,7 +4799,7 @@ impl<'a> Decompiler<'a> {
             // Keep index as a register so `idx = e.ordinal()` stays in the body
             // (fixture tests look for `ordinal()`; full enum restore can still run later).
             let expr = format!("v{arr}[v{idx}]");
-            let mut map = HashMap::new();
+            let mut map = DetHashMap::default();
             map.insert(reg, expr.clone());
             let next = replace_register_names(condition, &map);
             if next != *condition {
@@ -4851,8 +4851,8 @@ impl<'a> Decompiler<'a> {
         indent: usize,
         skip_goto_to: Option<BlockId>,
         break_target: Option<BlockId>,
-        declared: &mut HashSet<String>,
-        global_used_regs: Option<&HashSet<u32>>,
+        declared: &mut DetHashSet<String>,
+        global_used_regs: Option<&DetHashSet<u32>>,
         emit_range: Option<(u32, u32)>,
         class_name: Option<&str>,
     ) -> Result<()> {
@@ -4936,7 +4936,7 @@ impl<'a> Decompiler<'a> {
     fn predecessor_blocks_for_condition_naming(cfg: &MethodCfg, target: BlockId) -> Vec<BlockId> {
         let mut out = Vec::new();
         let mut frontier = vec![target];
-        let mut seen = HashSet::from([target]);
+        let mut seen = DetHashSet::from_iter([target]);
         for _ in 0..2 {
             let mut next = Vec::new();
             for &t in &frontier {
@@ -5016,8 +5016,8 @@ impl<'a> Decompiler<'a> {
             // Include fall-through predecessor blocks so `invoke; move-result` + `if-nez`
             // in adjacent blocks still names the tested value as `obj1`, not stale `obj0`.
             let seq = self.block_instruction_seq_for_condition_naming(cfg, instructions, block_id);
-            let mut local_names: HashMap<u32, String> = HashMap::new();
-            let mut local_types: HashMap<u32, String> = HashMap::new();
+            let mut local_names: DetHashMap<u32, String> = DetHashMap::default();
+            let mut local_types: DetHashMap<u32, String> = DetHashMap::default();
             if !seq.is_empty() {
                 let stmts = self
                     .instructions_to_ir(&seq, base_off, code_insns, Some(instructions))
@@ -5037,7 +5037,7 @@ impl<'a> Decompiler<'a> {
                 self.apply_signature_param_names(&mut name_map, encoded, code);
 
                 // Highest SSA version per register in this block = value reaching the condition.
-                let mut best_ver: HashMap<u32, u32> = HashMap::new();
+                let mut best_ver: DetHashMap<u32, u32> = DetHashMap::default();
                 for (vid, name) in &name_map {
                     let prev = best_ver.get(&vid.reg).copied().unwrap_or(0);
                     if !local_names.contains_key(&vid.reg) || vid.ver >= prev {
@@ -5166,7 +5166,7 @@ impl<'a> Decompiler<'a> {
         instructions: &[Instruction],
         base_off: usize,
         code_insns: &[u8],
-    ) -> HashSet<u32> {
+    ) -> DetHashSet<u32> {
         let mut runner = PassRunner::new();
         runner.add(InvokeChainPass);
         runner.add(SsaRenamePass);
@@ -5204,7 +5204,7 @@ impl<'a> Decompiler<'a> {
             *self.method_debug_types.borrow_mut() = None;
             return;
         };
-        let mut map = HashMap::new();
+        let mut map = DetHashMap::default();
         for (reg, desc) in &dbg.register_types {
             let java = java::descriptor_to_java(desc);
             if !java.is_empty() {
@@ -5245,8 +5245,8 @@ impl<'a> Decompiler<'a> {
         runner.add(InlineFilledArrayPass);
         let stmts = runner.run(stmts);
         let types = self.infer_types_for(encoded, code, &stmts);
-        let mut by_reg: HashMap<u32, String> = HashMap::new();
-        let mut ver_seen: HashMap<u32, u32> = HashMap::new();
+        let mut by_reg: DetHashMap<u32, String> = DetHashMap::default();
+        let mut ver_seen: DetHashMap<u32, u32> = DetHashMap::default();
         for (vid, ty) in &types {
             let prev_ver = ver_seen.get(&vid.reg).copied().unwrap_or(0);
             let replace = match by_reg.get(&vid.reg) {
@@ -5460,7 +5460,7 @@ impl<'a> Decompiler<'a> {
         &self,
         encoded: &EncodedMethod,
         code: &CodeItem,
-    ) -> HashMap<u32, String> {
+    ) -> DetHashMap<u32, String> {
         let mut names = self.signature_param_names(encoded, code);
         let Ok(info) = self.dex.get_method_info(encoded.method_idx) else {
             return names;
@@ -5521,8 +5521,8 @@ impl<'a> Decompiler<'a> {
     /// the incoming value, and a synthetic temp name belongs to a single register.
     fn apply_def_web_names(
         &self,
-        name_map: &mut HashMap<VarId, String>,
-        type_map: &HashMap<VarId, String>,
+        name_map: &mut DetHashMap<VarId, String>,
+        type_map: &DetHashMap<VarId, String>,
         seq: &[Instruction],
         encoded: &EncodedMethod,
         code: &CodeItem,
@@ -5538,7 +5538,7 @@ impl<'a> Decompiler<'a> {
         let param_base = registers_size.saturating_sub(code.ins_size as u32);
         let param_names = self.param_display_names_by_reg(encoded, code);
         // SSA version k of a register is its k-th IR definition in `seq`.
-        let mut defs_by_reg: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut defs_by_reg: DetHashMap<u32, Vec<u32>> = DetHashMap::default();
         for ins in seq {
             if let Some(reg) = self.ir_def_reg(ins) {
                 defs_by_reg.entry(reg).or_default().push(ins.offset as u32);
@@ -5632,9 +5632,9 @@ impl<'a> Decompiler<'a> {
     /// name, the parameter's name only while the register holds the incoming value.
     fn apply_condition_web_names(
         &self,
-        names: &mut HashMap<u32, String>,
+        names: &mut DetHashMap<u32, String>,
         branch_off: u32,
-        types: &HashMap<u32, String>,
+        types: &DetHashMap<u32, String>,
         encoded: &EncodedMethod,
         code: &CodeItem,
     ) {
@@ -5781,7 +5781,7 @@ impl<'a> Decompiler<'a> {
         if *webs_off != code.insns_off || state.insns_off != code.insns_off {
             return names;
         }
-        let mut webs_by_name: HashMap<&str, Vec<DefKey>> = HashMap::new();
+        let mut webs_by_name: DetHashMap<&str, Vec<DefKey>> = DetHashMap::default();
         for (web, name) in &state.web_names {
             webs_by_name.entry(name.as_str()).or_default().push(*web);
         }
@@ -5841,8 +5841,8 @@ impl<'a> Decompiler<'a> {
             if *webs_off != code.insns_off {
                 return stmts;
             }
-            let in_seq: HashSet<u32> = seq.iter().map(|ins| ins.offset as u32).collect();
-            let mut versions: HashMap<u32, u32> = HashMap::new();
+            let in_seq: DetHashSet<u32> = seq.iter().map(|ins| ins.offset as u32).collect();
+            let mut versions: DetHashMap<u32, u32> = DetHashMap::default();
             for ins in seq {
                 let Some(reg) = self.ir_def_reg(ins) else {
                     continue;
@@ -5997,7 +5997,7 @@ impl<'a> Decompiler<'a> {
     /// SSA assign (`b = b + 1`) does not emit `int b = ...` after `if (b == 10)`.
     fn seed_declared_from_params(
         &self,
-        declared: &mut HashSet<String>,
+        declared: &mut DetHashSet<String>,
         code: &CodeItem,
         encoded: &EncodedMethod,
     ) {
@@ -6056,9 +6056,9 @@ impl<'a> Decompiler<'a> {
         &self,
         encoded: &EncodedMethod,
         code: &CodeItem,
-    ) -> HashMap<u32, String> {
+    ) -> DetHashMap<u32, String> {
         let Ok(info) = self.dex.get_method_info(encoded.method_idx) else {
-            return HashMap::new();
+            return DetHashMap::default();
         };
         let is_static = (encoded.access_flags & 0x8) != 0;
         let param_types: Vec<String> = info
@@ -6078,7 +6078,7 @@ impl<'a> Decompiler<'a> {
     /// Temps (`v0`, `x0`, `s0`) are replaced; debug/user names (`email`) are kept.
     fn apply_signature_param_names(
         &self,
-        name_map: &mut HashMap<VarId, String>,
+        name_map: &mut DetHashMap<VarId, String>,
         encoded: &EncodedMethod,
         code: &CodeItem,
     ) {
@@ -6108,8 +6108,8 @@ impl<'a> Decompiler<'a> {
     /// so `email` does not overwrite the Activity/`this` receiver used by `findViewById`.
     fn apply_debug_names_to_name_map(
         &self,
-        name_map: &mut HashMap<VarId, String>,
-        type_map: &HashMap<VarId, String>,
+        name_map: &mut DetHashMap<VarId, String>,
+        type_map: &DetHashMap<VarId, String>,
         code: &CodeItem,
         encoded: &EncodedMethod,
     ) {
@@ -6137,8 +6137,8 @@ impl<'a> Decompiler<'a> {
             }
         }
 
-        let latest_ver_by_reg: HashMap<u32, u32> =
-            name_map.keys().fold(HashMap::new(), |mut m, v| {
+        let latest_ver_by_reg: DetHashMap<u32, u32> =
+            name_map.keys().fold(DetHashMap::default(), |mut m, v| {
                 m.entry(v.reg)
                     .and_modify(|ver| *ver = (*ver).max(v.ver))
                     .or_insert(v.ver);
@@ -6146,7 +6146,7 @@ impl<'a> Decompiler<'a> {
             });
 
         // Names already claimed (params / prior renames) so register-reuse locals do not collide.
-        let mut used_names: HashSet<String> = HashSet::new();
+        let mut used_names: DetHashSet<String> = DetHashSet::default();
         for display in name_map.values() {
             if display.as_str() != "this" && is_java_ident(display) && !is_temp_like_name(display)
             {
@@ -6227,7 +6227,7 @@ impl<'a> Decompiler<'a> {
     /// For constructors, also accepts UI keys that use the simple class name instead of `<init>`.
     fn apply_variable_renames_to_name_map(
         &self,
-        name_map: &mut HashMap<VarId, String>,
+        name_map: &mut DetHashMap<VarId, String>,
         class_name: Option<&str>,
         encoded: &EncodedMethod,
     ) {
@@ -6271,8 +6271,8 @@ impl<'a> Decompiler<'a> {
         code: &CodeItem,
         out: &mut String,
         indent: usize,
-        declared: &mut HashSet<String>,
-        global_used_regs: Option<&HashSet<u32>>,
+        declared: &mut DetHashSet<String>,
+        global_used_regs: Option<&DetHashSet<u32>>,
         skip_last_instruction: bool,
         emit_range: Option<(u32, u32)>,
         class_name: Option<&str>,
@@ -6314,7 +6314,7 @@ impl<'a> Decompiler<'a> {
         } else if let Some(debug_types) = self.method_debug_types.borrow().as_ref() {
             self.enrich_types_for(
                 &mut type_map,
-                &HashMap::new(),
+                &DetHashMap::default(),
                 Some(debug_types),
                 &stmts,
             );
@@ -6405,9 +6405,9 @@ impl<'a> Decompiler<'a> {
     fn codegen_ir_lines(
         &self,
         stmts: &[IrStmt],
-        type_map: Option<&HashMap<VarId, String>>,
-        name_map: Option<&HashMap<VarId, String>>,
-        declared: &mut HashSet<String>,
+        type_map: Option<&DetHashMap<VarId, String>>,
+        name_map: Option<&DetHashMap<VarId, String>>,
+        declared: &mut DetHashSet<String>,
     ) -> Vec<String> {
         stmts
             .iter()
@@ -6418,9 +6418,9 @@ impl<'a> Decompiler<'a> {
     fn codegen_stmt_line(
         &self,
         stmt: &IrStmt,
-        type_map: Option<&HashMap<VarId, String>>,
-        name_map: Option<&HashMap<VarId, String>>,
-        declared: &mut HashSet<String>,
+        type_map: Option<&DetHashMap<VarId, String>>,
+        name_map: Option<&DetHashMap<VarId, String>>,
+        declared: &mut DetHashSet<String>,
     ) -> String {
         let line = match (stmt, type_map) {
             (IrStmt::Assign { dst, rhs, comment }, Some(types)) if types.get(dst).is_some() => {
@@ -7156,7 +7156,7 @@ fn replace_capture_in_body(body: &str, field_name: &str, arg: &str) -> String {
 
 /// After capture replacement: find "var = arg;" lines and replace whole-word "var" with "arg" in body, then remove those assignment lines.
 fn replace_capture_assignees_in_body(body: &str, val_replacements: &[(String, String)]) -> String {
-    let args: std::collections::HashSet<&str> =
+    let args: DetHashSet<&str> =
         val_replacements.iter().map(|(_, a)| a.as_str()).collect();
     let mut assignees: Vec<(String, String)> = Vec::new();
     for line in body.lines() {
@@ -7504,7 +7504,7 @@ fn drop_wide_high_half_args(args: &str, param_types: &[String]) -> String {
 fn format_compound_line(
     compound: &str,
     var: &str,
-    name_map: Option<&HashMap<VarId, String>>,
+    name_map: Option<&DetHashMap<VarId, String>>,
 ) -> String {
     let compound = if let Some(nm) = name_map {
         ir::substitute_names_in_text_pub(compound, nm)
@@ -7529,7 +7529,7 @@ fn format_compound_line(
 }
 
 /// Handle compound assign markers in raw/untyped lines.
-fn resolve_compound_in_line(line: &str, name_map: Option<&HashMap<VarId, String>>) -> String {
+fn resolve_compound_in_line(line: &str, name_map: Option<&DetHashMap<VarId, String>>) -> String {
     if let Some(eq_pos) = line.find(" = __compound_") {
         let var = line[..eq_pos].trim();
         let after = line[eq_pos + " = __compound_".len()..]
@@ -7642,8 +7642,8 @@ struct CtorFieldInit {
 fn hoist_common_ctor_field_inits(
     methods: &mut [String],
     simple_class: &str,
-    instance_fields: &HashSet<String>,
-) -> HashMap<String, String> {
+    instance_fields: &DetHashSet<String>,
+) -> DetHashMap<String, String> {
     struct Ctor {
         method_idx: usize,
         steps: Vec<CtorFieldInit>,
@@ -7659,7 +7659,7 @@ fn hoist_common_ctor_field_inits(
         });
     }
     if ctors.len() < 2 {
-        return HashMap::new();
+        return DetHashMap::default();
     }
     let mut n = ctors.iter().map(|c| c.steps.len()).min().unwrap_or(0);
     for i in 0..n {
@@ -7674,9 +7674,9 @@ fn hoist_common_ctor_field_inits(
         }
     }
     if n == 0 {
-        return HashMap::new();
+        return DetHashMap::default();
     }
-    let mut inits = HashMap::new();
+    let mut inits = DetHashMap::default();
     for step in &ctors[0].steps[..n] {
         inits.insert(step.field.clone(), step.expr.clone());
     }
@@ -7818,7 +7818,7 @@ fn constructor_delegates_to_this(java: &str) -> bool {
     })
 }
 
-fn leading_field_inits(java: &str, fields: &HashSet<String>) -> Vec<CtorFieldInit> {
+fn leading_field_inits(java: &str, fields: &DetHashSet<String>) -> Vec<CtorFieldInit> {
     let lines: Vec<&str> = java.lines().collect();
     let mut i = 1usize;
     let mut steps = Vec::new();
@@ -7962,7 +7962,7 @@ fn insert_used_short_imports(
     if used.is_empty() {
         return source.to_string();
     }
-    let mut by_simple: HashMap<String, Vec<String>> = HashMap::new();
+    let mut by_simple: DetHashMap<String, Vec<String>> = DetHashMap::default();
     for idx in 0..dex.header.type_ids_size {
         let Ok(desc) = dex.get_type(idx) else {
             continue;
@@ -8007,9 +8007,9 @@ fn insert_used_short_imports(
     splice_imports(source, &extra)
 }
 
-fn uppercase_idents(src: &str) -> HashSet<String> {
+fn uppercase_idents(src: &str) -> DetHashSet<String> {
     let bytes = src.as_bytes();
-    let mut out = HashSet::new();
+    let mut out = DetHashSet::default();
     let mut i = 0usize;
     let mut in_str = false;
     let mut escape = false;
@@ -8070,7 +8070,7 @@ fn splice_imports(source: &str, extra: &[String]) -> String {
                     || t.contains(" enum "))
         })
         .unwrap_or(0);
-    let mut imports: HashSet<String> = HashSet::new();
+    let mut imports: DetHashSet<String> = DetHashSet::default();
     for line in &lines[..class_at] {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("import ") {
@@ -8121,9 +8121,9 @@ fn collect_class_imports(
     class_name: &str,
     package: &str,
 ) -> Result<Vec<String>> {
-    let mut fqns: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut fqns: DetHashSet<String> = DetHashSet::default();
 
-    let add_type = |fqns: &mut std::collections::HashSet<String>, ty: &str| {
+    let add_type = |fqns: &mut DetHashSet<String>, ty: &str| {
         let base = ty.trim_end_matches(']').trim_end_matches('[').trim();
         if base.is_empty() || PRIMITIVE_OR_VOID.contains(&base) {
             return;
@@ -8542,11 +8542,11 @@ fn is_branch_offset(token: &str) -> bool {
 
 /// Replace raw register references (vN) in a condition string with display names.
 /// Word-boundary aware: `v1` won't match inside `v10`.
-fn replace_register_names(condition: &str, reg_to_name: &HashMap<u32, String>) -> String {
+fn replace_register_names(condition: &str, reg_to_name: &DetHashMap<u32, String>) -> String {
     ir::map_outside_literals(condition, |code| replace_register_names_in_code(code, reg_to_name))
 }
 
-fn replace_register_names_in_code(condition: &str, reg_to_name: &HashMap<u32, String>) -> String {
+fn replace_register_names_in_code(condition: &str, reg_to_name: &DetHashMap<u32, String>) -> String {
     let bytes = condition.as_bytes();
     let mut result = String::with_capacity(condition.len());
     let mut i = 0;
@@ -8589,8 +8589,8 @@ fn replace_register_names_in_code(condition: &str, reg_to_name: &HashMap<u32, St
 /// Turn `obj == 0` / `obj != 0` into `obj == null` / `obj != null` for reference types.
 fn polish_boolean_condition(
     condition: &str,
-    local_names: &HashMap<u32, String>,
-    local_types: &HashMap<u32, String>,
+    local_names: &DetHashMap<u32, String>,
+    local_types: &DetHashMap<u32, String>,
 ) -> String {
     let cond = condition.trim();
     let (name, is_eq) = if let Some(n) = cond.strip_suffix(" == 0") {
@@ -9192,8 +9192,8 @@ fn is_ident_char(b: u8) -> bool {
 /// Registers that only ever hold `this` (the incoming `p0` plus `move-object` copies
 /// that are never overwritten). Loop blocks often don't see the prologue move, so
 /// without this they name `this` as `local0` and later passes turn it into `0`.
-fn registers_holding_this(instructions: &[Instruction], this_reg: u32) -> HashSet<u32> {
-    let mut holding: HashSet<u32> = HashSet::new();
+fn registers_holding_this(instructions: &[Instruction], this_reg: u32) -> DetHashSet<u32> {
+    let mut holding: DetHashSet<u32> = DetHashSet::default();
     holding.insert(this_reg);
     for ins in instructions {
         let m = ins.mnemonic();
@@ -10598,8 +10598,8 @@ mod tests {
 
     #[test]
     fn polish_boolean_condition_z_temp() {
-        let names = HashMap::new();
-        let types = HashMap::new();
+        let names = DetHashMap::default();
+        let types = DetHashMap::default();
         assert_eq!(polish_boolean_condition("z0 == 0", &names, &types), "!z0");
         assert_eq!(polish_boolean_condition("z0 != 0", &names, &types), "z0");
         // Non-boolean temps stay as comparisons
@@ -10615,9 +10615,9 @@ mod tests {
 
     #[test]
     fn polish_boolean_condition_typed_local() {
-        let mut names = HashMap::new();
+        let mut names = DetHashMap::default();
         names.insert(0u32, "loggedIn".into());
-        let mut types = HashMap::new();
+        let mut types = DetHashMap::default();
         types.insert(0u32, "boolean".into());
         assert_eq!(
             polish_boolean_condition("loggedIn == 0", &names, &types),
@@ -10749,7 +10749,7 @@ mod tests {
     #[test]
     fn debug_param_names_prefer_table_then_start_local() {
         let types = vec!["int".into(), "java.lang.String[]".into(), "int[]".into()];
-        let mut locals = HashMap::new();
+        let mut locals = DetHashMap::default();
         // instance: slot 0 = this, 1 = requestCode, 2 = permissions, 3 = grantResults
         locals.insert(4, "grantResults".to_string());
         let unnamed = vec![None, None, None];
@@ -10763,7 +10763,7 @@ mod tests {
             Some("permissions".into()),
             Some("grantResults".into()),
         ];
-        let names = debug_param_names_from_tables(&table, &HashMap::new(), 1, false, &types);
+        let names = debug_param_names_from_tables(&table, &DetHashMap::default(), 1, false, &types);
         assert_eq!(
             names,
             vec![
@@ -10782,7 +10782,7 @@ mod tests {
     #[test]
     fn debug_param_names_skip_this_and_wide_slots() {
         let types = vec!["long".into(), "java.lang.String".into()];
-        let mut locals = HashMap::new();
+        let mut locals = DetHashMap::default();
         locals.insert(0, "this".to_string());
         locals.insert(1, "count".to_string());
         locals.insert(3, "name".to_string());
@@ -10797,7 +10797,7 @@ mod tests {
         loop_header: bool,
         instructions: Vec<Instruction>,
     ) -> MethodCfg {
-        let mut loop_headers = HashSet::new();
+        let mut loop_headers = std::collections::HashSet::new();
         if loop_header {
             loop_headers.insert(0);
         }
@@ -10812,10 +10812,10 @@ mod tests {
                 },
                 instruction_offsets: offsets,
             }],
-            block_by_start: HashMap::new(),
+            block_by_start: std::collections::HashMap::new(),
             loop_headers,
             entry: 0,
-            folded_const_offsets: HashSet::new(),
+            folded_const_offsets: std::collections::HashSet::new(),
         };
         Decompiler::fold_constants_into_conditions(&mut cfg, &instructions, None, None);
         cfg
@@ -11088,7 +11088,7 @@ mod tests {
 
     #[test]
     fn text_rewrites_keep_non_ascii() {
-        let mut names = HashMap::new();
+        let mut names = DetHashMap::default();
         names.insert(0u32, "count".to_string());
         assert_eq!(
             replace_register_names("v0.equals(\"┌─┐ 友盟\")", &names),
@@ -11118,14 +11118,14 @@ mod tests {
 
     #[test]
     fn replace_register_names_skips_literals() {
-        let names = HashMap::from([(1, "this".to_string())]);
+        let names = DetHashMap::from_iter([(1, "this".to_string())]);
         let out = replace_register_names(r#"v1.equals("ota/api/conf/v1")"#, &names);
         assert_eq!(out, r#"this.equals("ota/api/conf/v1")"#);
     }
 
     #[test]
     fn replace_register_names_skips_a_literal_with_an_escaped_quote() {
-        let names = HashMap::from([(1, "this".to_string())]);
+        let names = DetHashMap::from_iter([(1, "this".to_string())]);
         let out = replace_register_names(r#"v1.equals("a\"v1\"b")"#, &names);
         assert_eq!(out, r#"this.equals("a\"v1\"b")"#);
     }

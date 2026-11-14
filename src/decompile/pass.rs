@@ -5,7 +5,7 @@
 
 use crate::decompile::ir::VarId;
 use crate::decompile::ir::{map_outside_literals, Expr as IrExpr, Stmt as IrStmt};
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
 
 /// A single transformation pass over method IR.
 pub trait Pass {
@@ -272,7 +272,7 @@ impl Pass for DeadAssignPass {
 /// Dead-assign using a precomputed set of used *register numbers* (not VarId).
 /// Keeps Assign if dst.reg is in used_regs. Use when emitting CFG so assigns
 /// whose destination is used in other blocks are not removed.
-pub fn run_dead_assign_with_used_regs(stmts: Vec<IrStmt>, used_regs: &HashSet<u32>) -> Vec<IrStmt> {
+pub fn run_dead_assign_with_used_regs(stmts: Vec<IrStmt>, used_regs: &DetHashSet<u32>) -> Vec<IrStmt> {
     stmts
         .into_iter()
         .filter(|s| {
@@ -340,14 +340,14 @@ fn is_fp_or_wide_const_rhs(rhs: &str) -> bool {
 }
 
 /// Collect all register numbers that are read (used) in the IR.
-pub fn used_regs(stmts: &[IrStmt]) -> HashSet<u32> {
+pub fn used_regs(stmts: &[IrStmt]) -> DetHashSet<u32> {
     used_var_ids(stmts).iter().map(|v| v.reg).collect()
 }
 
 /// Collect all VarIds that are read (used) in the IR (in RHS, Return, Expr).
 /// Includes VarIds mentioned in Raw strings and Call args so dead-assign doesn't remove defs that are only used there.
-fn used_var_ids(stmts: &[IrStmt]) -> HashSet<VarId> {
-    let mut set = HashSet::new();
+fn used_var_ids(stmts: &[IrStmt]) -> DetHashSet<VarId> {
+    let mut set = DetHashSet::default();
     for s in stmts {
         match s {
             IrStmt::Assign { rhs, .. } => collect_var_ids_expr(rhs, &mut set),
@@ -365,7 +365,7 @@ fn used_var_ids(stmts: &[IrStmt]) -> HashSet<VarId> {
     set
 }
 
-fn collect_var_ids_expr(expr: &IrExpr, set: &mut HashSet<VarId>) {
+fn collect_var_ids_expr(expr: &IrExpr, set: &mut DetHashSet<VarId>) {
     match expr {
         IrExpr::Var(v) => {
             set.insert(*v);
@@ -381,7 +381,7 @@ fn collect_var_ids_expr(expr: &IrExpr, set: &mut HashSet<VarId>) {
 }
 
 /// Collect all VarIds mentioned in text (vN or vN_k).
-fn var_ids_in_text(s: &str, set: &mut HashSet<VarId>) {
+fn var_ids_in_text(s: &str, set: &mut DetHashSet<VarId>) {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -417,7 +417,7 @@ pub struct CopyPropPass;
 
 impl Pass for CopyPropPass {
     fn run(&self, stmts: Vec<IrStmt>) -> Vec<IrStmt> {
-        let mut alias: HashMap<VarId, VarId> = HashMap::new();
+        let mut alias: DetHashMap<VarId, VarId> = DetHashMap::default();
         for stmt in &stmts {
             if let IrStmt::Assign { dst, rhs, .. } = stmt {
                 if let Some(src) = copy_source(rhs) {
@@ -430,10 +430,10 @@ impl Pass for CopyPropPass {
         if alias.is_empty() {
             return stmts;
         }
-        let mut resolved: HashMap<VarId, VarId> = HashMap::new();
+        let mut resolved: DetHashMap<VarId, VarId> = DetHashMap::default();
         for &dst in alias.keys() {
             let mut cur = dst;
-            let mut seen: HashSet<VarId> = HashSet::new();
+            let mut seen: DetHashSet<VarId> = DetHashSet::default();
             while let Some(&next) = alias.get(&cur) {
                 if !seen.insert(cur) {
                     break;
@@ -475,7 +475,7 @@ fn copy_assign_must_keep(
     dst: VarId,
     stmts: &[IrStmt],
     rewritten: &[IrStmt],
-    resolved: &HashMap<VarId, VarId>,
+    resolved: &DetHashMap<VarId, VarId>,
 ) -> bool {
     let reg = dst.reg;
     // One-instruction block `dst = src` is a store used outside the block
@@ -502,7 +502,7 @@ fn copy_assign_must_keep(
     false
 }
 
-fn rewrite_stmt(stmt: &IrStmt, resolved: &HashMap<VarId, VarId>) -> IrStmt {
+fn rewrite_stmt(stmt: &IrStmt, resolved: &DetHashMap<VarId, VarId>) -> IrStmt {
     match stmt {
         IrStmt::Assign { dst, rhs, comment } => IrStmt::Assign {
             dst: *dst,
@@ -600,11 +600,11 @@ fn parse_bare_varid(s: &str) -> Option<VarId> {
     Some(VarId::new(reg, ver))
 }
 
-fn resolve_vid(v: VarId, map: &HashMap<VarId, VarId>) -> VarId {
+fn resolve_vid(v: VarId, map: &DetHashMap<VarId, VarId>) -> VarId {
     map.get(&v).copied().unwrap_or(v)
 }
 
-fn rewrite_expr(expr: IrExpr, map: &HashMap<VarId, VarId>) -> IrExpr {
+fn rewrite_expr(expr: IrExpr, map: &DetHashMap<VarId, VarId>) -> IrExpr {
     match expr {
         IrExpr::Var(v) => IrExpr::Var(resolve_vid(v, map)),
         IrExpr::Call { target, args } => IrExpr::Call {
@@ -624,7 +624,7 @@ fn format_varid(v: VarId) -> String {
     }
 }
 
-fn rewrite_varids_in_text(s: &str, map: &HashMap<VarId, VarId>) -> String {
+fn rewrite_varids_in_text(s: &str, map: &DetHashMap<VarId, VarId>) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -682,8 +682,8 @@ pub struct SsaRenamePass;
 
 impl Pass for SsaRenamePass {
     fn run(&self, stmts: Vec<IrStmt>) -> Vec<IrStmt> {
-        let mut next_ver: HashMap<u32, u32> = HashMap::new();
-        let mut cur_ver: HashMap<u32, u32> = HashMap::new();
+        let mut next_ver: DetHashMap<u32, u32> = DetHashMap::default();
+        let mut cur_ver: DetHashMap<u32, u32> = DetHashMap::default();
 
         let mut out = Vec::with_capacity(stmts.len());
         for stmt in stmts {
@@ -748,7 +748,7 @@ fn raw_register_def(s: &str) -> Option<(u32, &str)> {
     Some((reg, rhs))
 }
 
-fn rename_expr(expr: IrExpr, cur_ver: &HashMap<u32, u32>) -> IrExpr {
+fn rename_expr(expr: IrExpr, cur_ver: &DetHashMap<u32, u32>) -> IrExpr {
     match expr {
         IrExpr::Var(v) => IrExpr::Var(rename_var(v, cur_ver)),
         IrExpr::Call { target, args } => IrExpr::Call {
@@ -760,24 +760,24 @@ fn rename_expr(expr: IrExpr, cur_ver: &HashMap<u32, u32>) -> IrExpr {
     }
 }
 
-fn rename_var(v: VarId, cur_ver: &HashMap<u32, u32>) -> VarId {
+fn rename_var(v: VarId, cur_ver: &DetHashMap<u32, u32>) -> VarId {
     let ver = cur_ver.get(&v.reg).copied().unwrap_or(0);
     VarId::new(v.reg, ver)
 }
 
 /// Best-effort text rewrite: `vN` -> `vN_k` if current version for N is k>0.
 /// Leaves already-versioned `vN_k` unchanged.
-pub(crate) fn rename_vars_in_text_public(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
+pub(crate) fn rename_vars_in_text_public(s: &str, cur_ver: &DetHashMap<u32, u32>) -> String {
     rename_vars_in_text(s, cur_ver)
 }
 
 /// Best-effort text rewrite: `vN` -> `vN_k` if current version for N is k>0.
 /// Leaves already-versioned `vN_k` unchanged.
-fn rename_vars_in_text(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
+fn rename_vars_in_text(s: &str, cur_ver: &DetHashMap<u32, u32>) -> String {
     map_outside_literals(s, |code| rename_vars_in_code(code, cur_ver))
 }
 
-fn rename_vars_in_code(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
+fn rename_vars_in_code(s: &str, cur_ver: &DetHashMap<u32, u32>) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -1039,7 +1039,7 @@ pub struct InlineFilledArrayPass;
 
 impl Pass for InlineFilledArrayPass {
     fn run(&self, stmts: Vec<IrStmt>) -> Vec<IrStmt> {
-        let mut defs: HashMap<VarId, String> = HashMap::new();
+        let mut defs: DetHashMap<VarId, String> = DetHashMap::default();
         for s in &stmts {
             if let IrStmt::Assign {
                 dst,
@@ -1055,8 +1055,8 @@ impl Pass for InlineFilledArrayPass {
         if defs.is_empty() {
             return stmts;
         }
-        let mut inlined_from: HashSet<VarId> = HashSet::new();
-        let mut rewrites: HashMap<usize, String> = HashMap::new();
+        let mut inlined_from: DetHashSet<VarId> = DetHashSet::default();
+        let mut rewrites: DetHashMap<usize, String> = DetHashMap::default();
         for (idx, s) in stmts.iter().enumerate() {
             let raw = match s {
                 IrStmt::Assign {
@@ -1115,7 +1115,7 @@ impl Pass for InlineFilledArrayPass {
 fn vid_used_outside_inlined_arrays(
     stmts: &[IrStmt],
     vid: VarId,
-    array_rewrites: &HashMap<usize, String>,
+    array_rewrites: &DetHashMap<usize, String>,
 ) -> bool {
     for (idx, s) in stmts.iter().enumerate() {
         if array_rewrites.contains_key(&idx) {
@@ -1126,7 +1126,7 @@ fn vid_used_outside_inlined_arrays(
                 continue;
             }
         }
-        let mut used = HashSet::new();
+        let mut used = DetHashSet::default();
         match s {
             IrStmt::Assign { rhs, .. } => collect_var_ids_expr(rhs, &mut used),
             IrStmt::Expr { expr, .. } => collect_var_ids_expr(expr, &mut used),
@@ -1180,8 +1180,8 @@ fn is_java_ident_part(s: &str) -> bool {
 
 fn try_inline_array_literal(
     r: &str,
-    defs: &HashMap<VarId, String>,
-    inlined: &mut HashSet<VarId>,
+    defs: &DetHashMap<VarId, String>,
+    inlined: &mut DetHashSet<VarId>,
 ) -> Option<String> {
     let r = r.trim();
     let open = r.find("[]{")?;
@@ -1521,12 +1521,12 @@ mod tests {
 
     #[test]
     fn var_ids_parses_versioned_aput() {
-        let mut set = HashSet::new();
+        let mut set = DetHashSet::default();
         var_ids_in_text("v8_2[v10_2] = v9_2;", &mut set);
         assert!(set.contains(&VarId::new(8, 2)), "{:?}", set);
         assert!(set.contains(&VarId::new(10, 2)), "{:?}", set);
         assert!(set.contains(&VarId::new(9, 2)), "{:?}", set);
-        let regs: HashSet<u32> = set.iter().map(|v| v.reg).collect();
+        let regs: DetHashSet<u32> = set.iter().map(|v| v.reg).collect();
         assert!(regs.contains(&9) && regs.contains(&10), "{:?}", regs);
     }
 
@@ -1710,13 +1710,13 @@ mod tests {
     #[test]
     fn text_rewrites_keep_non_ascii() {
         let text = "v1 = \"┌─┐ 友盟\" + v2; // 日志";
-        let mut map = HashMap::new();
+        let mut map = DetHashMap::default();
         map.insert(VarId::new(1, 0), VarId::new(3, 0));
         assert_eq!(
             rewrite_varids_in_text(text, &map),
             "v3 = \"┌─┐ 友盟\" + v2; // 日志"
         );
-        let mut cur_ver = HashMap::new();
+        let mut cur_ver = DetHashMap::default();
         cur_ver.insert(2u32, 1u32);
         assert_eq!(
             rename_vars_in_text(text, &cur_ver),
@@ -1730,14 +1730,14 @@ mod tests {
 
     #[test]
     fn rename_vars_skips_literals() {
-        let cur_ver = HashMap::from([(1, 2)]);
+        let cur_ver = DetHashMap::from_iter([(1, 2)]);
         let out = rename_vars_in_text(r#"v1 + "ota/api/conf/v1" + 'v'"#, &cur_ver);
         assert_eq!(out, r#"v1_2 + "ota/api/conf/v1" + 'v'"#);
     }
 
     #[test]
     fn rename_vars_skips_a_literal_with_an_escaped_quote() {
-        let cur_ver = HashMap::from([(1, 2)]);
+        let cur_ver = DetHashMap::from_iter([(1, 2)]);
         let out = rename_vars_in_text(r#"f("a\"v1\"b", v1)"#, &cur_ver);
         assert_eq!(out, r#"f("a\"v1\"b", v1_2)"#);
     }

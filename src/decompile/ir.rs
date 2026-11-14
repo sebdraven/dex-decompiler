@@ -2,7 +2,7 @@
 //!
 //! This is intentionally small and permissive: unhandled cases can fall back to `Raw`.
 
-use std::collections::HashMap;
+use crate::decompile::DetHashMap;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -63,11 +63,11 @@ impl Expr {
     }
 
     /// Emit Java with optional variable name map (VarId -> display name).
-    pub fn to_java_with_names(&self, names: Option<&HashMap<VarId, String>>) -> String {
+    pub fn to_java_with_names(&self, names: Option<&DetHashMap<VarId, String>>) -> String {
         self.to_java_impl(names)
     }
 
-    fn to_java_impl(&self, names: Option<&HashMap<VarId, String>>) -> String {
+    fn to_java_impl(&self, names: Option<&DetHashMap<VarId, String>>) -> String {
         match self {
             Expr::Var(v) => {
                 if let Some(ns) = names {
@@ -104,11 +104,11 @@ impl Stmt {
     }
 
     /// Emit Java line with optional variable name map.
-    pub fn to_java_line_with_names(&self, names: Option<&HashMap<VarId, String>>) -> String {
+    pub fn to_java_line_with_names(&self, names: Option<&DetHashMap<VarId, String>>) -> String {
         self.to_java_line_impl(names)
     }
 
-    fn to_java_line_impl(&self, names: Option<&HashMap<VarId, String>>) -> String {
+    fn to_java_line_impl(&self, names: Option<&DetHashMap<VarId, String>>) -> String {
         match self {
             Stmt::Assign { dst, rhs, comment } => {
                 let dst_str = names
@@ -138,7 +138,7 @@ impl Stmt {
 }
 
 /// Replace variable references (vN or vN_k) in text with names from the map.
-pub fn substitute_names_in_text_pub(s: &str, names: &HashMap<VarId, String>) -> String {
+pub fn substitute_names_in_text_pub(s: &str, names: &DetHashMap<VarId, String>) -> String {
     substitute_names_in_text(s, names)
 }
 
@@ -190,11 +190,11 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || !b.is_ascii()
 }
 
-fn substitute_names_in_text(s: &str, names: &HashMap<VarId, String>) -> String {
+fn substitute_names_in_text(s: &str, names: &DetHashMap<VarId, String>) -> String {
     map_outside_literals(s, |code| substitute_names_in_code(code, names))
 }
 
-fn substitute_names_in_code(s: &str, names: &HashMap<VarId, String>) -> String {
+fn substitute_names_in_code(s: &str, names: &DetHashMap<VarId, String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     let bytes = s.as_bytes();
@@ -257,8 +257,8 @@ fn append_comment(base: String, _comment: Option<&str>) -> String {
 mod tests {
     use super::*;
 
-    fn names() -> HashMap<VarId, String> {
-        let mut names = HashMap::new();
+    fn names() -> DetHashMap<VarId, String> {
+        let mut names = DetHashMap::default();
         names.insert(VarId::new(1, 0), "this".to_string());
         names.insert(VarId::new(4, 0), "localRawFile".to_string());
         names

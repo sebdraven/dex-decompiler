@@ -1,7 +1,7 @@
 //! Shared parsing, identifier, and structural helpers.
 
 use crate::decompile::ir::map_outside_literals;
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
 
 /// Strip trailing "  // ..." comment from a line to get the statement part.
 pub(crate) fn strip_trailing_comment(line: &str) -> String {
@@ -482,13 +482,13 @@ pub(crate) fn is_class_literal(s: &str) -> bool {
 #[derive(Default)]
 pub(crate) struct WebNames {
     /// Parameters and `this`: defined on entry.
-    pub(crate) params: HashSet<String>,
+    pub(crate) params: DetHashSet<String>,
     /// Constants read once, in the region of their definition.
-    pub(crate) inlinable: HashSet<String>,
+    pub(crate) inlinable: DetHashSet<String>,
     /// Name of a web: no text pass replaces it by a value unless it is inlinable.
-    pub(crate) frozen: HashSet<String>,
+    pub(crate) frozen: DetHashSet<String>,
     /// Java type of a web's name or a parameter, when the bytecode tells it.
-    pub(crate) types: HashMap<String, String>,
+    pub(crate) types: DetHashMap<String, String>,
 }
 
 impl WebNames {
@@ -847,8 +847,8 @@ pub(crate) fn string_lit_in_predicate_cond(cond: &str) -> Option<String> {
 /// Drop `name = "lit";` when the next statement is `if ("lit".equals(…))` / negated form.
 pub(crate) fn rebuild_lines(
     lines: &[&str],
-    skip: &HashSet<usize>,
-    replacements: &HashMap<usize, String>,
+    skip: &DetHashSet<usize>,
+    replacements: &DetHashMap<usize, String>,
     trailing_nl: bool,
 ) -> String {
     let mut out = String::new();

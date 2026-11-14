@@ -1,6 +1,6 @@
 //! Repair SSA/register-reuse artifacts in decompiled bodies.
 
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
 
 use super::loops::parse_index_compare_bound;
 use super::util::*;
@@ -18,8 +18,8 @@ pub(crate) fn forward_array_scalar_literal(name: &str) -> Option<String> {
 /// Undeclared `localN` / literal temps in call args — usually dropped `const` loads.
 pub(crate) fn repair_undeclared_temps_in_call_args(
     current: &mut String,
-    assigned: &HashSet<String>,
-    literal_by_temp: &HashMap<String, String>,
+    assigned: &DetHashSet<String>,
+    literal_by_temp: &DetHashMap<String, String>,
     webs: &WebNames,
 ) {
     if !line_contains_call(current) {
@@ -57,7 +57,7 @@ pub(crate) fn repair_undeclared_temps_in_call_args(
 pub(crate) fn repair_forward_array_scalar_uses(
     current: &mut String,
     line_idx: usize,
-    array_decls: &HashMap<String, usize>,
+    array_decls: &DetHashMap<String, usize>,
     webs: &WebNames,
 ) {
     for (name, decl_idx) in array_decls {
@@ -162,7 +162,7 @@ fn ident_used_as_receiver(line: &str, ident: &str) -> bool {
 /// `i = i0 + 1` / `int j = i1 + 1` after SSA unify → `i++` / `j++`.
 pub(crate) fn repair_ssa_temp_increments(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut declared: HashSet<String> = HashSet::new();
+    let mut declared: DetHashSet<String> = DetHashSet::default();
     for line in &lines {
         if let Some(eq) = strip_trailing_comment(line).trim().find(" = ") {
             let binding = strip_trailing_comment(line);
@@ -216,8 +216,8 @@ pub(crate) fn repair_register_reuse_scalars(body: &str) -> String {
 /// replaced by a literal unless it is an inlinable constant.
 pub(crate) fn repair_register_reuse_scalars_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut assigned: HashSet<String> = webs.params.clone();
-    let mut array_decls: HashMap<String, usize> = HashMap::new();
+    let mut assigned: DetHashSet<String> = webs.params.clone();
+    let mut array_decls: DetHashMap<String, usize> = DetHashMap::default();
     for (i, line) in lines.iter().enumerate() {
         let binding = strip_trailing_comment(line);
         let t = binding.trim();
@@ -237,7 +237,7 @@ pub(crate) fn repair_register_reuse_scalars_with_webs(body: &str, webs: &WebName
             }
         }
     }
-    let mut literal_by_temp: HashMap<String, String> = HashMap::new();
+    let mut literal_by_temp: DetHashMap<String, String> = DetHashMap::default();
     for line in &lines {
         if let Some((var, val)) = parse_simple_assign_line(line) {
             if is_temp_like_name(&var) && is_cheap_literal_rhs(&val) {
@@ -343,7 +343,7 @@ pub(crate) fn repair_self_referential_call_args(body: &str) -> String {
 
 pub(crate) fn repair_self_referential_call_args_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut literal_temps: HashMap<String, String> = HashMap::new();
+    let mut literal_temps: DetHashMap<String, String> = DetHashMap::default();
     for line in &lines {
         let Some((var, val)) = parse_simple_assign_line(line) else {
             continue;

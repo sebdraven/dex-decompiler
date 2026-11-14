@@ -6,26 +6,27 @@
 use super::cfg::{BlockId, MethodCfg};
 use super::read_write::instruction_reads_writes;
 use dex_bytecode::Instruction;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
+use std::collections::BTreeSet;
 
 /// Pseudo definition: the value a register holds on method entry (incoming argument).
 pub(crate) const ENTRY_DEF: u32 = u32::MAX;
 
-type RegDefs = HashMap<u32, BTreeSet<u32>>;
+type RegDefs = DetHashMap<u32, BTreeSet<u32>>;
 /// (register, defining instruction offset or `ENTRY_DEF`).
 pub(crate) type DefKey = (u32, u32);
 
 pub(crate) struct DefWebs {
     block_in: Vec<RegDefs>,
     block_offsets: Vec<Vec<u32>>,
-    position: HashMap<u32, (BlockId, usize)>,
-    rw: HashMap<u32, (Vec<u32>, Vec<u32>)>,
-    parent: HashMap<DefKey, DefKey>,
-    uses: HashMap<DefKey, usize>,
-    use_sites: HashMap<DefKey, Vec<u32>>,
-    const_defs: HashSet<u32>,
-    exception_defs: HashSet<u32>,
-    object_defs: HashSet<u32>,
+    position: DetHashMap<u32, (BlockId, usize)>,
+    rw: DetHashMap<u32, (Vec<u32>, Vec<u32>)>,
+    parent: DetHashMap<DefKey, DefKey>,
+    uses: DetHashMap<DefKey, usize>,
+    use_sites: DetHashMap<DefKey, Vec<u32>>,
+    const_defs: DetHashSet<u32>,
+    exception_defs: DetHashSet<u32>,
+    object_defs: DetHashSet<u32>,
     /// Catch handler entries a block belongs to; empty when it is reachable without a throw.
     handlers_of: Vec<BTreeSet<BlockId>>,
     /// Protected byte ranges `[start, end)`.
@@ -38,7 +39,7 @@ fn merge(into: &mut RegDefs, from: &RegDefs) {
     }
 }
 
-fn find(parent: &HashMap<DefKey, DefKey>, key: DefKey) -> DefKey {
+fn find(parent: &DetHashMap<DefKey, DefKey>, key: DefKey) -> DefKey {
     let mut cur = key;
     while let Some(&p) = parent.get(&cur) {
         if p == cur {
@@ -49,7 +50,7 @@ fn find(parent: &HashMap<DefKey, DefKey>, key: DefKey) -> DefKey {
     cur
 }
 
-fn union(parent: &mut HashMap<DefKey, DefKey>, a: DefKey, b: DefKey) {
+fn union(parent: &mut DetHashMap<DefKey, DefKey>, a: DefKey, b: DefKey) {
     parent.entry(a).or_insert(a);
     parent.entry(b).or_insert(b);
     let ra = find(parent, a);
@@ -72,7 +73,7 @@ impl DefWebs {
         exceptional_edges: &[ExcEdge],
         entry_regs: &[u32],
     ) -> Self {
-        let rw: HashMap<u32, (Vec<u32>, Vec<u32>)> = instructions
+        let rw: DetHashMap<u32, (Vec<u32>, Vec<u32>)> = instructions
             .iter()
             .map(|ins| {
                 (
@@ -87,7 +88,7 @@ impl DefWebs {
             .iter()
             .map(|b| b.instruction_offsets.clone())
             .collect();
-        let mut position = HashMap::new();
+        let mut position = DetHashMap::default();
         for (bid, offs) in block_offsets.iter().enumerate() {
             for (i, &off) in offs.iter().enumerate() {
                 position.insert(off, (bid, i));
@@ -131,10 +132,10 @@ impl DefWebs {
                 stack.extend(succs[b].iter().copied());
             }
         }
-        let mut const_defs = HashSet::new();
-        let mut exception_defs = HashSet::new();
-        let mut check_casts = HashSet::new();
-        let mut object_defs = HashSet::new();
+        let mut const_defs = DetHashSet::default();
+        let mut exception_defs = DetHashSet::default();
+        let mut check_casts = DetHashSet::default();
+        let mut object_defs = DetHashSet::default();
         for ins in instructions {
             let off = ins.offset as u32;
             if matches!(
@@ -223,9 +224,9 @@ impl DefWebs {
             }
         }
 
-        let mut parent: HashMap<DefKey, DefKey> = HashMap::new();
-        let mut uses: HashMap<DefKey, usize> = HashMap::new();
-        let mut use_sites: HashMap<DefKey, Vec<u32>> = HashMap::new();
+        let mut parent: DetHashMap<DefKey, DefKey> = DetHashMap::default();
+        let mut uses: DetHashMap<DefKey, usize> = DetHashMap::default();
+        let mut use_sites: DetHashMap<DefKey, Vec<u32>> = DetHashMap::default();
         for bid in 0..n {
             let mut cur = block_in[bid].clone();
             for off in &block_offsets[bid] {

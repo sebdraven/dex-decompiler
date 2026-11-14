@@ -1,7 +1,8 @@
 //! Control-flow graph utilities: dominators (Lengauer-Tarjan), reverse post-order.
 //! Mirrors androguard.decompiler.graph for test parity with test_decompiler_dominator.py and test_decompiler_rpo.py.
 
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
+use std::collections::HashMap;
 
 /// Directed graph with named nodes (string ids). Used for dominator and RPO tests.
 #[derive(Debug, Clone, Default)]
@@ -59,8 +60,8 @@ impl Graph {
             return HashMap::new();
         }
         let rpo = self.compute_rpo();
-        let rpo_set: HashSet<_> = rpo.iter().cloned().collect();
-        let mut preds: HashMap<String, Vec<String>> = HashMap::new();
+        let rpo_set: DetHashSet<_> = rpo.iter().cloned().collect();
+        let mut preds: DetHashMap<String, Vec<String>> = DetHashMap::default();
         for n in &self.nodes {
             for s in self.successors(n) {
                 if rpo_set.contains(s) {
@@ -106,9 +107,9 @@ impl Graph {
     /// Matches androguard graph.compute_rpo() semantics (node.num = RPO number).
     pub fn compute_rpo(&self) -> Vec<String> {
         let mut post = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited = DetHashSet::default();
         let mut stack = vec![(self.entry.clone(), 0)];
-        let mut index: HashMap<String, usize> = HashMap::new();
+        let mut index: DetHashMap<String, usize> = DetHashMap::default();
         for (i, n) in self.successors(&self.entry).iter().enumerate() {
             index.insert(n.clone(), i);
         }
@@ -150,7 +151,7 @@ fn intersect(
     mut b1: String,
     mut b2: String,
 ) -> String {
-    let rpo_idx: HashMap<&str, usize> = rpo
+    let rpo_idx: DetHashMap<&str, usize> = rpo
         .iter()
         .enumerate()
         .map(|(i, s)| (s.as_str(), i))
@@ -208,7 +209,7 @@ mod tests {
         ];
         let g = graph_from_edges("r", edges);
         let idom = g.immediate_dominators();
-        let expected: HashMap<String, Option<String>> = [
+        let expected: DetHashMap<String, Option<String>> = [
             ("r", None),
             ("a", Some("r")),
             ("b", Some("r")),
@@ -257,7 +258,7 @@ mod tests {
         ];
         let g = graph_from_edges("r", edges);
         let idom = g.immediate_dominators();
-        let expected: HashMap<String, Option<String>> = [
+        let expected: DetHashMap<String, Option<String>> = [
             ("r", None),
             ("w1", Some("r")),
             ("w2", Some("r")),
@@ -301,7 +302,7 @@ mod tests {
         ];
         let g = graph_from_edges("r", edges);
         let idom = g.immediate_dominators();
-        let expected: HashMap<String, Option<String>> = [
+        let expected: DetHashMap<String, Option<String>> = [
             ("r", None),
             ("y1", Some("r")),
             ("y2", Some("y1")),
@@ -329,7 +330,7 @@ mod tests {
         ];
         let g = graph_from_edges("r", edges);
         let idom = g.immediate_dominators();
-        let expected: HashMap<String, Option<String>> = [
+        let expected: DetHashMap<String, Option<String>> = [
             ("r", None),
             ("w", Some("r")),
             ("x1", Some("r")),
@@ -354,7 +355,7 @@ mod tests {
         ];
         let g = graph_from_edges("r", edges);
         let idom = g.immediate_dominators();
-        let expected: HashMap<String, Option<String>> = [
+        let expected: DetHashMap<String, Option<String>> = [
             ("r", None),
             ("x1", Some("r")),
             ("x2", Some("x1")),
@@ -384,7 +385,7 @@ mod tests {
         ];
         let g = graph_from_edges("r", edges);
         let idom = g.immediate_dominators();
-        let expected: HashMap<String, Option<String>> = [
+        let expected: DetHashMap<String, Option<String>> = [
             ("r", None),
             ("a", Some("r")),
             ("b", Some("a")),
@@ -420,7 +421,7 @@ mod tests {
         ];
         let g = graph_from_edges("r", edges);
         let idom = g.immediate_dominators();
-        let expected: HashMap<String, Option<String>> = [
+        let expected: DetHashMap<String, Option<String>> = [
             ("r", None),
             ("w", Some("r")),
             ("y", Some("r")),
@@ -453,7 +454,7 @@ mod tests {
         ];
         let g = graph_from_edges("r", edges);
         let idom = g.immediate_dominators();
-        let expected: HashMap<String, Option<String>> = [
+        let expected: DetHashMap<String, Option<String>> = [
             ("r", None),
             ("a", Some("r")),
             ("b", Some("a")),
@@ -489,7 +490,7 @@ mod tests {
         ];
         let g = graph_from_edges("n1", edges);
         let idom = g.immediate_dominators();
-        let expected: HashMap<String, Option<String>> = [
+        let expected: DetHashMap<String, Option<String>> = [
             ("n1", None),
             ("n2", Some("n1")),
             ("n3", Some("n1")),

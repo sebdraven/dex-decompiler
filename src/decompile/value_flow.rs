@@ -6,7 +6,8 @@
 use super::cfg::{BlockId, MethodCfg};
 use super::read_write::instruction_reads_writes;
 use dex_bytecode::Instruction;
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
+use std::collections::HashMap;
 
 /// Map from instruction offset (invoke only) to resolved method ref. Used for PendingIntent and sink analysis.
 pub type InvokeMethodMap = HashMap<u32, String>;
@@ -68,8 +69,8 @@ impl ValueFlowAnalysisOwned {
             .filter(|(_, method_ref)| patterns.iter().any(|p| method_ref.contains(p.as_ref())))
             .map(|&((offset, reg), _)| (offset, reg))
             .collect();
-        let mut reads = HashSet::new();
-        let mut writes = HashSet::new();
+        let mut reads = DetHashSet::default();
+        let mut writes = DetHashSet::default();
         let analysis = self.analysis();
         for (offset, reg) in seeds {
             let result = analysis.value_flow_from_seed(offset, reg);
@@ -231,9 +232,9 @@ pub struct ValueFlowResult {
 pub struct ValueFlowAnalysis<'a> {
     rw_map: &'a InstructionRwMap,
     /// For each (offset, reg) use, the set of (offset', reg') defs that can reach it.
-    use_def: HashMap<(u32, u32), HashSet<(u32, u32)>>,
+    use_def: DetHashMap<(u32, u32), DetHashSet<(u32, u32)>>,
     /// For each (offset', reg') def, the set of (offset, reg) uses it reaches.
-    def_use: HashMap<(u32, u32), HashSet<(u32, u32)>>,
+    def_use: DetHashMap<(u32, u32), DetHashSet<(u32, u32)>>,
 }
 
 impl<'a> ValueFlowAnalysis<'a> {
@@ -260,8 +261,8 @@ impl<'a> ValueFlowAnalysis<'a> {
     fn predecessors(
         cfg: &MethodCfg,
         exceptional_edges: &[(BlockId, BlockId)],
-    ) -> HashMap<BlockId, Vec<BlockId>> {
-        let mut pred: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    ) -> DetHashMap<BlockId, Vec<BlockId>> {
+        let mut pred: DetHashMap<BlockId, Vec<BlockId>> = DetHashMap::default();
         for (from, to) in cfg
             .successor_edges()
             .into_iter()
@@ -276,16 +277,16 @@ impl<'a> ValueFlowAnalysis<'a> {
     fn reaching_defs(
         cfg: &MethodCfg,
         rw_map: &InstructionRwMap,
-        predecessors: &HashMap<BlockId, Vec<BlockId>>,
+        predecessors: &DetHashMap<BlockId, Vec<BlockId>>,
     ) -> (
-        HashMap<(u32, u32), HashSet<(u32, u32)>>,
-        HashMap<(u32, u32), HashSet<(u32, u32)>>,
+        DetHashMap<(u32, u32), DetHashSet<(u32, u32)>>,
+        DetHashMap<(u32, u32), DetHashSet<(u32, u32)>>,
     ) {
-        type RegDefs = HashMap<u32, HashSet<(u32, u32)>>; // reg -> set of (offset, reg) defs
+        type RegDefs = DetHashMap<u32, DetHashSet<(u32, u32)>>; // reg -> set of (offset, reg) defs
 
-        let mut out_block: HashMap<BlockId, RegDefs> = HashMap::new();
-        let mut use_def: HashMap<(u32, u32), HashSet<(u32, u32)>> = HashMap::new();
-        let mut def_use: HashMap<(u32, u32), HashSet<(u32, u32)>> = HashMap::new();
+        let mut out_block: DetHashMap<BlockId, RegDefs> = DetHashMap::default();
+        let mut use_def: DetHashMap<(u32, u32), DetHashSet<(u32, u32)>> = DetHashMap::default();
+        let mut def_use: DetHashMap<(u32, u32), DetHashSet<(u32, u32)>> = DetHashMap::default();
 
         let mut changed = true;
         while changed {
@@ -295,7 +296,7 @@ impl<'a> ValueFlowAnalysis<'a> {
                 let mut in_state: RegDefs = predecessors
                     .get(&bid)
                     .map(|preds| {
-                        let mut merged: RegDefs = HashMap::new();
+                        let mut merged: RegDefs = DetHashMap::default();
                         for &p in preds {
                             if let Some(out) = out_block.get(&p) {
                                 for (reg, defs) in out {
@@ -323,7 +324,7 @@ impl<'a> ValueFlowAnalysis<'a> {
                         }
                     }
                     for reg in &writes {
-                        in_state.insert(*reg, HashSet::from([(off, *reg)]));
+                        in_state.insert(*reg, DetHashSet::from_iter([(off, *reg)]));
                     }
                 }
 
@@ -346,7 +347,7 @@ impl<'a> ValueFlowAnalysis<'a> {
 
         // Writes: seed + all defs that get their value from the seed (transitively).
         // E.g. move v1,v0 then move v2,v1 → (0,v0), (2,v1), (4,v2) all write the same value.
-        let mut written_set: HashSet<(u32, u32)> = HashSet::from([seed]);
+        let mut written_set: DetHashSet<(u32, u32)> = DetHashSet::from_iter([seed]);
         let mut changed = true;
         while changed {
             changed = false;
@@ -367,7 +368,7 @@ impl<'a> ValueFlowAnalysis<'a> {
         let writes = sorted_points(written_set);
 
         // Reads: all (offset, reg) that use the value (direct use of seed or use of any copy).
-        let mut read_set: HashSet<(u32, u32)> = HashSet::new();
+        let mut read_set: DetHashSet<(u32, u32)> = DetHashSet::default();
         for &def in &writes {
             if let Some(uses) = self.def_use.get(&def) {
                 read_set.extend(uses.iter().copied());
@@ -490,7 +491,7 @@ mod tests {
         let analysis = ValueFlowAnalysis::new(&cfg, &rw_map);
         let result = analysis.value_flow_from_seed(off_const, 0);
 
-        let writes_set: HashSet<_> = result.writes.iter().copied().collect();
+        let writes_set: DetHashSet<_> = result.writes.iter().copied().collect();
         assert!(
             writes_set.contains(&(off_const, 0)),
             "writes should contain seed, got {:?}",
@@ -508,7 +509,7 @@ mod tests {
             result.writes
         );
 
-        let reads_set: HashSet<_> = result.reads.iter().copied().collect();
+        let reads_set: DetHashSet<_> = result.reads.iter().copied().collect();
         assert!(reads_set.contains(&(off_move, 0)));
         assert!(reads_set.contains(&(off_return, 1)));
         assert_eq!(
@@ -534,7 +535,7 @@ mod tests {
         let analysis = ValueFlowAnalysis::new(&cfg, &rw_map);
         let result = analysis.value_flow_from_seed(off_const, 0);
 
-        let writes_set: HashSet<_> = result.writes.iter().copied().collect();
+        let writes_set: DetHashSet<_> = result.writes.iter().copied().collect();
         assert!(writes_set.contains(&(off_const, 0)));
         assert!(writes_set.contains(&(off_move1, 1)));
         assert!(writes_set.contains(&(off_move2, 2)));
@@ -545,7 +546,7 @@ mod tests {
             result.writes
         );
 
-        let reads_set: HashSet<_> = result.reads.iter().copied().collect();
+        let reads_set: DetHashSet<_> = result.reads.iter().copied().collect();
         assert!(reads_set.contains(&(off_move1, 0)));
         assert!(reads_set.contains(&(off_move2, 1)));
         assert!(reads_set.contains(&(off_return, 2)));
@@ -620,7 +621,7 @@ mod tests {
         let result = analysis.value_flow_from_seed(offsets[0], 0);
 
         // Writes: const v0, move v1.
-        let writes_set: HashSet<_> = result.writes.iter().copied().collect();
+        let writes_set: DetHashSet<_> = result.writes.iter().copied().collect();
         assert!(
             writes_set.contains(&(offsets[0], 0)),
             "writes should contain const v0"
@@ -655,8 +656,8 @@ mod tests {
         let analysis = ValueFlowAnalysis::new(&cfg, &rw_map);
         let result = analysis.value_flow_from_seed(offsets[0], 0);
 
-        let reads_set: HashSet<_> = result.reads.iter().copied().collect();
-        let writes_set: HashSet<_> = result.writes.iter().copied().collect();
+        let reads_set: DetHashSet<_> = result.reads.iter().copied().collect();
+        let writes_set: DetHashSet<_> = result.writes.iter().copied().collect();
 
         // Value flows to invoke (passed as param).
         assert!(
@@ -694,8 +695,8 @@ mod tests {
         // Seed: value received from callee (move-result v0).
         let result = analysis.value_flow_from_seed(off_move_result, 0);
 
-        let reads_set: HashSet<_> = result.reads.iter().copied().collect();
-        let writes_set: HashSet<_> = result.writes.iter().copied().collect();
+        let reads_set: DetHashSet<_> = result.reads.iter().copied().collect();
+        let writes_set: DetHashSet<_> = result.writes.iter().copied().collect();
 
         // Value from callee flows through move to return.
         assert!(
@@ -731,10 +732,10 @@ mod tests {
                     instruction_offsets: vec![10],
                 },
             ],
-            block_by_start: HashMap::from([(0, 0), (10, 1)]),
-            loop_headers: HashSet::new(),
+            block_by_start: std::collections::HashMap::from([(0, 0), (10, 1)]),
+            loop_headers: std::collections::HashSet::new(),
             entry: 0,
-            folded_const_offsets: HashSet::new(),
+            folded_const_offsets: std::collections::HashSet::new(),
         };
         let rw_map = HashMap::from([(0, (vec![], vec![0])), (10, (vec![0], vec![]))]);
 
