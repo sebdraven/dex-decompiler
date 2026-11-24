@@ -12,6 +12,7 @@ pub mod graph;
 mod ir;
 pub mod json_export;
 pub mod kotlin;
+pub(crate) mod local_types;
 pub mod mapping;
 pub mod pass;
 mod read_write;
@@ -38,6 +39,7 @@ use def_webs::{DefKey, DefWebs, ENTRY_DEF};
 use dex_bytecode::{decode_all, Instruction};
 use dex_parser::{ClassDef, CodeItem, DexFile, EncodedMethod, NO_INDEX};
 use ir::{Expr as IrExpr, Stmt as IrStmt, VarId};
+use local_types::{LocalTypes, THROWABLE};
 use pass::{
     run_dead_assign_with_used_regs, used_regs, ConstructorMergePass, CopyPropPass, DeadAssignPass,
     ExprSimplifyPass, InlineFilledArrayPass, InvokeChainPass, Pass, PassRunner, SsaRenamePass,
