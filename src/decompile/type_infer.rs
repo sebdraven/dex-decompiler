@@ -415,7 +415,7 @@ pub(crate) fn enrich_types_with_field_index(
     }
 }
 
-fn vars_in_stmt(stmt: &IrStmt) -> Vec<VarId> {
+pub(crate) fn vars_in_stmt(stmt: &IrStmt) -> Vec<VarId> {
     match stmt {
         IrStmt::Assign { dst, rhs, .. } => {
             let mut v = var_ids_in_expr(rhs);
@@ -470,7 +470,7 @@ impl FieldTypeIndex {
     }
 }
 
-fn superclass_java(dex: &DexFile, class_java: &str) -> Option<String> {
+pub(crate) fn superclass_java(dex: &DexFile, class_java: &str) -> Option<String> {
     if class_java.is_empty() || is_primitive_java_type(class_java) {
         return None;
     }
