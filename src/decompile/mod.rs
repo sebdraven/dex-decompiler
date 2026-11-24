@@ -577,12 +577,14 @@ impl<'a> Decompiler<'a> {
         }
     }
 
-    /// Type-infer for a method body, reusing cached field / return indexes.
+    /// Type-infer for a method body, reusing cached field / return indexes. With `seq`, the
+    /// instructions `stmts` come from, local type inference takes over from the heuristics.
     fn infer_types_for(
         &self,
         encoded: &EncodedMethod,
         code: &CodeItem,
         stmts: &[IrStmt],
+        seq: Option<&[Instruction]>,
     ) -> DetHashMap<VarId, String> {
         self.ensure_type_indexes();
         let fields = self.field_type_index.borrow();
@@ -617,14 +619,107 @@ impl<'a> Decompiler<'a> {
                 types.insert(*dst, ty);
             }
         }
+        if let Some(seq) = seq {
+            self.apply_local_types(&mut types, stmts, seq, code);
+        }
         types
+    }
+
+    /// A version whose definitions all fall in webs of one resolved type takes that type;
+    /// registers with a debug type keep theirs.
+    fn apply_local_types(
+        &self,
+        types: &mut DetHashMap<VarId, String>,
+        stmts: &[IrStmt],
+        seq: &[Instruction],
+        code: &CodeItem,
+    ) {
+        let webs_slot = self.method_webs.borrow();
+        let local_slot = self.method_local_types.borrow();
+        let Some((webs_off, webs)) = webs_slot.as_ref() else {
+            return;
+        };
+        let Some((local_off, local)) = local_slot.as_ref() else {
+            return;
+        };
+        if *webs_off != code.insns_off || *local_off != code.insns_off {
+            return;
+        }
+        let debug = self.method_debug_types.borrow();
+        let versions = self.version_defs(webs, seq);
+        let vids: BTreeSet<VarId> = stmts.iter().flat_map(type_infer::vars_in_stmt).collect();
+        for vid in vids {
+            if debug.as_ref().is_some_and(|d| d.contains_key(&vid.reg)) {
+                continue;
+            }
+            let defs = versions.defs(vid);
+            let mut found = defs
+                .into_iter()
+                .map(|def| local.java_type(webs.web(vid.reg, def)));
+            let Some(Some(ty)) = found.next() else {
+                continue;
+            };
+            if found.all(|t| t.as_deref() == Some(ty.as_str())) {
+                types.insert(vid, ty);
+            }
+        }
+    }
+
+    /// Type local type inference gives every definition of `reg` reaching `off`.
+    fn local_type_at(
+        &self,
+        webs_off: usize,
+        webs: &DefWebs,
+        off: u32,
+        reg: u32,
+    ) -> Option<String> {
+        let local_slot = self.method_local_types.borrow();
+        let (local_off, local) = local_slot.as_ref()?;
+        if *local_off != webs_off || self.debug_type_for_reg(reg).is_some() {
+            return None;
+        }
+        let reaching = webs.reaching(off, reg);
+        let mut found = reaching
+            .into_iter()
+            .map(|def| local.java_type(webs.web(reg, def)));
+        let ty = found.next()??;
+        found
+            .all(|t| t.as_deref() == Some(ty.as_str()))
+            .then_some(ty)
+    }
+
+    /// Type local type inference gives the value `reg` receives at `def`, in the method
+    /// starting at `insns_off`.
+    fn local_def_type(&self, insns_off: usize, reg: u32, def: u32) -> Option<String> {
+        let webs_slot = self.method_webs.borrow();
+        let local_slot = self.method_local_types.borrow();
+        let (webs_off, webs) = webs_slot.as_ref()?;
+        let (local_off, local) = local_slot.as_ref()?;
+        if *webs_off != insns_off || *local_off != insns_off {
+            return None;
+        }
+        local.java_type(webs.web(reg, def))
+    }
+
+    /// `null`, `true` / `false` or a char literal for the constant `bits` defined at `def`,
+    /// from the type local type inference resolved; debug-typed registers keep the number.
+    fn int_literal_at(&self, insns_off: usize, reg: u32, def: u32, bits: &str) -> Option<String> {
+        if self.debug_type_for_reg(reg).is_some() {
+            return None;
+        }
+        let value = bits.trim().parse().ok()?;
+        let ty = self.local_def_type(insns_off, reg, def)?;
+        local_types::int_literal(value, &ty)
     }
 
     /// Java type `reg` holds just before `off`, read off the instructions defining it;
     /// `None` unless every reaching definition gives the same one.
     fn def_type_at(&self, instructions: &[Instruction], off: u32, reg: u32) -> Option<String> {
         let webs_slot = self.method_webs.borrow();
-        let (_, webs) = webs_slot.as_ref()?;
+        let (webs_off, webs) = webs_slot.as_ref()?;
+        if let Some(ty) = self.local_type_at(*webs_off, webs, off, reg) {
+            return Some(ty);
+        }
         let mut found: Option<String> = None;
         for def in webs.reaching(off, reg) {
             let idx = instructions
@@ -3311,7 +3406,8 @@ impl<'a> Decompiler<'a> {
             let stmts = block_ir.remove(&bid).unwrap_or_default();
             let stmts = CopyPropPass.run(stmts);
             let stmts = run_dead_assign_with_used_regs(stmts, &global_used_regs);
-            let type_map = self.infer_types_for(encoded, code, &stmts);
+            // φ-based versions: not the per-block numbering local types map from.
+            let type_map = self.infer_types_for(encoded, code, &stmts, None);
             let registers_size = code.registers_size as u32;
             let ins_size = code.ins_size as u32;
             let is_static = (encoded.access_flags & 0x8) != 0;
@@ -3421,7 +3517,7 @@ impl<'a> Decompiler<'a> {
         let mut out = String::new();
         let stmts = self.instructions_to_ir(instructions, base_off, code_insns, None)?;
         let stmts = self.default_pass_runner().run(stmts);
-        let type_map = self.infer_types_for(encoded, code, &stmts);
+        let type_map = self.infer_types_for(encoded, code, &stmts, Some(instructions));
         let registers_size = code.registers_size as u32;
         let ins_size = code.ins_size as u32;
         let is_static = (encoded.access_flags & 0x8) != 0;
@@ -5035,7 +5131,7 @@ impl<'a> Decompiler<'a> {
                 runner.add(ExprSimplifyPass);
                 runner.add(InlineFilledArrayPass);
                 let stmts = runner.run(stmts);
-                let types = self.infer_types_for(encoded, code, &stmts);
+                let types = self.infer_types_for(encoded, code, &stmts, Some(seq.as_slice()));
                 let mut name_map =
                     build_var_names_with_regs(&stmts, &types, registers_size, ins_size, is_static);
                 self.apply_debug_names_to_name_map(&mut name_map, &types, code, encoded);
@@ -5249,7 +5345,7 @@ impl<'a> Decompiler<'a> {
         runner.add(ExprSimplifyPass);
         runner.add(InlineFilledArrayPass);
         let stmts = runner.run(stmts);
-        let types = self.infer_types_for(encoded, code, &stmts);
+        let types = self.infer_types_for(encoded, code, &stmts, Some(instructions));
         let mut by_reg: DetHashMap<u32, String> = DetHashMap::default();
         let mut ver_seen: DetHashMap<u32, u32> = DetHashMap::default();
         for (vid, ty) in &types {
@@ -6360,7 +6456,7 @@ impl<'a> Decompiler<'a> {
             self.default_pass_runner().run(stmts)
         };
         let stmts = self.inline_single_use_casts(stmts, &seq, code);
-        let mut type_map = self.infer_types_for(encoded, code, &stmts);
+        let mut type_map = self.infer_types_for(encoded, code, &stmts, Some(seq.as_slice()));
         if let Some(reg_types) = self.method_reg_types.borrow().as_ref() {
             let debug_types = self.method_debug_types.borrow();
             self.enrich_types_for(
