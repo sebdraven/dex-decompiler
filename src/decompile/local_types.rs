@@ -564,6 +564,8 @@ struct Constraints {
     sources: Vec<BTreeSet<DefKey>>,
     use_webs: Vec<(BTreeSet<DefKey>, BTreeSet<DefKey>)>,
     all: BTreeSet<DefKey>,
+    /// Webs where a check-cast joins the value it converts: they hold two types.
+    casts: BTreeSet<DefKey>,
 }
 
 impl Constraints {
@@ -623,6 +625,15 @@ impl Constraints {
         for (targets, _) in &use_webs {
             all.extend(targets.iter().copied());
         }
+        let casts: BTreeSet<DefKey> = instructions
+            .iter()
+            .filter(|ins| ins.mnemonic() == "check-cast")
+            .filter_map(|ins| {
+                let reg = *leading_regs(ins.operands()).first()?;
+                let joined = !webs.reaching(ins.offset, reg).is_empty();
+                joined.then(|| webs.web(reg, ins.offset))
+            })
+            .collect();
         Self {
             defs,
             uses,
@@ -631,6 +642,7 @@ impl Constraints {
             sources,
             use_webs,
             all,
+            casts,
         }
     }
 }
@@ -705,7 +717,10 @@ fn solve(constraints: &Constraints, env: &impl TypeEnv, max_iters: usize) -> Loc
         .filter(|ty| **ty == LType::Conflict)
         .count();
     LocalTypes {
-        web_types: resolved.into_iter().collect(),
+        web_types: resolved
+            .into_iter()
+            .filter(|(web, _)| !constraints.casts.contains(web))
+            .collect(),
         conflicts,
     }
 }
