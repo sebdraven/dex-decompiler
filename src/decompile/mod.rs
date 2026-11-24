@@ -498,9 +498,21 @@ struct VersionDefs<'w> {
     webs: &'w DefWebs,
     offsets: Vec<u32>,
     defs_by_reg: DetHashMap<u32, Vec<u32>>,
+    /// `move-result` → the instruction it is folded into.
+    merged: DetHashMap<u32, u32>,
 }
 
 impl VersionDefs<'_> {
+    /// The IR printed for instruction `site` defines `vid`: its own definition, or the call
+    /// its `move-result` was folded into.
+    fn defined_at(&self, vid: VarId, site: u32) -> bool {
+        let def = vid
+            .ver
+            .checked_sub(1)
+            .and_then(|k| self.defs_by_reg.get(&vid.reg)?.get(k as usize).copied());
+        def.is_some_and(|d| d == site || self.merged.get(&d) == Some(&site))
+    }
+
     fn defs(&self, vid: VarId) -> BTreeSet<u32> {
         let defs = self.defs_by_reg.get(&vid.reg);
         if vid.ver > 0 {
@@ -682,9 +694,27 @@ impl<'a> Decompiler<'a> {
         }
         let debug = self.method_debug_types.borrow();
         let versions = self.version_defs(webs, seq);
+        let insns_off = u32::try_from(code.insns_off).ok();
+        let sites: DetHashMap<VarId, u32> = stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                IrStmt::Assign {
+                    dst,
+                    comment: Some(comment),
+                    ..
+                } => Some((*dst, comment_insn_offset(comment)?.checked_sub(insns_off?)?)),
+                _ => None,
+            })
+            .collect();
         let vids: BTreeSet<VarId> = stmts.iter().flat_map(type_infer::vars_in_stmt).collect();
         for vid in vids {
             if debug.as_ref().is_some_and(|d| d.contains_key(&vid.reg)) {
+                continue;
+            }
+            let traced = sites
+                .get(&vid)
+                .is_some_and(|&site| versions.defined_at(vid, site));
+            if vid.ver > 0 && !traced {
                 continue;
             }
             let defs = versions.defs(vid);
@@ -5712,10 +5742,16 @@ impl<'a> Decompiler<'a> {
                 defs_by_reg.entry(reg).or_default().push(ins.offset);
             }
         }
+        let merged = seq
+            .windows(2)
+            .filter(|pair| pair[1].mnemonic().starts_with("move-result"))
+            .map(|pair| (pair[1].offset, pair[0].offset))
+            .collect();
         VersionDefs {
             webs,
             offsets: seq.iter().map(|ins| ins.offset).collect(),
             defs_by_reg,
+            merged,
         }
     }
 
