@@ -6479,7 +6479,13 @@ impl<'a> Decompiler<'a> {
         bits_str: &str,
         instructions: &[Instruction],
         idx: usize,
+        base_off: usize,
     ) -> String {
+        if let Some(ins) = instructions.get(idx) {
+            if let Some(literal) = self.int_literal_at(base_off, dst_reg, ins.offset, bits_str) {
+                return literal;
+            }
+        }
         let as_float = self.const_32_used_as_float(dst_reg, instructions, idx)
             || self.debug_type_for_reg(dst_reg).as_deref() == Some("float");
         if as_float {
@@ -6830,7 +6836,7 @@ impl<'a> Decompiler<'a> {
                 let rhs_str = if m.starts_with("const-wide") {
                     self.format_const_wide_rhs(m, dst_reg, &rhs_str, instructions, idx)
                 } else if matches!(m, "const" | "const/high16" | "const/16" | "const/4") {
-                    self.format_const_32_rhs(dst_reg, &rhs_str, instructions, idx)
+                    self.format_const_32_rhs(dst_reg, &rhs_str, instructions, idx, base_off)
                 } else {
                     rhs_str
                 };
