@@ -11265,6 +11265,92 @@ mod tests {
         assert_eq!(names.len(), 3, "{names:?}");
     }
 
+    /// `D0.T.c(Object, Object)`: the call result is cast again in its register, and the
+    /// second parameter's register is reused for `S1.e.c`, passed to `f` and returned.
+    #[test]
+    fn recast_call_result_and_reused_parameter_register_stay_declared() {
+        const OBJECT: &str = "Ljava/lang/Object;";
+        const A: &str = "(LW1/d;Ljava/lang/Object;)LW1/d;";
+        const F: &str = "(Ljava/lang/Object;)Ljava/lang/Object;";
+        const C: &str = "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;";
+        let mut builder = dex_parser::DexBuilder::new();
+        for ty in [OBJECT, "LD0/T;", "Lm2/s;", "LW1/d;"] {
+            builder.intern_type(ty);
+        }
+        builder.intern_field_ref("LS1/e;", "c", "LS1/e;");
+        builder.intern_method_ref("LD0/T;", "a", A);
+        builder.intern_method_ref("LD0/T;", "f", F);
+        builder.intern_method_ref("LD0/T;", "c", C);
+        let pools = builder.pool_maps();
+        let le = |idx: u32| u16::try_from(idx).expect("16-bit index").to_le_bytes();
+        let ty = |d: &str| le(pools.ty(d).expect("type"));
+        let (m2, w1, t) = (ty("Lm2/s;"), ty("LW1/d;"), ty("LD0/T;"));
+        let field = le(pools.field("LS1/e;", "c", "LS1/e;").expect("field"));
+        let a = le(pools.method("LD0/T;", "a", A).expect("method a"));
+        let f = le(pools.method("LD0/T;", "f", F).expect("method f"));
+        let insns = vec![
+            0x1f, 0x01, m2[0], m2[1], // 00: check-cast v1, m2.s
+            0x1f, 0x02, w1[0], w1[1], // 04: check-cast v2, W1.d
+            0x6e, 0x30, a[0], a[1], 0x20, 0x01, // 08: invoke-virtual {v0, v2, v1}, T.a
+            0x0c, 0x01, // 0e: move-result-object v1
+            0x1f, 0x01, t[0], t[1], // 10: check-cast v1, D0.T
+            0x62, 0x02, field[0], field[1], // 14: sget-object v2, S1.e.c
+            0x6e, 0x20, f[0], f[1], 0x21, 0x00, // 18: invoke-virtual {v1, v2}, T.f
+            0x11, 0x02, // 1e: return-object v2
+        ];
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "LD0/T;".into(),
+            access_flags: 1,
+            superclass: Some(OBJECT.into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![],
+            direct_methods: vec![],
+            virtual_methods: vec![dex_parser::BuiltMethod {
+                class: "LD0/T;".into(),
+                name: "c".into(),
+                proto: C.into(),
+                access_flags: 1,
+                direct: false,
+                code: Some(dex_parser::BuiltCode {
+                    registers_size: 3,
+                    ins_size: 3,
+                    outs_size: 3,
+                    insns,
+                    ..Default::default()
+                }),
+            }],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        let java = Decompiler::new(&dex).decompile().expect("decompile");
+        let lines: Vec<&str> = java.lines().map(str::trim).collect();
+
+        let read = lines
+            .iter()
+            .find(|l| l.ends_with("e.c;"))
+            .unwrap_or_else(|| panic!("no read of S1.e.c:\n{java}"));
+        let (lhs, _) = read.split_once(" = ").expect("assignment");
+        let &[_, var] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {read}\n{java}");
+        };
+        let passed = format!(".f({var});");
+        assert!(lines.iter().any(|l| l.ends_with(&passed)), "{java}");
+        assert!(lines.contains(&format!("return {var};").as_str()), "{java}");
+
+        let call = lines
+            .iter()
+            .find(|l| l.contains("this.a("))
+            .unwrap_or_else(|| panic!("no call to a:\n{java}"));
+        let (lhs, _) = call.split_once(" = ").expect("assignment");
+        let &[ty, _] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {call}\n{java}");
+        };
+        assert_ne!(ty.rsplit('.').next(), Some("T"), "{java}");
+    }
+
     #[test]
     fn text_rewrites_keep_non_ascii() {
         let mut names = DetHashMap::default();
