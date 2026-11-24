@@ -5390,6 +5390,13 @@ impl<'a> Decompiler<'a> {
         let mut cfg = cfg.clone();
         let mut exceptional_edges = Vec::new();
         let mut tries = Vec::new();
+        let mut catch_types: DetHashMap<u32, String> = DetHashMap::default();
+        let mut catch = |addr: u32, ty: String| {
+            let slot = catch_types.entry(addr * 2).or_insert_with(|| ty.clone());
+            if *slot != ty {
+                *slot = THROWABLE.to_string();
+            }
+        };
         if code.tries_size > 0 {
             if let Some(pairs) = try_handler_pairs(self.dex.data.as_ref(), encoded.code_off, code)
             {
@@ -5400,8 +5407,16 @@ impl<'a> Decompiler<'a> {
                     let end = (try_item.start_addr + try_item.insn_count as u32) * 2;
                     let mut starts: Vec<u32> =
                         handler.handlers.iter().map(|entry| entry.addr * 2).collect();
+                    for entry in &handler.handlers {
+                        let ty = match self.dex.get_type(entry.type_idx) {
+                            Ok(desc) => java::descriptor_to_java(&desc),
+                            Err(_) => THROWABLE.to_string(),
+                        };
+                        catch(entry.addr, ty);
+                    }
                     if let Some(catch_all) = handler.catch_all_addr {
                         starts.push(catch_all * 2);
+                        catch(catch_all, THROWABLE.to_string());
                     }
                     leaders.extend(starts.iter().copied());
                     tries.push((start, end));
@@ -5422,11 +5437,49 @@ impl<'a> Decompiler<'a> {
         let entry_regs: Vec<u32> = (param_base..registers_size).collect();
         let webs = DefWebs::build(&cfg, instructions, &exceptional_edges, &entry_regs)
             .with_tries(tries);
+        let local = self.build_local_types(instructions, &webs, code, encoded, catch_types);
+        let mut web_types = DetHashMap::default();
+        if let Some(local) = &local {
+            let debug = self.method_debug_types.borrow();
+            for (web, ty) in local.java_types() {
+                if !debug.as_ref().is_some_and(|d| d.contains_key(&web.0)) {
+                    web_types.insert(web, ty);
+                }
+            }
+        }
         *self.method_webs.borrow_mut() = Some((code.insns_off, webs));
+        *self.method_local_types.borrow_mut() = local.map(|l| (code.insns_off, l));
         *self.method_names.borrow_mut() = MethodNameState {
             insns_off: code.insns_off,
+            web_types,
             ..MethodNameState::default()
         };
+    }
+
+    fn build_local_types(
+        &self,
+        instructions: &[Instruction],
+        webs: &DefWebs,
+        code: &CodeItem,
+        encoded: &EncodedMethod,
+        catch_types: DetHashMap<u32, String>,
+    ) -> Option<LocalTypes> {
+        let info = self.dex.get_method_info(encoded.method_idx).ok()?;
+        let is_static = (encoded.access_flags & 0x8) != 0;
+        let registers_size = code.registers_size as u32;
+        let frame = local_types::Frame {
+            this_class: (!is_static).then(|| java::descriptor_to_java(&info.class)),
+            params: info
+                .params
+                .iter()
+                .map(|p| java::descriptor_to_java(p))
+                .collect(),
+            ret: java::descriptor_to_java(&info.return_type),
+            param_base: registers_size.saturating_sub(code.ins_size as u32),
+            catch_types,
+        };
+        let env = local_types::DexTypeEnv::new(self.dex);
+        Some(LocalTypes::build(instructions, webs, &frame, &env))
     }
 
     /// Parameter names and `this` belong to their entry web from the start (R2); the
