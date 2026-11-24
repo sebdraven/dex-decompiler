@@ -6182,12 +6182,17 @@ impl<'a> Decompiler<'a> {
         let registers_size = code.registers_size as u32;
         let ins_size = code.ins_size as u32;
         let param_base = registers_size.saturating_sub(ins_size);
+        let params = self.param_display_names_by_reg(encoded, code);
         if let Some(names) = self.method_reg_names.borrow().as_ref() {
             for reg in param_base..registers_size {
-                if let Some(n) = names.get(&reg) {
-                    if n != "this" {
-                        declared.insert(n.clone());
-                    }
+                let Some(n) = names.get(&reg) else {
+                    continue;
+                };
+                // A role or temp name on a parameter register names a later local.
+                let local = params.get(&reg) != Some(n)
+                    && (matches!(n.as_str(), "result" | "length") || is_synthetic_local_name(n));
+                if n != "this" && !local {
+                    declared.insert(n.clone());
                 }
             }
         }
