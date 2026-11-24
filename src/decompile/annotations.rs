@@ -33,7 +33,7 @@ fn read_u32(data: &[u8], pos: usize) -> Option<u32> {
 }
 
 /// One annotation element value (subset needed for Signature / InnerClass).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EncodedValue {
     Byte(i8),
     Short(i16),
@@ -262,7 +262,49 @@ fn parse_annotation_item(
     Some(ParsedAnnotation { type_idx, elements })
 }
 
-fn read_encoded_value(data: &[u8], pos: &mut usize) -> Option<EncodedValue> {
+/// Reads the `value_arg + 1` little-endian payload bytes of an `encoded_value`,
+/// capped at `width`. Returns the raw bits and how many bytes were read.
+fn read_payload(
+    data: &[u8],
+    pos: &mut usize,
+    value_arg: usize,
+    width: usize,
+) -> Option<(u64, usize)> {
+    let n = value_arg.min(width - 1) + 1;
+    let bytes = data.get(*pos..*pos + n)?;
+    *pos += n;
+    let raw = bytes
+        .iter()
+        .enumerate()
+        .fold(0u64, |acc, (i, &b)| acc | (u64::from(b) << (8 * i)));
+    Some((raw, n))
+}
+
+/// `VALUE_CHAR`: zero-extended to the left.
+fn read_unsigned(data: &[u8], pos: &mut usize, value_arg: usize, width: usize) -> Option<u64> {
+    read_payload(data, pos, value_arg, width).map(|(raw, _)| raw)
+}
+
+/// `VALUE_SHORT` / `VALUE_INT` / `VALUE_LONG`: sign-extended to the left.
+fn read_signed(data: &[u8], pos: &mut usize, value_arg: usize, width: usize) -> Option<i64> {
+    let (raw, n) = read_payload(data, pos, value_arg, width)?;
+    let shift = 64 - 8 * n as u32;
+    Some(((raw << shift) as i64) >> shift)
+}
+
+/// `VALUE_FLOAT` / `VALUE_DOUBLE`: zero-extended to the right — the stored bytes
+/// are the most significant ones of the IEEE 754 bit pattern.
+fn read_right_extended(
+    data: &[u8],
+    pos: &mut usize,
+    value_arg: usize,
+    width: usize,
+) -> Option<u64> {
+    let (raw, n) = read_payload(data, pos, value_arg, width)?;
+    Some(raw << (8 * (width - n) as u32))
+}
+
+pub(super) fn read_encoded_value(data: &[u8], pos: &mut usize) -> Option<EncodedValue> {
     if *pos >= data.len() {
         return None;
     }
@@ -277,56 +319,22 @@ fn read_encoded_value(data: &[u8], pos: &mut usize) -> Option<EncodedValue> {
             *pos += 1;
             Some(EncodedValue::Byte(v))
         }
-        0x02 => {
-            let mut buf = [0u8; 2];
-            for i in 0..=value_arg.min(1) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Short(i16::from_le_bytes(buf)))
-        }
-        0x03 => {
-            let mut buf = [0u8; 2];
-            for i in 0..=value_arg.min(1) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Char(u16::from_le_bytes(buf)))
-        }
-        0x04 => {
-            let mut buf = [0u8; 4];
-            for i in 0..=value_arg.min(3) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Int(i32::from_le_bytes(buf)))
-        }
-        0x06 => {
-            let mut buf = [0u8; 8];
-            for i in 0..=value_arg.min(7) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Long(i64::from_le_bytes(buf)))
-        }
-        0x10 => {
-            let mut buf = [0u8; 4];
-            for i in 0..=value_arg.min(3) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Float(f32::from_bits(u32::from_le_bytes(buf))))
-        }
-        0x11 => {
-            let mut buf = [0u8; 8];
-            for i in 0..=value_arg.min(7) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Double(f64::from_bits(u64::from_le_bytes(
-                buf,
-            ))))
-        }
+        0x02 => Some(EncodedValue::Short(
+            read_signed(data, pos, value_arg, 2)? as i16
+        )),
+        0x03 => Some(EncodedValue::Char(
+            read_unsigned(data, pos, value_arg, 2)? as u16
+        )),
+        0x04 => Some(EncodedValue::Int(
+            read_signed(data, pos, value_arg, 4)? as i32
+        )),
+        0x06 => Some(EncodedValue::Long(read_signed(data, pos, value_arg, 8)?)),
+        0x10 => Some(EncodedValue::Float(f32::from_bits(read_right_extended(
+            data, pos, value_arg, 4,
+        )? as u32))),
+        0x11 => Some(EncodedValue::Double(f64::from_bits(read_right_extended(
+            data, pos, value_arg, 8,
+        )?))),
         0x17 => {
             // string (uleb128 index, size = value_arg+1 bytes as unsigned)
             let mut v: u32 = 0;
@@ -753,6 +761,70 @@ fn find_matching_gt(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_one(bytes: &[u8]) -> Option<(EncodedValue, usize)> {
+        let mut pos = 0;
+        read_encoded_value(bytes, &mut pos).map(|v| (v, pos))
+    }
+
+    #[test]
+    fn encoded_float_double_zero_extended_to_the_right() {
+        // 5.0 = 0x4014_0000_0000_0000, stored as its two high bytes.
+        assert_eq!(
+            decode_one(b"\x31\x14\x40"),
+            Some((EncodedValue::Double(5.0), 3))
+        );
+        // 0.5 = 0x3FE0_0000_0000_0000.
+        assert_eq!(
+            decode_one(b"\x31\xE0\x3F"),
+            Some((EncodedValue::Double(0.5), 3))
+        );
+        // 1.0f = 0x3F80_0000.
+        assert_eq!(
+            decode_one(b"\x30\x80\x3F"),
+            Some((EncodedValue::Float(1.0), 3))
+        );
+        // 9.80665f = 0x411C_E80A, all four bytes present.
+        assert_eq!(
+            decode_one(b"\x70\x0A\xE8\x1C\x41"),
+            Some((EncodedValue::Float(9.80665), 5))
+        );
+    }
+
+    #[test]
+    fn encoded_short_int_long_sign_extended() {
+        assert_eq!(decode_one(b"\x04\xFF"), Some((EncodedValue::Int(-1), 2)));
+        assert_eq!(decode_one(b"\x04\x7F"), Some((EncodedValue::Int(127), 2)));
+        assert_eq!(
+            decode_one(b"\x24\x80\x00"),
+            Some((EncodedValue::Int(128), 3))
+        );
+        assert_eq!(
+            decode_one(b"\x24\x00\x80"),
+            Some((EncodedValue::Int(-32768), 3))
+        );
+        assert_eq!(decode_one(b"\x02\xFE"), Some((EncodedValue::Short(-2), 2)));
+        assert_eq!(decode_one(b"\x06\xFF"), Some((EncodedValue::Long(-1), 2)));
+        assert_eq!(
+            decode_one(b"\x46\x00\x00\x80"),
+            Some((EncodedValue::Long(-8_388_608), 4))
+        );
+    }
+
+    #[test]
+    fn encoded_char_zero_extended() {
+        assert_eq!(decode_one(b"\x03\xFF"), Some((EncodedValue::Char(0xFF), 2)));
+        assert_eq!(
+            decode_one(b"\x23\xFF\xFF"),
+            Some((EncodedValue::Char(0xFFFF), 3))
+        );
+    }
+
+    #[test]
+    fn encoded_value_truncated_payload_is_none() {
+        assert_eq!(decode_one(b"\x31\x14"), None);
+        assert_eq!(decode_one(b"\x64\x01\x02"), None);
+    }
 
     #[test]
     fn signature_type_params() {
