@@ -423,6 +423,8 @@ pub struct Decompiler<'a> {
     method_return_index: RefCell<Option<MethodReturnIndex>>,
     /// Def-use webs of the method being decompiled, keyed by its `insns_off`.
     method_webs: RefCell<Option<(usize, DefWebs)>>,
+    /// Types of `method_webs` by local type inference, keyed by the same `insns_off`.
+    method_local_types: RefCell<Option<(usize, LocalTypes)>>,
     /// Per-method name ownership, so two variables (webs) never share a synthetic name.
     method_names: RefCell<MethodNameState>,
     /// Invoke offset (as printed in IR comments) → declared Java return type.
@@ -488,6 +490,35 @@ impl MethodNameState {
     }
 }
 
+/// Definitions behind the SSA versions of the IR built from `seq`: version k of a register
+/// is its k-th IR definition in `seq`, version 0 the value read before the first one.
+struct VersionDefs<'w> {
+    webs: &'w DefWebs,
+    offsets: Vec<u32>,
+    defs_by_reg: DetHashMap<u32, Vec<u32>>,
+}
+
+impl VersionDefs<'_> {
+    fn defs(&self, vid: VarId) -> BTreeSet<u32> {
+        let defs = self.defs_by_reg.get(&vid.reg);
+        if vid.ver > 0 {
+            let def = defs.and_then(|d| d.get(vid.ver as usize - 1));
+            return def.map(|&off| BTreeSet::from([off])).unwrap_or_default();
+        }
+        let first_def = defs.and_then(|d| d.first().copied());
+        let probe = self
+            .offsets
+            .iter()
+            .copied()
+            .take_while(|off| first_def.is_none_or(|d| *off <= d))
+            .find(|off| self.webs.reads(*off).contains(&vid.reg))
+            .or_else(|| self.offsets.first().copied());
+        probe
+            .map(|off| self.webs.reaching(off, vid.reg))
+            .unwrap_or_default()
+    }
+}
+
 impl<'a> Decompiler<'a> {
     pub fn new(dex: &'a DexFile) -> Self {
         let resource_map = resource_consts::build_resource_name_map(dex, None);
@@ -517,6 +548,7 @@ impl<'a> Decompiler<'a> {
             field_type_index: RefCell::new(None),
             method_return_index: RefCell::new(None),
             method_webs: RefCell::new(None),
+            method_local_types: RefCell::new(None),
             method_names: RefCell::new(MethodNameState::default()),
             call_return_types: RefCell::new(DetHashMap::default()),
         }
@@ -552,6 +584,7 @@ impl<'a> Decompiler<'a> {
             field_type_index: RefCell::new(None),
             method_return_index: RefCell::new(None),
             method_webs: RefCell::new(None),
+            method_local_types: RefCell::new(None),
             method_names: RefCell::new(MethodNameState::default()),
             call_return_types: RefCell::new(DetHashMap::default()),
         }
@@ -5670,6 +5703,20 @@ impl<'a> Decompiler<'a> {
         None
     }
 
+    fn version_defs<'w>(&self, webs: &'w DefWebs, seq: &[Instruction]) -> VersionDefs<'w> {
+        let mut defs_by_reg: DetHashMap<u32, Vec<u32>> = DetHashMap::default();
+        for ins in seq {
+            if let Some(reg) = self.ir_def_reg(ins) {
+                defs_by_reg.entry(reg).or_default().push(ins.offset);
+            }
+        }
+        VersionDefs {
+            webs,
+            offsets: seq.iter().map(|ins| ins.offset).collect(),
+            defs_by_reg,
+        }
+    }
+
     /// One Java variable per def-use web (D1, D5): every definition and use of a web gets
     /// the same name, a parameter register keeps the parameter's name only while it holds
     /// the incoming value, and a synthetic temp name belongs to a single register.
@@ -5691,40 +5738,10 @@ impl<'a> Decompiler<'a> {
         let registers_size = code.registers_size as u32;
         let param_base = registers_size.saturating_sub(code.ins_size as u32);
         let param_names = self.param_display_names_by_reg(encoded, code);
-        // SSA version k of a register is its k-th IR definition in `seq`.
-        let mut defs_by_reg: DetHashMap<u32, Vec<u32>> = DetHashMap::default();
-        for ins in seq {
-            if let Some(reg) = self.ir_def_reg(ins) {
-                defs_by_reg.entry(reg).or_default().push(ins.offset as u32);
-            }
-        }
-        // Version 0 is the value read before the first definition in `seq`.
-        let incoming = |reg: u32| -> BTreeSet<u32> {
-            let first_def = defs_by_reg.get(&reg).and_then(|d| d.first().copied());
-            let probe = seq
-                .iter()
-                .map(|ins| ins.offset as u32)
-                .take_while(|off| first_def.map_or(true, |d| *off <= d))
-                .find(|off| webs.reads(*off).contains(&reg))
-                .or_else(|| seq.first().map(|ins| ins.offset as u32));
-            probe
-                .map(|off| webs.reaching(off, reg))
-                .unwrap_or_default()
-        };
-        let defs_of = |vid: VarId| -> BTreeSet<u32> {
-            if vid.ver == 0 {
-                incoming(vid.reg)
-            } else {
-                defs_by_reg
-                    .get(&vid.reg)
-                    .and_then(|d| d.get(vid.ver as usize - 1))
-                    .map(|&off| BTreeSet::from([off]))
-                    .unwrap_or_default()
-            }
-        };
+        let versions = self.version_defs(webs, seq);
         // Names are claimed in bytecode order: definition address, then register.
         let mut vids: Vec<(VarId, BTreeSet<u32>)> =
-            name_map.keys().map(|&vid| (vid, defs_of(vid))).collect();
+            name_map.keys().map(|&vid| (vid, versions.defs(vid))).collect();
         vids.sort_by_key(|(vid, defs)| {
             (defs.first().copied().unwrap_or(ENTRY_DEF), vid.reg, vid.ver)
         });
