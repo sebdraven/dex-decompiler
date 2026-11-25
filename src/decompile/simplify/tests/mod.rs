@@ -1424,6 +1424,26 @@ mod string_switch {
         );
     }
 
+    /// `F2.k.close()`: a value declared in the try and closed there, under a finally that
+    /// does not close it, stays a plain try/finally.
+    #[test]
+    fn resource_closed_in_try_under_unrelated_finally_is_not_try_with_resources() {
+        let body = r#"        try {
+            F2.q v0_r0 = (F2.q) this.e;
+            v0_r0.close();
+        } finally {
+            if (v5_r1 == null) {
+                v5_r1 = e;
+            }
+        }
+"#;
+        let out = simplify_method_body(body, false);
+        assert!(!out.contains("try ("), "{}", out);
+        assert!(out.contains("v0_r0.close();"), "{}", out);
+        assert!(out.contains("} finally {"), "{}", out);
+        assert_eq!(out.matches('{').count(), out.matches('}').count(), "{}", out);
+    }
+
     #[test]
     fn jadx_strip_redundant_cast() {
         let body = r#"        String s = (String) new String("x");

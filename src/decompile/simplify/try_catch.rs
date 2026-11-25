@@ -1294,6 +1294,12 @@ pub(crate) fn restore_d8_try_with_resources_once(body: &str) -> String {
         if !had_inline_close && !has_boilerplate {
             continue;
         }
+        // A catch or finally that does not close the resources is the method's own:
+        // rewriting the try would leave it orphaned.
+        let left = lines.get(boilerplate_end).map(|l| l.trim()).unwrap_or("");
+        if left.starts_with("} catch (") || left.starts_with("} finally") || left == "finally {" {
+            continue;
+        }
 
         let decl_idxs: DetHashSet<usize> =
             decls_above.iter().map(|(i, _, _, _)| *i).collect();

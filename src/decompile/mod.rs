@@ -6090,8 +6090,8 @@ impl<'a> Decompiler<'a> {
         code: &CodeItem,
     ) -> Vec<IrStmt> {
         let mut casts: Vec<VarId> = Vec::new();
-        // (load, its cast, cast inlinable at its use)
-        let mut folds: Vec<(VarId, VarId, bool)> = Vec::new();
+        // (load, its cast, cast inlinable at its use, cast type)
+        let mut folds: Vec<(VarId, VarId, bool, String)> = Vec::new();
         {
             let webs_slot = self.method_webs.borrow();
             let Some((webs_off, webs)) = webs_slot.as_ref() else {
@@ -6123,16 +6123,22 @@ impl<'a> Decompiler<'a> {
                 let after_load = i.checked_sub(1).and_then(|j| seq.get(j)).is_some_and(|prev| {
                     local.is_some_and(|l| l.is_cast_load(reg, prev.offset as u32))
                 });
-                if after_load {
-                    folds.push((VarId::new(reg, *ver - 1), cast, inlinable));
-                } else if inlinable {
-                    casts.push(cast);
+                let ty = after_load
+                    .then(|| {
+                        let ops = self.resolve_operands(ins.operands());
+                        ops.split(',').nth(1).map(|t| t.trim().to_string())
+                    })
+                    .flatten();
+                match ty {
+                    Some(ty) => folds.push((VarId::new(reg, *ver - 1), cast, inlinable, ty)),
+                    None if inlinable => casts.push(cast),
+                    None => {}
                 }
             }
         }
         let mut stmts = stmts;
-        for (load, cast, inlinable) in folds {
-            if !fold_load_into_cast(&mut stmts, load) && inlinable {
+        for (load, cast, inlinable, ty) in folds {
+            if !fold_load_into_cast(&mut stmts, load, &ty) && inlinable {
                 casts.push(cast);
             }
         }
@@ -6736,6 +6742,9 @@ impl<'a> Decompiler<'a> {
                 }
             }
         };
+        if line.contains(REGISTER_SHIELD) {
+            return shorten_java_names(&line.replace(REGISTER_SHIELD, ""));
+        }
         shorten_java_names(&line)
     }
 
@@ -9464,9 +9473,9 @@ fn substitute_ir_var(stmt: &mut IrStmt, vid: VarId, var: &str, expr: &str) -> bo
     }
 }
 
-/// Writes the value `load` assigns into its one use, the check-cast right after it, and
-/// drops the assignment; false when either is missing.
-fn fold_load_into_cast(stmts: &mut Vec<IrStmt>, load: VarId) -> bool {
+/// Writes the value `load` assigns into the operand of the check-cast `(ty) operand` right
+/// after it, and drops the assignment; false when the cast is not in that form.
+fn fold_load_into_cast(stmts: &mut Vec<IrStmt>, load: VarId, ty: &str) -> bool {
     let Some(at) = stmts
         .iter()
         .position(|s| matches!(s, IrStmt::Assign { dst, .. } if *dst == load))
@@ -9488,16 +9497,68 @@ fn fold_load_into_cast(stmts: &mut Vec<IrStmt>, load: VarId) -> bool {
             }
         }
     };
+    let (Some(IrStmt::Assign {
+        rhs: IrExpr::Raw(cast),
+        ..
+    })
+    | Some(IrStmt::Return {
+        value: Some(IrExpr::Raw(cast)),
+        ..
+    })) = stmts.get_mut(at + 1)
+    else {
+        return false;
+    };
+    let Some(operand) = cast_operand(cast.as_str()) else {
+        return false;
+    };
+    let mut operand = IrStmt::Raw(operand.to_string());
     let var = format!("v{}_{}", load.reg, load.ver);
-    if !stmts
-        .iter_mut()
-        .skip(at + 1)
-        .any(|stmt| substitute_ir_var(stmt, load, &var, &value))
-    {
+    if !substitute_ir_var(&mut operand, load, &var, &value) {
         return false;
     }
+    let IrStmt::Raw(operand) = operand else {
+        return false;
+    };
+    // SSA renaming already rewrote a package named like a register (`v0.f` → `v0_1.f`).
+    *cast = format!("({}) {operand}", shield_registers(ty));
     stmts.remove(at);
     true
+}
+
+/// Operand of a check-cast text `(<Type>) <operand>`: what follows the parenthesis closing
+/// the first one.
+fn cast_operand(text: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return text[at + 1..].strip_prefix(' ').filter(|op| !op.is_empty());
+                }
+            }
+            _ if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Put after the `v` of `v<digit>` in a type written into IR text, so that no pass reads
+/// it as a register; `codegen_stmt_line` removes it.
+const REGISTER_SHIELD: char = '\u{FDD1}';
+
+fn shield_registers(ty: &str) -> String {
+    let mut out = String::with_capacity(ty.len());
+    let mut chars = ty.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == 'v' && chars.peek().is_some_and(char::is_ascii_digit) {
+            out.push(REGISTER_SHIELD);
+        }
+    }
+    out
 }
 
 fn replace_ident_in_body(body: &str, from: &str, to: &str) -> String {
@@ -11666,7 +11727,7 @@ mod tests {
 
     /// Decompiles `k.K.m<proto>` (a virtual method unless `access_flags` has `static`),
     /// with `Iterator.next`, `p.Foo.bar()`, `k.K.k(Object)`, the `Object` fields `k.K.o`,
-    /// `k.S.a`, `k.S.b` and the types `p.Foo`, `p.A`, `p.B` interned for `body`.
+    /// `k.S.a`, `k.S.b` and the types `p.Foo`, `p.A`, `p.B`, `v0.f` interned for `body`.
     fn decompile_cast_method(
         proto: &str,
         access_flags: u32,
@@ -11676,7 +11737,7 @@ mod tests {
     ) -> String {
         const OBJECT: &str = "Ljava/lang/Object;";
         let mut builder = dex_parser::DexBuilder::new();
-        for ty in [OBJECT, "Lk/K;", "Lp/Foo;", "Lp/A;", "Lp/B;", ITERATOR] {
+        for ty in [OBJECT, "Lk/K;", "Lp/Foo;", "Lp/A;", "Lp/B;", "Lv0/f;", ITERATOR] {
             builder.intern_type(ty);
         }
         builder.intern_method_ref(ITERATOR, "next", NEXT);
@@ -11773,6 +11834,37 @@ mod tests {
             ]
         });
         assert_foo_cast_at_assignment(&java, ".next();");
+    }
+
+    /// Obfuscated package named like the register cast: `v0` keeps its name in the cast,
+    /// only the operand takes the call.
+    #[test]
+    fn cast_to_a_package_named_like_its_register_keeps_the_type() {
+        let java = decompile_cast_method("(Ljava/util/Iterator;)V", 0x9, 2, 1, |pools| {
+            let next = le16(pools.method(ITERATOR, "next", NEXT));
+            let f = le16(pools.ty("Lv0/f;"));
+            let k = le16(pools.method("Lk/K;", "k", "(Ljava/lang/Object;)V"));
+            vec![
+                0x72, 0x10, next[0], next[1], 0x01, 0x00, // 00: invoke-interface {v1}, next
+                0x0c, 0x00, // 06: move-result-object v0
+                0x1f, 0x00, f[0], f[1], // 08: check-cast v0, v0.f
+                0x71, 0x10, k[0], k[1], 0x00, 0x00, // 0c: invoke-static {v0}, k.K.k
+                0x0e, 0x00, // 12: return-void
+            ]
+        });
+        let line = java
+            .lines()
+            .map(str::trim)
+            .find(|l| l.ends_with(".next();"))
+            .unwrap_or_else(|| panic!("no call to next:\n{java}"));
+        let (lhs, rhs) = line.split_once(" = ").expect("assignment");
+        let &[ty, _] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {line}\n{java}");
+        };
+        assert_eq!(ty, "v0.f", "{java}");
+        assert!(rhs.starts_with("(v0.f) "), "{java}");
+        assert!(!java.contains("(("), "{java}");
+        assert!(!java.contains(".next()).f"), "{java}");
     }
 
     /// `Foo f = (Foo) this.o;` for a field typed `Object`.
