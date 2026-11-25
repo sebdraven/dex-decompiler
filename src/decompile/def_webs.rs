@@ -330,7 +330,13 @@ impl DefWebs {
             .unwrap_or(&[])
     }
 
-    fn members(&self, web: DefKey) -> impl Iterator<Item = DefKey> + '_ {
+    /// Offset of the instruction right after `off` in its block.
+    pub(crate) fn next_in_block(&self, off: u32) -> Option<u32> {
+        let &(bid, idx) = self.position.get(&off)?;
+        self.block_offsets[bid].get(idx + 1).copied()
+    }
+
+    pub(crate) fn members(&self, web: DefKey) -> impl Iterator<Item = DefKey> + '_ {
         self.parent
             .iter()
             .filter(move |(_, root)| **root == web)

@@ -217,6 +217,8 @@ pub(crate) struct Frame {
 #[derive(Debug, PartialEq)]
 pub(crate) struct LocalTypes {
     web_types: DetHashMap<DefKey, LType>,
+    /// Loads of the webs typed at their check-cast (`cast_target`).
+    cast_loads: BTreeSet<DefKey>,
     /// Webs left in `Conflict`: the next step of the algorithm splits them.
     #[cfg_attr(not(test), allow(dead_code))]
     conflicts: usize,
@@ -263,6 +265,12 @@ impl LocalTypes {
         self.web_types
             .iter()
             .filter_map(|(web, ty)| Some((*web, ty.java()?)))
+    }
+
+    /// Definition `def` of `reg` is a load whose web takes the type of the check-cast
+    /// right after it: the cast belongs in its assignment.
+    pub(crate) fn is_cast_load(&self, reg: u32, def: u32) -> bool {
+        self.cast_loads.contains(&(reg, def))
     }
 }
 
@@ -566,6 +574,9 @@ struct Constraints {
     all: BTreeSet<DefKey>,
     /// Webs where a check-cast joins the value it converts: they hold two types.
     casts: BTreeSet<DefKey>,
+    /// Webs of `casts` typed at their check-cast, and their loads.
+    cast_typed: BTreeMap<DefKey, LType>,
+    cast_loads: BTreeSet<DefKey>,
 }
 
 impl Constraints {
@@ -634,6 +645,14 @@ impl Constraints {
                 joined.then(|| webs.web(reg, ins.offset))
             })
             .collect();
+        let mut cast_typed = BTreeMap::new();
+        let mut cast_loads = BTreeSet::new();
+        for &web in &casts {
+            if let Some((ty, loads)) = cast_target(web, instructions, webs, env) {
+                cast_typed.insert(web, ty);
+                cast_loads.extend(loads);
+            }
+        }
         Self {
             defs,
             uses,
@@ -643,8 +662,59 @@ impl Constraints {
             use_webs,
             all,
             casts,
+            cast_typed,
+            cast_loads,
         }
     }
+}
+
+/// Type `T` of the cast web `web` when every other definition of it is an object load
+/// (call result, field, array element) read only by a check-cast to `T`, the next
+/// instruction of its block; with those loads. Parameters stay out.
+fn cast_target(
+    web: DefKey,
+    instructions: &[Instruction],
+    webs: &DefWebs,
+    env: &impl TypeEnv,
+) -> Option<(LType, Vec<DefKey>)> {
+    let at = |off: u32| instructions.binary_search_by_key(&off, |ins| ins.offset).ok();
+    let mut target: Option<String> = None;
+    let mut loads = Vec::new();
+    for (reg, def) in webs.members(web) {
+        if def == ENTRY_DEF {
+            return None;
+        }
+        let i = at(def)?;
+        match instructions[i].mnemonic() {
+            "check-cast" => {
+                let ty = ref_index(instructions[i].operands()).and_then(|t| env.type_name(t))?;
+                if *target.get_or_insert_with(|| ty.clone()) != ty {
+                    return None;
+                }
+                continue;
+            }
+            "move-result-object" => {
+                let after_invoke = i
+                    .checked_sub(1)
+                    .is_some_and(|j| instructions[j].mnemonic().starts_with("invoke-"));
+                if !after_invoke {
+                    return None;
+                }
+            }
+            "iget-object" | "sget-object" | "aget-object" => {}
+            _ => return None,
+        }
+        let next = webs.next_in_block(def)?;
+        let cast = &instructions[at(next)?];
+        let casts_reg = cast.mnemonic() == "check-cast"
+            && leading_regs(cast.operands()).first() == Some(&reg);
+        if !casts_reg || webs.use_sites(reg, def) != [next].as_slice() {
+            return None;
+        }
+        loads.push((reg, def));
+    }
+    let target = target?;
+    (!loads.is_empty()).then(|| (LType::from_java(&target), loads))
 }
 
 /// Fixpoint over `constraints`; without convergence in `max_iters` rounds, no web is typed.
@@ -709,6 +779,7 @@ fn solve(constraints: &Constraints, env: &impl TypeEnv, max_iters: usize) -> Loc
     if !converged {
         return LocalTypes {
             web_types: DetHashMap::default(),
+            cast_loads: BTreeSet::new(),
             conflicts: 0,
         };
     }
@@ -719,8 +790,12 @@ fn solve(constraints: &Constraints, env: &impl TypeEnv, max_iters: usize) -> Loc
     LocalTypes {
         web_types: resolved
             .into_iter()
-            .filter(|(web, _)| !constraints.casts.contains(web))
+            .filter_map(|(web, ty)| match constraints.cast_typed.get(&web) {
+                Some(cast) => Some((web, cast.clone())),
+                None => (!constraints.casts.contains(&web)).then_some((web, ty)),
+            })
             .collect(),
+        cast_loads: constraints.cast_loads.clone(),
         conflicts,
     }
 }

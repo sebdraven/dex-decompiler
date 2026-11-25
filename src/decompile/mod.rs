@@ -718,6 +718,10 @@ impl<'a> Decompiler<'a> {
                 continue;
             }
             let defs = versions.defs(vid);
+            // A load left outside its cast does not have the cast type yet.
+            if defs.iter().any(|&def| local.is_cast_load(vid.reg, def)) {
+                continue;
+            }
             let mut found = defs
                 .into_iter()
                 .map(|def| local.java_type(webs.web(vid.reg, def)));
@@ -6077,6 +6081,7 @@ impl<'a> Decompiler<'a> {
 
     /// A check-cast read once, by an instruction of this block, is written at that use:
     /// the cast keeps its variable (same web), `p1 = (T) p1;` would only retype it.
+    /// A cast load (`LocalTypes::is_cast_load`) is written in its cast instead: `x = (T) load;`.
     /// Versions follow `ir_def_reg`, as `SsaRenamePass` numbers them.
     fn inline_single_use_casts(
         &self,
@@ -6085,6 +6090,8 @@ impl<'a> Decompiler<'a> {
         code: &CodeItem,
     ) -> Vec<IrStmt> {
         let mut casts: Vec<VarId> = Vec::new();
+        // (load, its cast, cast inlinable at its use)
+        let mut folds: Vec<(VarId, VarId, bool)> = Vec::new();
         {
             let webs_slot = self.method_webs.borrow();
             let Some((webs_off, webs)) = webs_slot.as_ref() else {
@@ -6093,24 +6100,42 @@ impl<'a> Decompiler<'a> {
             if *webs_off != code.insns_off {
                 return stmts;
             }
+            let local_slot = self.method_local_types.borrow();
+            let local = local_slot
+                .as_ref()
+                .filter(|(off, _)| *off == code.insns_off)
+                .map(|(_, local)| local);
             let in_seq: DetHashSet<u32> = seq.iter().map(|ins| ins.offset as u32).collect();
             let mut versions: DetHashMap<u32, u32> = DetHashMap::default();
-            for ins in seq {
+            for (i, ins) in seq.iter().enumerate() {
                 let Some(reg) = self.ir_def_reg(ins) else {
                     continue;
                 };
                 let ver = versions.entry(reg).or_insert(0);
                 *ver += 1;
                 let off = ins.offset as u32;
-                if ins.mnemonic() == "check-cast"
-                    && webs.use_count(reg, off) == 1
-                    && webs.use_sites(reg, off).iter().all(|site| in_seq.contains(site))
-                {
-                    casts.push(VarId::new(reg, *ver));
+                if ins.mnemonic() != "check-cast" {
+                    continue;
+                }
+                let cast = VarId::new(reg, *ver);
+                let inlinable = webs.use_count(reg, off) == 1
+                    && webs.use_sites(reg, off).iter().all(|site| in_seq.contains(site));
+                let after_load = i.checked_sub(1).and_then(|j| seq.get(j)).is_some_and(|prev| {
+                    local.is_some_and(|l| l.is_cast_load(reg, prev.offset as u32))
+                });
+                if after_load {
+                    folds.push((VarId::new(reg, *ver - 1), cast, inlinable));
+                } else if inlinable {
+                    casts.push(cast);
                 }
             }
         }
         let mut stmts = stmts;
+        for (load, cast, inlinable) in folds {
+            if !fold_load_into_cast(&mut stmts, load) && inlinable {
+                casts.push(cast);
+            }
+        }
         for vid in casts {
             let Some(at) = stmts
                 .iter()
@@ -9439,6 +9464,42 @@ fn substitute_ir_var(stmt: &mut IrStmt, vid: VarId, var: &str, expr: &str) -> bo
     }
 }
 
+/// Writes the value `load` assigns into its one use, the check-cast right after it, and
+/// drops the assignment; false when either is missing.
+fn fold_load_into_cast(stmts: &mut Vec<IrStmt>, load: VarId) -> bool {
+    let Some(at) = stmts
+        .iter()
+        .position(|s| matches!(s, IrStmt::Assign { dst, .. } if *dst == load))
+    else {
+        return false;
+    };
+    let IrStmt::Assign { rhs, .. } = &stmts[at] else {
+        return false;
+    };
+    let value = match rhs {
+        IrExpr::PendingResult => return false,
+        IrExpr::Call { .. } => rhs.to_java(),
+        _ => {
+            let text = rhs.to_java();
+            if text.contains(' ') {
+                format!("({text})")
+            } else {
+                text
+            }
+        }
+    };
+    let var = format!("v{}_{}", load.reg, load.ver);
+    if !stmts
+        .iter_mut()
+        .skip(at + 1)
+        .any(|stmt| substitute_ir_var(stmt, load, &var, &value))
+    {
+        return false;
+    }
+    stmts.remove(at);
+    true
+}
+
 fn replace_ident_in_body(body: &str, from: &str, to: &str) -> String {
     if from == to || from.is_empty() {
         return body.to_string();
@@ -11449,16 +11510,19 @@ mod tests {
             .iter()
             .find(|l| l.contains("this.a("))
             .unwrap_or_else(|| panic!("no call to a:\n{java}"));
-        let (lhs, _) = call.split_once(" = ").expect("assignment");
+        let (lhs, rhs) = call.split_once(" = ").expect("assignment");
         let &[ty, _] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
             panic!("undeclared: {call}\n{java}");
         };
-        assert_ne!(ty.rsplit('.').next(), Some("T"), "{java}");
+        // Declared at the type of its cast only with the cast in the assignment.
+        assert_eq!(ty, "D0.T", "{java}");
+        assert!(rhs.starts_with("(D0.T) this.a("), "{java}");
     }
 
-    /// `f.f.invalidateDrawable(Drawable)`: `this.d` read into v0 and cast where it is used.
+    /// `f.f.invalidateDrawable(Drawable)`: `this.d` read into v0 and cast right after: the
+    /// read is declared at the cast type, cast in its assignment.
     #[test]
-    fn field_read_cast_at_its_use_keeps_its_declaration() {
+    fn field_read_cast_right_after_is_declared_at_the_cast_type() {
         const DRAWABLE: &str = "Landroid/graphics/drawable/Drawable;";
         const INVALIDATE: &str = "(Landroid/graphics/drawable/Drawable;)V";
         let mut builder = dex_parser::DexBuilder::new();
@@ -11520,12 +11584,15 @@ mod tests {
             .iter()
             .find(|l| l.ends_with("this.d;"))
             .unwrap_or_else(|| panic!("no read of this.d:\n{java}"));
-        let (lhs, _) = read.split_once(" = ").expect("assignment");
-        let &[_, var] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+        let (lhs, rhs) = read.split_once(" = ").expect("assignment");
+        let &[ty, var] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
             panic!("undeclared: {read}\n{java}");
         };
-        let cast = format!("(n0.e) {var})");
-        assert!(lines.iter().any(|l| l.contains(&cast)), "{java}");
+        assert_eq!(ty, "n0.e", "{java}");
+        assert_eq!(rhs, "(n0.e) this.d;", "{java}");
+        let call = format!("{var}.invalidateSelf();");
+        assert!(lines.contains(&call.as_str()), "{java}");
+        assert!(!java.contains(&format!("(n0.e) {var}")), "{java}");
     }
 
     /// Static `M.f0.e(View)`: `instance-of` on the parameter, whose register another branch
@@ -11592,6 +11659,206 @@ mod tests {
             .find(|l| l.contains(" instanceof "))
             .unwrap_or_else(|| panic!("no instanceof:\n{java}"));
         assert!(test.contains("(view instanceof "), "{java}");
+    }
+
+    const ITERATOR: &str = "Ljava/util/Iterator;";
+    const NEXT: &str = "()Ljava/lang/Object;";
+
+    /// Decompiles `k.K.m<proto>` (a virtual method unless `access_flags` has `static`),
+    /// with `Iterator.next`, `p.Foo.bar()`, `k.K.k(Object)`, the `Object` fields `k.K.o`,
+    /// `k.S.a`, `k.S.b` and the types `p.Foo`, `p.A`, `p.B` interned for `body`.
+    fn decompile_cast_method(
+        proto: &str,
+        access_flags: u32,
+        registers: u16,
+        ins: u16,
+        body: impl FnOnce(&dex_parser::PoolMaps) -> Vec<u8>,
+    ) -> String {
+        const OBJECT: &str = "Ljava/lang/Object;";
+        let mut builder = dex_parser::DexBuilder::new();
+        for ty in [OBJECT, "Lk/K;", "Lp/Foo;", "Lp/A;", "Lp/B;", ITERATOR] {
+            builder.intern_type(ty);
+        }
+        builder.intern_method_ref(ITERATOR, "next", NEXT);
+        builder.intern_method_ref("Lp/Foo;", "bar", "()V");
+        builder.intern_method_ref("Lk/K;", "k", "(Ljava/lang/Object;)V");
+        builder.intern_method_ref("Lk/K;", "m", proto);
+        builder.intern_field_ref("Lk/K;", "o", OBJECT);
+        builder.intern_field_ref("Lk/S;", "a", OBJECT);
+        builder.intern_field_ref("Lk/S;", "b", OBJECT);
+        let insns = body(&builder.pool_maps());
+        let is_static = access_flags & 0x8 != 0;
+        let method = dex_parser::BuiltMethod {
+            class: "Lk/K;".into(),
+            name: "m".into(),
+            proto: proto.into(),
+            access_flags,
+            direct: is_static,
+            code: Some(dex_parser::BuiltCode {
+                registers_size: registers,
+                ins_size: ins,
+                outs_size: registers,
+                insns,
+                ..Default::default()
+            }),
+        };
+        let (direct_methods, virtual_methods) = if is_static {
+            (vec![method], vec![])
+        } else {
+            (vec![], vec![method])
+        };
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "Lk/K;".into(),
+            access_flags: 1,
+            superclass: Some(OBJECT.into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![dex_parser::BuiltField {
+                class: "Lk/K;".into(),
+                name: "o".into(),
+                typ: OBJECT.into(),
+                access_flags: 0,
+                static_field: false,
+                static_value: None,
+            }],
+            direct_methods,
+            virtual_methods,
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        Decompiler::new(&dex).decompile().expect("decompile")
+    }
+
+    fn le16(idx: dex_parser::Result<u32>) -> [u8; 2] {
+        u16::try_from(idx.expect("pool index"))
+            .expect("16-bit index")
+            .to_le_bytes()
+    }
+
+    /// The line ending in `load` reads `p.Foo var = (p.Foo) …load`, and `var.bar()` is
+    /// called without a cast.
+    fn assert_foo_cast_at_assignment(java: &str, load: &str) {
+        let lines: Vec<&str> = java.lines().map(str::trim).collect();
+        let line = lines
+            .iter()
+            .find(|l| l.ends_with(load))
+            .unwrap_or_else(|| panic!("no {load}:\n{java}"));
+        let (lhs, rhs) = line.split_once(" = ").expect("assignment");
+        let &[ty, var] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {line}\n{java}");
+        };
+        assert_eq!(ty, "p.Foo", "{java}");
+        assert!(rhs.starts_with("(p.Foo) "), "{java}");
+        let call = format!("{var}.bar();");
+        assert!(lines.contains(&call.as_str()), "{java}");
+        assert!(!java.contains(&format!("(p.Foo) {var}")), "{java}");
+    }
+
+    /// `Foo f = (Foo) it.next();`: the erased call result takes the type of the check-cast
+    /// right after it, the cast in its assignment.
+    #[test]
+    fn erased_call_result_is_declared_at_its_cast_type() {
+        let java = decompile_cast_method("(Ljava/util/Iterator;)V", 0x9, 2, 1, |pools| {
+            let next = le16(pools.method(ITERATOR, "next", NEXT));
+            let foo = le16(pools.ty("Lp/Foo;"));
+            let bar = le16(pools.method("Lp/Foo;", "bar", "()V"));
+            vec![
+                0x72, 0x10, next[0], next[1], 0x01, 0x00, // 00: invoke-interface {v1}, next
+                0x0c, 0x00, // 06: move-result-object v0
+                0x1f, 0x00, foo[0], foo[1], // 08: check-cast v0, p.Foo
+                0x6e, 0x10, bar[0], bar[1], 0x00, 0x00, // 0c: invoke-virtual {v0}, bar
+                0x0e, 0x00, // 12: return-void
+            ]
+        });
+        assert_foo_cast_at_assignment(&java, ".next();");
+    }
+
+    /// `Foo f = (Foo) this.o;` for a field typed `Object`.
+    #[test]
+    fn object_field_read_is_declared_at_its_cast_type() {
+        let java = decompile_cast_method("()V", 0x1, 2, 1, |pools| {
+            let field = le16(pools.field("Lk/K;", "o", "Ljava/lang/Object;"));
+            let foo = le16(pools.ty("Lp/Foo;"));
+            let bar = le16(pools.method("Lp/Foo;", "bar", "()V"));
+            vec![
+                0x54, 0x10, field[0], field[1], // 00: iget-object v0, v1, k.K.o
+                0x1f, 0x00, foo[0], foo[1], // 04: check-cast v0, p.Foo
+                0x6e, 0x10, bar[0], bar[1], 0x00, 0x00, // 08: invoke-virtual {v0}, bar
+                0x0e, 0x00, // 0e: return-void
+            ]
+        });
+        assert_foo_cast_at_assignment(&java, "this.o;");
+    }
+
+    /// `Object o = it.next(); if (o instanceof Foo) ((Foo) o).bar();`: the cast does not
+    /// follow the call, `o` stays an `Object` cast where it is used.
+    #[test]
+    fn value_tested_by_instanceof_before_its_cast_stays_an_object() {
+        let java = decompile_cast_method("(Ljava/util/Iterator;)V", 0x9, 3, 1, |pools| {
+            let next = le16(pools.method(ITERATOR, "next", NEXT));
+            let foo = le16(pools.ty("Lp/Foo;"));
+            let bar = le16(pools.method("Lp/Foo;", "bar", "()V"));
+            vec![
+                0x72, 0x10, next[0], next[1], 0x02, 0x00, // 00: invoke-interface {v2}, next
+                0x0c, 0x00, // 06: move-result-object v0
+                0x20, 0x01, foo[0], foo[1], // 08: instance-of v1, v0, p.Foo
+                0x38, 0x01, 0x07, 0x00, // 0c: if-eqz v1, +7 -> 1a
+                0x1f, 0x00, foo[0], foo[1], // 10: check-cast v0, p.Foo
+                0x6e, 0x10, bar[0], bar[1], 0x00, 0x00, // 14: invoke-virtual {v0}, bar
+                0x0e, 0x00, // 1a: return-void
+            ]
+        });
+        let lines: Vec<&str> = java.lines().map(str::trim).collect();
+        let line = lines
+            .iter()
+            .find(|l| l.ends_with(".next();"))
+            .unwrap_or_else(|| panic!("no call to next:\n{java}"));
+        let (lhs, rhs) = line.split_once(" = ").expect("assignment");
+        let &[ty, var] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {line}\n{java}");
+        };
+        assert_eq!(ty, "Object", "{java}");
+        assert!(!rhs.contains("(p.Foo)"), "{java}");
+        assert!(java.contains(&format!("(p.Foo) {var}")), "{java}");
+    }
+
+    /// One variable loaded on two paths, cast to `p.A` on one and `p.B` on the other: no
+    /// single cast type, each cast stays apart from its load.
+    #[test]
+    fn loads_cast_to_two_types_keep_their_casts_apart() {
+        let java = decompile_cast_method("(I)V", 0x9, 2, 1, |pools| {
+            let a = le16(pools.field("Lk/S;", "a", "Ljava/lang/Object;"));
+            let b = le16(pools.field("Lk/S;", "b", "Ljava/lang/Object;"));
+            let ta = le16(pools.ty("Lp/A;"));
+            let tb = le16(pools.ty("Lp/B;"));
+            let k = le16(pools.method("Lk/K;", "k", "(Ljava/lang/Object;)V"));
+            vec![
+                0x38, 0x01, 0x07, 0x00, // 00: if-eqz v1, +7 -> 0e
+                0x62, 0x00, a[0], a[1], // 04: sget-object v0, k.S.a
+                0x1f, 0x00, ta[0], ta[1], // 08: check-cast v0, p.A
+                0x28, 0x05, // 0c: goto +5 -> 16
+                0x62, 0x00, b[0], b[1], // 0e: sget-object v0, k.S.b
+                0x1f, 0x00, tb[0], tb[1], // 12: check-cast v0, p.B
+                0x71, 0x10, k[0], k[1], 0x00, 0x00, // 16: invoke-static {v0}, k.K.k
+                0x0e, 0x00, // 1c: return-void
+            ]
+        });
+        let lines: Vec<&str> = java.lines().map(str::trim).collect();
+        for (ty, field) in [("p.A", "S.a"), ("p.B", "S.b")] {
+            let cast = format!("({ty}) ");
+            let line = lines
+                .iter()
+                .find(|l| l.contains(&cast))
+                .unwrap_or_else(|| panic!("no cast to {ty}:\n{java}"));
+            assert!(!line.contains(field), "{java}");
+            let declared = format!("{ty} ");
+            assert!(
+                !lines.iter().any(|l| l.starts_with(&declared) && l.contains(field)),
+                "{java}"
+            );
+        }
     }
 
     /// Decompiles static `k.K.m()V`, whose body `body` builds from the index of the
