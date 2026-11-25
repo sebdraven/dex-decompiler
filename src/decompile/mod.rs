@@ -2268,7 +2268,7 @@ impl<'a> Decompiler<'a> {
             insns_bytes,
             class_name,
         );
-        self.seed_name_owners(encoded, code);
+        self.seed_name_owners(encoded, code, class_name);
         self.rename_condition_registers(&mut cfg, &instructions, encoded, code);
         self.rename_switch_conditions(&mut cfg);
         if cfg.block_count() == 0 {
@@ -5643,18 +5643,29 @@ impl<'a> Decompiler<'a> {
         Some(LocalTypes::build(instructions, webs, &frame, &env))
     }
 
-    /// Parameter names and `this` belong to their entry web from the start (R2); the
-    /// method-wide temp names of `prepare_method_reg_types` are held for their register.
-    fn seed_name_owners(&self, encoded: &EncodedMethod, code: &CodeItem) {
+    /// Parameter names and `this` belong to their entry web from the start (R2), which
+    /// keeps that name at every site; the method-wide temp names of
+    /// `prepare_method_reg_types` are held for their register.
+    fn seed_name_owners(
+        &self,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+        class_name: Option<&str>,
+    ) {
         let params = self.param_display_names_by_reg(encoded, code);
+        let entry_names = self.param_entry_names(encoded, code, class_name);
         let webs_slot = self.method_webs.borrow();
         let mut state = self.method_names.borrow_mut();
         if let Some((_, webs)) = webs_slot.as_ref() {
             let mut by_reg: Vec<(&u32, &String)> = params.iter().collect();
             by_reg.sort();
             for (reg, name) in by_reg {
-                let entry = NameOwner::Web(webs.web(*reg, ENTRY_DEF));
-                state.owners.insert(name.clone(), entry);
+                let web = webs.web(*reg, ENTRY_DEF);
+                state.owners.insert(name.clone(), NameOwner::Web(web));
+                if let Some(entry) = entry_names.get(reg) {
+                    state.owners.insert(entry.clone(), NameOwner::Web(web));
+                    state.web_names.insert(web, entry.clone());
+                }
             }
         }
         if let Some(names) = self.method_reg_names.borrow().as_ref() {
@@ -5672,6 +5683,22 @@ impl<'a> Decompiler<'a> {
                 .entry(CATCH_VAR.to_string())
                 .or_insert(NameOwner::Catch);
         }
+    }
+
+    /// Name of each parameter's entry web: its display name after user renames.
+    fn param_entry_names(
+        &self,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+        class_name: Option<&str>,
+    ) -> DetHashMap<u32, String> {
+        let mut by_var: DetHashMap<VarId, String> = self
+            .param_display_names_by_reg(encoded, code)
+            .into_iter()
+            .map(|(reg, name)| (VarId::new(reg, 0), name))
+            .collect();
+        self.apply_variable_renames_to_name_map(&mut by_var, class_name, encoded);
+        by_var.into_iter().map(|(vid, name)| (vid.reg, name)).collect()
     }
 
     /// Display name of each parameter register: debug name, else signature name.
@@ -5873,7 +5900,7 @@ impl<'a> Decompiler<'a> {
             let is_param = (param_base..registers_size).contains(&reg);
             if is_param && defs.iter().any(|&d| webs.shares_entry(reg, d)) {
                 if let Some(p) = param_names.get(&reg) {
-                    names.insert(reg, p.clone());
+                    names.insert(reg, self.web_name(web, p));
                 }
                 continue;
             }
@@ -6204,30 +6231,36 @@ impl<'a> Decompiler<'a> {
 
     /// Treat incoming Dalvik parameter registers as already declared so a later
     /// SSA assign (`b = b + 1`) does not emit `int b = ...` after `if (b == 10)`.
+    /// Only the parameters' own names: a later local of the register is declared where
+    /// it is defined.
     fn seed_declared_from_params(
         &self,
         declared: &mut DetHashSet<String>,
         code: &CodeItem,
         encoded: &EncodedMethod,
     ) {
-        for n in self.signature_param_names(encoded, code).values() {
+        let params = self
+            .signature_param_names(encoded, code)
+            .into_values()
+            .chain(self.param_display_names_by_reg(encoded, code).into_values());
+        for n in params {
             if n != "this" {
-                declared.insert(n.clone());
+                declared.insert(n);
             }
         }
+        let webs_slot = self.method_webs.borrow();
+        let state = self.method_names.borrow();
+        let Some((webs_off, webs)) = webs_slot.as_ref() else {
+            return;
+        };
+        if *webs_off != code.insns_off || state.insns_off != code.insns_off {
+            return;
+        }
         let registers_size = code.registers_size as u32;
-        let ins_size = code.ins_size as u32;
-        let param_base = registers_size.saturating_sub(ins_size);
-        let params = self.param_display_names_by_reg(encoded, code);
-        if let Some(names) = self.method_reg_names.borrow().as_ref() {
-            for reg in param_base..registers_size {
-                let Some(n) = names.get(&reg) else {
-                    continue;
-                };
-                // A role or temp name on a parameter register names a later local.
-                let local = params.get(&reg) != Some(n)
-                    && (matches!(n.as_str(), "result" | "length") || is_synthetic_local_name(n));
-                if n != "this" && !local {
+        let param_base = registers_size.saturating_sub(code.ins_size as u32);
+        for reg in param_base..registers_size {
+            if let Some(n) = state.web_names.get(&webs.web(reg, ENTRY_DEF)) {
+                if n != "this" {
                     declared.insert(n.clone());
                 }
             }
@@ -11390,6 +11423,144 @@ mod tests {
             panic!("undeclared: {call}\n{java}");
         };
         assert_ne!(ty.rsplit('.').next(), Some("T"), "{java}");
+    }
+
+    /// `f.f.invalidateDrawable(Drawable)`: `this.d` read into v0 and cast where it is used.
+    #[test]
+    fn field_read_cast_at_its_use_keeps_its_declaration() {
+        const DRAWABLE: &str = "Landroid/graphics/drawable/Drawable;";
+        const INVALIDATE: &str = "(Landroid/graphics/drawable/Drawable;)V";
+        let mut builder = dex_parser::DexBuilder::new();
+        for ty in ["Ljava/lang/Object;", "Lf/f;", "Ln0/e;"] {
+            builder.intern_type(ty);
+        }
+        builder.intern_field_ref("Lf/f;", "d", DRAWABLE);
+        builder.intern_method_ref("Ln0/e;", "invalidateSelf", "()V");
+        builder.intern_method_ref("Lf/f;", "invalidateDrawable", INVALIDATE);
+        let pools = builder.pool_maps();
+        let le = |idx: u32| u16::try_from(idx).expect("16-bit index").to_le_bytes();
+        let field = le(pools.field("Lf/f;", "d", DRAWABLE).expect("field"));
+        let cast = le(pools.ty("Ln0/e;").expect("type"));
+        let call = le(pools.method("Ln0/e;", "invalidateSelf", "()V").expect("call"));
+        let insns = vec![
+            0x54, 0x10, field[0], field[1], // 00: iget-object v0, v1, f.d
+            0x1f, 0x00, cast[0], cast[1], // 04: check-cast v0, n0.e
+            0x6e, 0x10, call[0], call[1], 0x00, 0x00, // 08: invoke-virtual {v0}, invalidateSelf
+            0x0e, 0x00, // 0e: return-void
+        ];
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "Lf/f;".into(),
+            access_flags: 1,
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![dex_parser::BuiltField {
+                class: "Lf/f;".into(),
+                name: "d".into(),
+                typ: DRAWABLE.into(),
+                access_flags: 0,
+                static_field: false,
+                static_value: None,
+            }],
+            direct_methods: vec![],
+            virtual_methods: vec![dex_parser::BuiltMethod {
+                class: "Lf/f;".into(),
+                name: "invalidateDrawable".into(),
+                proto: INVALIDATE.into(),
+                access_flags: 1,
+                direct: false,
+                code: Some(dex_parser::BuiltCode {
+                    registers_size: 3,
+                    ins_size: 2,
+                    outs_size: 1,
+                    insns,
+                    ..Default::default()
+                }),
+            }],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        let java = Decompiler::new(&dex).decompile().expect("decompile");
+        let lines: Vec<&str> = java.lines().map(str::trim).collect();
+
+        let read = lines
+            .iter()
+            .find(|l| l.ends_with("this.d;"))
+            .unwrap_or_else(|| panic!("no read of this.d:\n{java}"));
+        let (lhs, _) = read.split_once(" = ").expect("assignment");
+        let &[_, var] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {read}\n{java}");
+        };
+        let cast = format!("(n0.e) {var})");
+        assert!(lines.iter().any(|l| l.contains(&cast)), "{java}");
+    }
+
+    /// Static `M.f0.e(View)`: `instance-of` on the parameter, whose register another branch
+    /// reuses for an `Object` field cast to `View`.
+    #[test]
+    fn instance_of_on_a_reused_parameter_register_names_the_parameter() {
+        const OBJECT: &str = "Ljava/lang/Object;";
+        const VIEW: &str = "Landroid/view/View;";
+        const GROUP: &str = "Landroid/view/ViewGroup;";
+        let mut builder = dex_parser::DexBuilder::new();
+        for ty in [OBJECT, "LM/f0;", VIEW, GROUP] {
+            builder.intern_type(ty);
+        }
+        builder.intern_field_ref("LM/f0;", "g", OBJECT);
+        builder.intern_method_ref(VIEW, "invalidate", "()V");
+        builder.intern_method_ref("LM/f0;", "e", "(Landroid/view/View;)V");
+        let pools = builder.pool_maps();
+        let le = |idx: u32| u16::try_from(idx).expect("16-bit index").to_le_bytes();
+        let group = le(pools.ty(GROUP).expect("type"));
+        let view = le(pools.ty(VIEW).expect("type"));
+        let field = le(pools.field("LM/f0;", "g", OBJECT).expect("field"));
+        let call = le(pools.method(VIEW, "invalidate", "()V").expect("method"));
+        let insns = vec![
+            0x20, 0x10, group[0], group[1], // 00: instance-of v0, v1, ViewGroup
+            0x38, 0x00, 0x06, 0x00, // 04: if-eqz v0, +6 -> 10
+            0x6e, 0x10, call[0], call[1], 0x01, 0x00, // 08: invoke-virtual {v1}, invalidate
+            0x0e, 0x00, // 0e: return-void
+            0x62, 0x01, field[0], field[1], // 10: sget-object v1, M.f0.g
+            0x1f, 0x01, view[0], view[1], // 14: check-cast v1, View
+            0x6e, 0x10, call[0], call[1], 0x01, 0x00, // 18: invoke-virtual {v1}, invalidate
+            0x0e, 0x00, // 1e: return-void
+        ];
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "LM/f0;".into(),
+            access_flags: 1,
+            superclass: Some(OBJECT.into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![],
+            direct_methods: vec![dex_parser::BuiltMethod {
+                class: "LM/f0;".into(),
+                name: "e".into(),
+                proto: "(Landroid/view/View;)V".into(),
+                access_flags: 0x9,
+                direct: true,
+                code: Some(dex_parser::BuiltCode {
+                    registers_size: 2,
+                    ins_size: 1,
+                    outs_size: 1,
+                    insns,
+                    ..Default::default()
+                }),
+            }],
+            virtual_methods: vec![],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        let java = Decompiler::new(&dex).decompile().expect("decompile");
+
+        let test = java
+            .lines()
+            .find(|l| l.contains(" instanceof "))
+            .unwrap_or_else(|| panic!("no instanceof:\n{java}"));
+        assert!(test.contains("(view instanceof "), "{java}");
     }
 
     #[test]
