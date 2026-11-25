@@ -766,6 +766,22 @@ impl<'a> Decompiler<'a> {
         local.java_type(webs.web(reg, def))
     }
 
+    /// Type local type inference gives the constant `instructions[idx]` writes to `reg`;
+    /// debug-typed registers keep their own rules.
+    fn local_const_type(
+        &self,
+        insns_off: usize,
+        reg: u32,
+        instructions: &[Instruction],
+        idx: usize,
+    ) -> Option<String> {
+        if self.debug_type_for_reg(reg).is_some() {
+            return None;
+        }
+        let def = instructions.get(idx)?.offset;
+        self.local_def_type(insns_off, reg, def)
+    }
+
     /// `null`, `true` / `false` or a char literal for the constant `bits` defined at `def`,
     /// from the type local type inference resolved; debug-typed registers keep the number.
     fn int_literal_at(&self, insns_off: usize, reg: u32, def: u32, bits: &str) -> Option<String> {
@@ -6708,10 +6724,15 @@ impl<'a> Decompiler<'a> {
         bits_str: &str,
         instructions: &[Instruction],
         idx: usize,
+        base_off: usize,
     ) -> String {
-        let java_ty = self
-            .wide_const_java_type(mnemonic, dst_reg, bits_str, instructions, idx)
-            .unwrap_or_else(|| "long".to_string());
+        let local = self.local_const_type(base_off, dst_reg, instructions, idx);
+        let java_ty = match local.as_deref() {
+            Some(ty @ ("double" | "long")) => ty.to_string(),
+            _ => self
+                .wide_const_java_type(mnemonic, dst_reg, bits_str, instructions, idx)
+                .unwrap_or_else(|| "long".to_string()),
+        };
         format_java_wide_literal(bits_str, &java_ty)
     }
 
@@ -6727,6 +6748,16 @@ impl<'a> Decompiler<'a> {
             if let Some(literal) = self.int_literal_at(base_off, dst_reg, ins.offset, bits_str) {
                 return literal;
             }
+        }
+        let local = self.local_const_type(base_off, dst_reg, instructions, idx);
+        match local.as_deref() {
+            Some("float") => {
+                if let Some(bits) = parse_const_bits_u32(bits_str) {
+                    return format_java_float(f32::from_bits(bits));
+                }
+            }
+            Some("int" | "short" | "byte" | "char" | "boolean") => return bits_str.to_string(),
+            _ => {}
         }
         let as_float = self.const_32_used_as_float(dst_reg, instructions, idx)
             || self.debug_type_for_reg(dst_reg).as_deref() == Some("float");
@@ -7076,7 +7107,7 @@ impl<'a> Decompiler<'a> {
             if let Some((dst_reg, rhs_str)) = parse_assign_rhs(m, &ops_resolved) {
                 flush_pending_invoke(&mut out, &mut pending_invoke);
                 let rhs_str = if m.starts_with("const-wide") {
-                    self.format_const_wide_rhs(m, dst_reg, &rhs_str, instructions, idx)
+                    self.format_const_wide_rhs(m, dst_reg, &rhs_str, instructions, idx, base_off)
                 } else if matches!(m, "const" | "const/high16" | "const/16" | "const/4") {
                     self.format_const_32_rhs(dst_reg, &rhs_str, instructions, idx, base_off)
                 } else {
@@ -11561,6 +11592,94 @@ mod tests {
             .find(|l| l.contains(" instanceof "))
             .unwrap_or_else(|| panic!("no instanceof:\n{java}"));
         assert!(test.contains("(view instanceof "), "{java}");
+    }
+
+    /// Decompiles static `k.K.m()V`, whose body `body` builds from the index of the
+    /// static method `k.K.<callee><proto>` it calls.
+    fn decompile_static_call(
+        callee: &str,
+        proto: &str,
+        registers: u16,
+        body: impl FnOnce([u8; 2]) -> Vec<u8>,
+    ) -> String {
+        let mut builder = dex_parser::DexBuilder::new();
+        builder.intern_type("Ljava/lang/Object;");
+        builder.intern_method_ref("Lk/K;", callee, proto);
+        builder.intern_method_ref("Lk/K;", "m", "()V");
+        let pools = builder.pool_maps();
+        let call = pools.method("Lk/K;", callee, proto).expect("callee");
+        let insns = body(u16::try_from(call).expect("16-bit index").to_le_bytes());
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "Lk/K;".into(),
+            access_flags: 1,
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![],
+            direct_methods: vec![dex_parser::BuiltMethod {
+                class: "Lk/K;".into(),
+                name: "m".into(),
+                proto: "()V".into(),
+                access_flags: 0x9,
+                direct: true,
+                code: Some(dex_parser::BuiltCode {
+                    registers_size: registers,
+                    ins_size: 0,
+                    outs_size: registers,
+                    insns,
+                    ..Default::default()
+                }),
+            }],
+            virtual_methods: vec![],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        Decompiler::new(&dex).decompile().expect("decompile")
+    }
+
+    #[test]
+    fn high16_constant_passed_as_float_is_a_float_literal() {
+        let java = decompile_static_call("f", "(F)V", 1, |call| {
+            vec![
+                0x15, 0x00, 0x80, 0x3f, // 00: const/high16 v0, 0x3f80
+                0x71, 0x10, call[0], call[1], 0x00, 0x00, // 04: invoke-static {v0}, f(F)V
+                0x0e, 0x00, // 0a: return-void
+            ]
+        });
+        assert!(java.contains("1.0f"), "{java}");
+        assert!(!java.contains("1065353216"), "{java}");
+    }
+
+    #[test]
+    fn wide_high16_constant_passed_as_double_is_a_double_literal() {
+        let java = decompile_static_call("d", "(D)V", 2, |call| {
+            vec![
+                0x19, 0x00, 0x14, 0x40, // 00: const-wide/high16 v0, 0x4014
+                0x71, 0x20, call[0], call[1], 0x10, 0x00, // 04: invoke-static {v0, v1}, d(D)V
+                0x0e, 0x00, // 0a: return-void
+            ]
+        });
+        assert!(java.contains("5.0"), "{java}");
+        assert!(!java.contains("4617315517961601024"), "{java}");
+        assert!(!java.contains("0x4014"), "{java}");
+    }
+
+    #[test]
+    fn small_constant_passed_as_int_stays_an_int() {
+        let java = decompile_static_call("i", "(I)V", 1, |call| {
+            vec![
+                0x12, 0x10, // 00: const/4 v0, 1
+                0x71, 0x10, call[0], call[1], 0x00, 0x00, // 02: invoke-static {v0}, i(I)V
+                0x0e, 0x00, // 08: return-void
+            ]
+        });
+        let one = java
+            .lines()
+            .any(|l| l.contains("(1)") || l.trim_end().ends_with(" = 1;"));
+        assert!(one, "{java}");
+        assert!(!java.contains("1.0"), "{java}");
     }
 
     #[test]
