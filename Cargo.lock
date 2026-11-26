@@ -76,6 +76,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "apkparser"
 version = "0.1.0"
+source = "git+https://github.com/androguard/apk-parser?branch=main#95ec9b00b4e2e30d16ac98c09868e5d6b58d3fdb"
 dependencies = [
  "axmldecoder",
  "byteorder",
@@ -445,6 +446,7 @@ dependencies = [
 [[package]]
 name = "dex-parser"
 version = "0.1.0"
+source = "git+https://github.com/androguard/dex-parser?branch=main#30bde726dd30a0d8c442ea7006666da2ef72b9bd"
 dependencies = [
  "clap",
  "dex-bytecode",

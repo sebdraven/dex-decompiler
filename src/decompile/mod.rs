@@ -469,6 +469,20 @@ pub struct Decompiler<'a> {
     explicit_jumps: Cell<bool>,
     /// Declarations moved before a region of the tree being emitted.
     hoist: RefCell<HoistState>,
+    /// Constructor whose body is being emitted.
+    ctor: RefCell<Option<CtorState>>,
+}
+
+/// What `this(…)` / `super(…)` emission needs from the constructor being emitted.
+struct CtorState {
+    insns_off: usize,
+    /// Descriptor of the constructor's class.
+    class: String,
+    this_reg: u32,
+    /// Some instruction of the method writes `this_reg`.
+    this_reg_written: bool,
+    /// `move-object` offset → (dst, src).
+    moves: DetHashMap<u32, (u32, u32)>,
 }
 
 #[derive(Default)]
@@ -620,6 +634,7 @@ impl<'a> Decompiler<'a> {
             call_return_types: RefCell::new(DetHashMap::default()),
             explicit_jumps: Cell::new(false),
             hoist: RefCell::new(HoistState::default()),
+            ctor: RefCell::new(None),
         }
     }
 
@@ -658,6 +673,7 @@ impl<'a> Decompiler<'a> {
             call_return_types: RefCell::new(DetHashMap::default()),
             explicit_jumps: Cell::new(false),
             hoist: RefCell::new(HoistState::default()),
+            ctor: RefCell::new(None),
         }
     }
 
@@ -892,14 +908,7 @@ impl<'a> Decompiler<'a> {
 
     /// Declared Java return type of an invoke's `method@N` operand (`None` for void).
     fn invoke_return_type(&self, ops: &str) -> Option<String> {
-        let idx: u32 = ops
-            .rsplit(',')
-            .next()?
-            .trim()
-            .strip_prefix("method@")?
-            .parse()
-            .ok()?;
-        let info = self.dex.get_method_info(idx).ok()?;
+        let info = self.dex.get_method_info(invoke_method_idx(ops)?).ok()?;
         let ret = java::descriptor_to_java(&info.return_type);
         (ret != "void").then_some(ret)
     }
@@ -1745,7 +1754,11 @@ impl<'a> Decompiler<'a> {
         let flags = java::access_flags_to_java_kind(encoded.access_flags, java::MemberKind::Method);
         let mut out = String::new();
         write!(&mut out, "    ").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-        if !flags.is_empty() {
+        let is_clinit = info.name == "<clinit>";
+        if is_clinit {
+            write!(&mut out, "static ")
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        } else if !flags.is_empty() {
             write!(&mut out, "{} ", flags.join(" "))
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         }
@@ -1756,22 +1769,27 @@ impl<'a> Decompiler<'a> {
             &info.name
         };
         let debug_pnames = self.debug_parameter_display_names(encoded, &params);
-        let params_str = params
+        let param_names: Vec<String> = params
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let pname = debug_pnames
+                debug_pnames
                     .get(i)
                     .and_then(|p| p.clone())
-                    .unwrap_or_else(|| type_infer::param_display_name(i, t));
-                format!("{} {}", t, pname)
+                    .unwrap_or_else(|| type_infer::param_display_name(i, t))
             })
+            .collect();
+        let params_str = params
+            .iter()
+            .zip(&param_names)
+            .map(|(t, pname)| format!("{} {}", t, pname))
             .collect::<Vec<_>>()
             .join(", ");
+        // `<clinit>` is `static {`: no return type, name or parameters.
         if is_constructor && class_simple_name.is_some() {
             write!(&mut out, "{}({}) ", name, params_str)
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
-        } else {
+        } else if !is_clinit {
             // Java: `<T> ReturnType name(params)` — type params before return type.
             let tp = if type_params.is_empty() {
                 String::new()
@@ -1805,7 +1823,16 @@ impl<'a> Decompiler<'a> {
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
         }
-        let body = self.decompile_method_body(&code, encoded, class_name)?;
+        let mut body = self.decompile_method_body(&code, encoded, class_name)?;
+        if is_clinit {
+            body = drop_final_return(&body);
+        } else if is_constructor {
+            if let Some(calls) = self.static_calls_before_ctor_call(&code, encoded) {
+                if let Some(moved) = ctor_call_first(&body, calls, &param_names) {
+                    body = moved;
+                }
+            }
+        }
         writeln!(&mut out, "{{").map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
         write!(&mut out, "{}", body)
             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
@@ -2287,7 +2314,130 @@ impl<'a> Decompiler<'a> {
     }
 
     /// Decompile method body: build CFG, emit structured Java (if/else, while).
+    /// Constructors carry their `this` register and class while emitted.
     fn decompile_method_body(
+        &self,
+        code: &CodeItem,
+        encoded: &EncodedMethod,
+        class_name: Option<&str>,
+    ) -> Result<String> {
+        let saved = self.ctor.replace(self.ctor_state(code, encoded));
+        let body = self.decompile_method_body_inner(code, encoded, class_name);
+        *self.ctor.borrow_mut() = saved;
+        body
+    }
+
+    fn ctor_state(&self, code: &CodeItem, encoded: &EncodedMethod) -> Option<CtorState> {
+        let info = self.dex.get_method_info(encoded.method_idx).ok()?;
+        if info.name != "<init>" || encoded.access_flags & 0x8 != 0 || code.ins_size == 0 {
+            return None;
+        }
+        let instructions = decode_all(code.insns_slice(&*self.dex.data), 0).ok()?;
+        let this_reg = (code.registers_size as u32).saturating_sub(code.ins_size as u32);
+        let mut this_reg_written = false;
+        let mut moves = DetHashMap::default();
+        for ins in &instructions {
+            if instruction_writes_register(ins) == Some(this_reg) {
+                this_reg_written = true;
+            }
+            if matches!(
+                ins.mnemonic(),
+                "move-object" | "move-object/from16" | "move-object/16"
+            ) {
+                if let Some(pair) = parse_two_regs(ins.operands()) {
+                    moves.insert(ins.offset as u32, pair);
+                }
+            }
+        }
+        Some(CtorState {
+            insns_off: code.insns_off,
+            class: info.class,
+            this_reg,
+            this_reg_written,
+            moves,
+        })
+    }
+
+    /// `this` or `super` when the `invoke-direct` at `off` (raw operands `ops`, Java
+    /// arguments `args`) calls a constructor on `this` from the constructor being emitted.
+    fn ctor_call_keyword(&self, ops: &str, args: &str, off: u32) -> Option<&'static str> {
+        let ctor = self.ctor.borrow();
+        let ctor = ctor.as_ref()?;
+        let callee = self.dex.get_method_info(invoke_method_idx(ops)?).ok()?;
+        if callee.name != "<init>" {
+            return None;
+        }
+        let receiver = args.split(',').next()?.trim().strip_prefix('v')?.parse().ok()?;
+        let webs = self.method_webs.borrow();
+        let webs = webs
+            .as_ref()
+            .filter(|(insns_off, _)| *insns_off == ctor.insns_off)
+            .map(|(_, w)| w);
+        if !holds_this(ctor, webs, off, receiver, 0) {
+            return None;
+        }
+        Some(if callee.class == ctor.class { "this" } else { "super" })
+    }
+
+    /// Number of static calls before the `super(…)` / `this(…)` call when every instruction
+    /// before it is a constant or a static call whose arguments are constants or untouched
+    /// parameters other than `this`.
+    fn static_calls_before_ctor_call(
+        &self,
+        code: &CodeItem,
+        encoded: &EncodedMethod,
+    ) -> Option<usize> {
+        if encoded.access_flags & 0x8 != 0 || code.ins_size == 0 {
+            return None;
+        }
+        let instructions = decode_all(code.insns_slice(&*self.dex.data), 0).ok()?;
+        let this_reg = (code.registers_size as u32).saturating_sub(code.ins_size as u32);
+        let is_param = |r: u32| r > this_reg && r < code.registers_size as u32;
+        let mut consts: DetHashSet<u32> = DetHashSet::default();
+        let mut written: DetHashSet<u32> = DetHashSet::default();
+        let mut calls = 0usize;
+        for ins in &instructions {
+            let m = ins.mnemonic();
+            let (reads, writes) = read_write::instruction_reads_writes(m, ins.operands());
+            if m == "nop" {
+                continue;
+            }
+            if matches!(
+                m,
+                "const/4"
+                    | "const/16"
+                    | "const"
+                    | "const/high16"
+                    | "const-wide/16"
+                    | "const-wide/32"
+                    | "const-wide"
+                    | "const-wide/high16"
+                    | "const-string"
+                    | "const-string/jumbo"
+            ) {
+                consts.extend(writes.iter().copied());
+                written.extend(writes);
+                continue;
+            }
+            if m.starts_with("invoke-static") {
+                let literal_or_param =
+                    |r: &u32| consts.contains(r) || (is_param(*r) && !written.contains(r));
+                if !reads.iter().all(literal_or_param) {
+                    return None;
+                }
+                calls += 1;
+                continue;
+            }
+            if m.starts_with("invoke-direct") && reads.first() == Some(&this_reg) {
+                let callee = self.dex.get_method_info(invoke_method_idx(ins.operands())?).ok()?;
+                return (callee.name == "<init>" && calls > 0).then_some(calls);
+            }
+            return None;
+        }
+        None
+    }
+
+    fn decompile_method_body_inner(
         &self,
         code: &CodeItem,
         encoded: &EncodedMethod,
@@ -7266,8 +7416,15 @@ impl<'a> Decompiler<'a> {
                             .borrow_mut()
                             .insert(offset as u32, ret);
                     }
+                    let ctor_call = if m.starts_with("invoke-direct") {
+                        self.ctor_call_keyword(ops, &args, ins.offset as u32)
+                    } else {
+                        None
+                    };
                     let (target, args) = if is_super {
                         to_super_style(&target, &args)
+                    } else if let Some(keyword) = ctor_call {
+                        (keyword.to_string(), to_receiver_style(&target, &args).1)
                     } else if is_instance {
                         to_receiver_style(&target, &args)
                     } else {
@@ -7858,6 +8015,131 @@ fn replace_whole_word(body: &str, from: &str, to: &str) -> String {
         i += ch_len;
     }
     result
+}
+
+/// `method@N` operand of raw invoke operands.
+fn invoke_method_idx(ops: &str) -> Option<u32> {
+    ops.rsplit(',')
+        .next()?
+        .trim()
+        .strip_prefix("method@")?
+        .parse()
+        .ok()
+}
+
+/// `reg` holds the incoming `this` just before `off`: directly or through `move-object`
+/// copies. Without webs, only the `this` register never written.
+fn holds_this(ctor: &CtorState, webs: Option<&DefWebs>, off: u32, reg: u32, depth: u32) -> bool {
+    let Some(webs) = webs else {
+        return reg == ctor.this_reg && !ctor.this_reg_written;
+    };
+    let defs = webs.reaching(off, reg);
+    !defs.is_empty()
+        && defs.iter().all(|&def| {
+            if def == ENTRY_DEF {
+                return reg == ctor.this_reg;
+            }
+            depth < 8
+                && ctor.moves.get(&def).is_some_and(|&(dst, src)| {
+                    dst == reg && holds_this(ctor, Some(webs), def, src, depth + 1)
+                })
+        })
+}
+
+/// `<clinit>` body without its trailing lone `return;`.
+fn drop_final_return(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let Some(last) = lines.iter().rposition(|l| !l.trim().is_empty()) else {
+        return body.to_string();
+    };
+    if code_part(lines[last]) != "return;" {
+        return body.to_string();
+    }
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i != last {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Statement text of a body line, without indentation or trailing `// …` comment.
+fn code_part(line: &str) -> &str {
+    let t = line.trim();
+    if t.starts_with("//") {
+        return "";
+    }
+    match t.find("  // ") {
+        Some(c) => t[..c].trim_end(),
+        None => t,
+    }
+}
+
+/// Constructor body with its `super(…)` / `this(…)` call moved before the `calls` static
+/// calls that precede it, when those are the only statements before it and each argument
+/// is a parameter or a literal.
+fn ctor_call_first(body: &str, calls: usize, params: &[String]) -> Option<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    let stmts: Vec<usize> = (0..lines.len())
+        .filter(|&i| !code_part(lines[i]).is_empty())
+        .collect();
+    let (&ctor_line, prefix) = stmts.get(calls).zip(stmts.get(..calls))?;
+    let ctor_call = code_part(lines[ctor_line]);
+    if !(ctor_call.starts_with("super(") || ctor_call.starts_with("this("))
+        || !ctor_call.ends_with(");")
+    {
+        return None;
+    }
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let top = indent(lines[ctor_line]);
+    let is_literal_or_param = |a: &str| {
+        params.iter().any(|p| p == a)
+            || a == "null"
+            || (a.len() >= 2 && a.starts_with('"') && a.ends_with('"'))
+            || is_number_literal(a)
+    };
+    for &i in prefix {
+        let stmt = code_part(lines[i]);
+        let call = stmt.strip_suffix(");")?;
+        let (callee, args) = call.split_once('(')?;
+        let mut segments = callee.split('.');
+        let head = segments.next()?;
+        if indent(lines[i]) != top
+            || head == "this"
+            || head == "super"
+            || !is_java_ident(head)
+            || !segments.all(is_java_ident)
+            || !callee.contains('.')
+            || !split_top_level_args(args).iter().all(|a| is_literal_or_param(a.as_str()))
+        {
+            return None;
+        }
+    }
+    let first = prefix[0];
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i == first {
+            out.push_str(lines[ctor_line]);
+            out.push('\n');
+        }
+        if i != ctor_line {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
+
+fn is_number_literal(s: &str) -> bool {
+    let s = s.strip_prefix('-').unwrap_or(s);
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        let hex = hex.strip_suffix(&['L', 'l'][..]).unwrap_or(hex);
+        return !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    let s = s.strip_suffix(&['L', 'l', 'F', 'f', 'D', 'd'][..]).unwrap_or(s);
+    s.starts_with(|c: char| c.is_ascii_digit() || c == '.') && s.parse::<f64>().is_ok()
 }
 
 /// For instance calls (virtual/interface/direct/super), transform `Class.method` + `receiver, args`
@@ -12944,5 +13226,258 @@ mod tests {
             (hoisted, java())
         };
         assert_ne!(structured, structured_unhoisted, "{structured}");
+    }
+
+    const JAVA_OBJECT: &str = "Ljava/lang/Object;";
+    const OBJECT_INIT: (&str, &str, &str) = (JAVA_OBJECT, "<init>", "()V");
+
+    fn idx16(idx: u32) -> [u8; 2] {
+        u16::try_from(idx).expect("16-bit index").to_le_bytes()
+    }
+
+    fn built_direct(
+        class: &str,
+        name: &str,
+        proto: &str,
+        access_flags: u32,
+        registers: u16,
+        ins: u16,
+        insns: Vec<u8>,
+    ) -> dex_parser::BuiltMethod {
+        dex_parser::BuiltMethod {
+            class: class.into(),
+            name: name.into(),
+            proto: proto.into(),
+            access_flags,
+            direct: true,
+            code: Some(dex_parser::BuiltCode {
+                registers_size: registers,
+                ins_size: ins,
+                outs_size: 3,
+                insns,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Decompiles `class` (fields `(name, type, static)`) once `methods` and `strings` are
+    /// interned; `direct` builds its direct methods from the pools.
+    fn decompile_direct_methods(
+        class: &str,
+        superclass: &str,
+        fields: &[(&str, &str, bool)],
+        methods: &[(&str, &str, &str)],
+        strings: &[&str],
+        direct: impl FnOnce(&dex_parser::PoolMaps) -> Vec<dex_parser::BuiltMethod>,
+    ) -> String {
+        let mut builder = dex_parser::DexBuilder::new();
+        for ty in [JAVA_OBJECT, class, superclass] {
+            builder.intern_type(ty);
+        }
+        for s in strings {
+            builder.intern_string(*s);
+        }
+        for &(c, n, p) in methods {
+            builder.intern_method_ref(c, n, p);
+        }
+        for &(n, t, _) in fields {
+            builder.intern_field_ref(class, n, t);
+        }
+        let pools = builder.pool_maps();
+        let mut direct_methods = direct(&pools);
+        direct_methods.sort_by_key(|m| pools.method(&m.class, &m.name, &m.proto).expect("method"));
+        let field = |&(n, t, is_static): &(&str, &str, bool)| dex_parser::BuiltField {
+            class: class.into(),
+            name: n.into(),
+            typ: t.into(),
+            access_flags: if is_static { 0x9 } else { 0x1 },
+            static_field: is_static,
+            static_value: None,
+        };
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: class.into(),
+            access_flags: 1,
+            superclass: Some(superclass.into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: fields.iter().filter(|f| f.2).map(&field).collect(),
+            instance_fields: fields.iter().filter(|f| !f.2).map(&field).collect(),
+            direct_methods,
+            virtual_methods: vec![],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        Decompiler::new(&dex).decompile().expect("decompile")
+    }
+
+    /// Header line containing every one of `parts`.
+    fn header_line<'j>(java: &'j str, parts: &[&str]) -> &'j str {
+        java.lines()
+            .find(|l| parts.iter().all(|p| l.contains(p)))
+            .unwrap_or_else(|| panic!("no header with {parts:?}:\n{java}"))
+    }
+
+    /// Statements of the method whose header line contains every one of `parts`.
+    fn statements_of(java: &str, parts: &[&str]) -> Vec<String> {
+        let header = header_line(java, parts);
+        java.lines()
+            .skip_while(|l| *l != header)
+            .skip(1)
+            .map(str::trim)
+            .take_while(|l| *l != "}")
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .map(String::from)
+            .collect()
+    }
+
+    /// Name of the parameter after `ty ` in the header line containing every one of `parts`.
+    fn param_after(java: &str, parts: &[&str], ty: &str) -> String {
+        let header = header_line(java, parts);
+        let rest = &header[header.find(ty).expect("type") + ty.len()..];
+        rest.trim_start().split(')').next().unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn clinit_is_emitted_as_a_static_initializer() {
+        let java = decompile_direct_methods(
+            "Lc/S;",
+            JAVA_OBJECT,
+            &[("x", "I", true)],
+            &[("Lc/S;", "<clinit>", "()V")],
+            &[],
+            |pools| {
+                let x = idx16(pools.field("Lc/S;", "x", "I").expect("field"));
+                vec![built_direct("Lc/S;", "<clinit>", "()V", 0x10008, 1, 0, vec![
+                    0x12, 0x70, // 00: const/4 v0, 7
+                    0x67, 0x00, x[0], x[1], // 02: sput v0, S.x
+                    0x0e, 0x00, // 06: return-void
+                ])]
+            },
+        );
+        assert!(!java.contains("<clinit>"), "{java}");
+        assert!(java.lines().any(|l| l.trim() == "static {"), "{java}");
+        let body = statements_of(&java, &["static {"]);
+        assert!(body.iter().any(|s| s.ends_with("x = 7;")), "{java}");
+        assert!(!body.iter().any(|s| s == "return;"), "{java}");
+    }
+
+    #[test]
+    fn constructor_calling_an_overload_starts_with_this() {
+        const BY_OBJECT: &str = "(Ljava/lang/Object;)V";
+        const BY_STRING: &str = "(Ljava/lang/String;)V";
+        let java = decompile_direct_methods(
+            "Lc/K;",
+            JAVA_OBJECT,
+            &[],
+            &[OBJECT_INIT, ("Lc/K;", "<init>", BY_OBJECT), ("Lc/K;", "<init>", BY_STRING)],
+            &[],
+            |pools| {
+                let object = idx16(pools.method(JAVA_OBJECT, "<init>", "()V").expect("Object()"));
+                let k = idx16(pools.method("Lc/K;", "<init>", BY_OBJECT).expect("K(Object)"));
+                vec![
+                    built_direct("Lc/K;", "<init>", BY_OBJECT, 0x10001, 2, 2, vec![
+                        0x70, 0x10, object[0], object[1], 0x00, 0x00, // invoke-direct {v0}, Object.<init>
+                        0x0e, 0x00, // return-void
+                    ]),
+                    built_direct("Lc/K;", "<init>", BY_STRING, 0x10001, 2, 2, vec![
+                        0x70, 0x20, k[0], k[1], 0x10, 0x00, // invoke-direct {v0, v1}, K.<init>(Object)
+                        0x0e, 0x00, // return-void
+                    ]),
+                ]
+            },
+        );
+        assert!(!java.contains(".<init>("), "{java}");
+        let param = param_after(&java, &["K(", "String "], "String");
+        let by_string = statements_of(&java, &["K(", "String "]);
+        assert_eq!(by_string.first(), Some(&format!("this({param});")), "{java}");
+        let by_object = statements_of(&java, &["K(", "Object "]);
+        assert_eq!(by_object.first().map(String::as_str), Some("super();"), "{java}");
+    }
+
+    #[test]
+    fn constructor_calling_the_superclass_constructor_with_an_argument_is_super() {
+        const BY_STRING: &str = "(Ljava/lang/String;)V";
+        let java = decompile_direct_methods(
+            "Lc/C;",
+            "Lc/B;",
+            &[],
+            &[("Lc/B;", "<init>", BY_STRING), ("Lc/C;", "<init>", BY_STRING)],
+            &[],
+            |pools| {
+                let b = idx16(pools.method("Lc/B;", "<init>", BY_STRING).expect("B(String)"));
+                vec![built_direct("Lc/C;", "<init>", BY_STRING, 0x10001, 2, 2, vec![
+                    0x70, 0x20, b[0], b[1], 0x10, 0x00, // invoke-direct {v0, v1}, B.<init>(String)
+                    0x0e, 0x00, // return-void
+                ])]
+            },
+        );
+        assert!(!java.contains(".<init>("), "{java}");
+        let param = param_after(&java, &["C(", "String "], "String");
+        let body = statements_of(&java, &["C(", "String "]);
+        assert_eq!(body.first(), Some(&format!("super({param});")), "{java}");
+    }
+
+    #[test]
+    fn super_call_after_static_checks_on_parameters_moves_first() {
+        const BY_STRING: &str = "(Ljava/lang/String;)V";
+        const CHECK: &str = "(Ljava/lang/Object;Ljava/lang/String;)V";
+        let java = decompile_direct_methods(
+            "Lc/D;",
+            JAVA_OBJECT,
+            &[("c", "Ljava/lang/String;", false)],
+            &[OBJECT_INIT, ("Lf2/e;", "e", CHECK), ("Lc/D;", "<init>", BY_STRING)],
+            &["left"],
+            |pools| {
+                let left = idx16(pools.string("left").expect("string"));
+                let check = idx16(pools.method("Lf2/e;", "e", CHECK).expect("e"));
+                let object = idx16(pools.method(JAVA_OBJECT, "<init>", "()V").expect("Object()"));
+                let c = idx16(pools.field("Lc/D;", "c", "Ljava/lang/String;").expect("field"));
+                vec![built_direct("Lc/D;", "<init>", BY_STRING, 0x10001, 3, 2, vec![
+                    0x1a, 0x00, left[0], left[1], // 00: const-string v0, "left"
+                    0x71, 0x20, check[0], check[1], 0x02, 0x00, // 04: invoke-static {v2, v0}, f2.e.e
+                    0x70, 0x10, object[0], object[1], 0x01, 0x00, // 0a: invoke-direct {v1}, Object.<init>
+                    0x5b, 0x12, c[0], c[1], // 10: iput-object v2, v1, D.c
+                    0x0e, 0x00, // 14: return-void
+                ])]
+            },
+        );
+        assert!(!java.contains(".<init>("), "{java}");
+        let param = param_after(&java, &["D(", "String "], "String");
+        let body = statements_of(&java, &["D(", "String "]);
+        assert_eq!(body.first().map(String::as_str), Some("super();"), "{java}");
+        let check = body.get(1).map(String::as_str).unwrap_or("");
+        assert!(
+            check.ends_with(&format!("e.e({param}, \"left\");")),
+            "{java}"
+        );
+        assert_eq!(body.get(2), Some(&format!("this.c = {param};")), "{java}");
+    }
+
+    #[test]
+    fn super_call_after_a_read_of_this_stays_in_place() {
+        let java = decompile_direct_methods(
+            "Lc/E;",
+            JAVA_OBJECT,
+            &[("c", JAVA_OBJECT, false)],
+            &[OBJECT_INIT, ("Lc/U;", "u", "(Ljava/lang/Object;)V"), ("Lc/E;", "<init>", "()V")],
+            &[],
+            |pools| {
+                let c = idx16(pools.field("Lc/E;", "c", JAVA_OBJECT).expect("field"));
+                let u = idx16(pools.method("Lc/U;", "u", "(Ljava/lang/Object;)V").expect("u"));
+                let object = idx16(pools.method(JAVA_OBJECT, "<init>", "()V").expect("Object()"));
+                vec![built_direct("Lc/E;", "<init>", "()V", 0x10001, 2, 1, vec![
+                    0x54, 0x10, c[0], c[1], // 00: iget-object v0, v1, E.c
+                    0x71, 0x10, u[0], u[1], 0x00, 0x00, // 04: invoke-static {v0}, U.u
+                    0x70, 0x10, object[0], object[1], 0x01, 0x00, // 0a: invoke-direct {v1}, Object.<init>
+                    0x0e, 0x00, // 10: return-void
+                ])]
+            },
+        );
+        assert!(!java.contains(".<init>("), "{java}");
+        let body = statements_of(&java, &["E() {"]);
+        let read = body.iter().position(|s| s.contains("this.c"));
+        let call = body.iter().position(|s| s == "super();");
+        assert!(read.is_some() && call.is_some() && read < call, "{java}");
     }
 }
