@@ -371,7 +371,7 @@ pub(crate) fn simplify_method_body_with_webs(
     // `int[] a = new int[]{…}; int[][] m = new int[][]{ a, … }` → nested literal rows
     out = fold_2d_array_row_literals(&out);
     // `Integer[] a = new Integer[2]; a[0]=…; Arrays.asList(a)` → `Arrays.asList(…)`
-    out = fold_arrays_as_list_filled_array(&out);
+    out = fold_arrays_as_list_filled_array(&out, webs);
     // `int[] a = new int[]{…}; foo(a)` → `foo(new int[]{…})` (not into `new T[][]{ a }`)
     out = inline_filled_array_into_calls_with_webs(&out, webs);
     // `path = uri.getScheme(); if ("x".equals(path))` → inline getter into if when single-use.
