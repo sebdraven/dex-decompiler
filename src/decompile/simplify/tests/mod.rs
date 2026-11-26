@@ -977,6 +977,68 @@ mod string_switch {
     }
 
     #[test]
+    fn arrays_as_list_resolves_index_without_dropping_reused_declaration() {
+        use crate::decompile::simplify::expr::fold_arrays_as_list_filled_array;
+        let body = concat!(
+            "        int index = 1;\n",
+            "        Integer[] values = new Integer[2];\n",
+            "        values[0] = Integer.valueOf(4);\n",
+            "        values[index] = Integer.valueOf(5);\n",
+            "        List list = Arrays.asList(values);\n",
+            "        index = readIndex();\n",
+            "        use(index, list);\n",
+        );
+        let out = fold_arrays_as_list_filled_array(body, &WebNames::default());
+        assert!(out.contains("Arrays.asList(4, 5)"), "{out}");
+        assert!(!out.contains("values"), "{out}");
+        assert!(out.contains("int index = 1;"), "{out}");
+        assert!(out.contains("index = readIndex();"), "{out}");
+        assert!(out.contains("use(index, list);"), "{out}");
+    }
+
+    #[test]
+    fn arrays_as_list_does_not_guess_an_index_across_mutations_or_branches() {
+        use crate::decompile::simplify::expr::fold_arrays_as_list_filled_array;
+        for setup in [
+            "        int index = 1;\n        index++;\n",
+            "        int index = 1;\n        index = readIndex();\n",
+            "        int index = 1;\n        if (flag) {\n            index = 0;\n        }\n",
+            "        if (flag) {\n            int index = 1;\n        }\n",
+        ] {
+            let body = format!(
+                "{setup}{}",
+                concat!(
+                    "        Integer[] values = new Integer[2];\n",
+                    "        values[0] = Integer.valueOf(4);\n",
+                    "        values[index] = Integer.valueOf(5);\n",
+                    "        use(Arrays.asList(values));\n",
+                )
+            );
+            assert_eq!(
+                fold_arrays_as_list_filled_array(&body, &WebNames::default()),
+                body
+            );
+        }
+    }
+
+    #[test]
+    fn arrays_as_list_does_not_substitute_a_frozen_index() {
+        use crate::decompile::simplify::expr::fold_arrays_as_list_filled_array;
+        let body = concat!(
+            "        int index = 1;\n",
+            "        Integer[] values = new Integer[2];\n",
+            "        values[0] = Integer.valueOf(4);\n",
+            "        values[index] = Integer.valueOf(5);\n",
+            "        use(Arrays.asList(values));\n",
+        );
+        let webs = WebNames {
+            frozen: ["index".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(fold_arrays_as_list_filled_array(body, &webs), body);
+    }
+
+    #[test]
     fn flip_and_flatten_simple_negated_equals() {
         let body = r#"        if (!("a".equals(path))) {
             if (!("b".equals(path))) {
@@ -1445,6 +1507,19 @@ mod string_switch {
     }
 
     #[test]
+    fn close_only_try_keeps_its_unrelated_handlers() {
+        use crate::decompile::simplify::try_catch::strip_orphan_twr_boilerplate;
+        for handler in [
+            "        } finally {\n            releaseLock();\n        }\n",
+            "        } catch (IOException e) {\n            log(e);\n        }\n",
+            "        } catch (IOException e) {\n        } finally {\n            releaseLock();\n        }\n",
+        ] {
+            let body = format!("        try {{\n            resource.close();\n{handler}");
+            assert_eq!(strip_orphan_twr_boilerplate(&body), body);
+        }
+    }
+
+    #[test]
     fn jadx_strip_redundant_cast() {
         let body = r#"        String s = (String) new String("x");
         Object o = (String) (String) y;
@@ -1830,9 +1905,11 @@ mod variable_reuse {
     fn numeric_literal_is_never_inlined_as_a_receiver() {
         let body = concat!("        p0 = 0;\n", "        p0.x.j(1);\n");
         let cleaned = cleanup_decompiler_artifacts(body);
-        assert!(!cleaned.contains("0.x"), "{cleaned}");
+        let numeric_receiver = regex::Regex::new(r"\b0\.x").unwrap();
+        assert!(numeric_receiver.is_match("        0.x.j(1);"));
+        assert!(!numeric_receiver.is_match(&cleaned), "{cleaned}");
         let simplified = simplify_method_body(body, false);
-        assert!(!simplified.contains("0.x"), "{simplified}");
+        assert!(!numeric_receiver.is_match(&simplified), "{simplified}");
     }
 
     /// D2 (001155): an undeclared temp is declared with the type of its definition.

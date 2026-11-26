@@ -972,7 +972,14 @@ pub(crate) fn strip_orphan_twr_boilerplate(body: &str) -> String {
                     });
                 let duplicate_body = is_twr_duplicate_body_try(&try_body);
                 if only_close || try_body.is_empty() || duplicate_body || throw_only {
-                    let mut end = try_close + 1;
+                    // A combined `} finally {` / `} catch (...) {` closes the
+                    // try on the handler's opening line. Inspect it too, and
+                    // never detach a user handler from a close-only try.
+                    let mut end = if lines[try_close].trim() == "}" {
+                        try_close + 1
+                    } else {
+                        try_close
+                    };
                     while end < lines.len() {
                         let t2 = lines[end].trim();
                         if t2.starts_with("} catch (")
@@ -981,18 +988,32 @@ pub(crate) fn strip_orphan_twr_boilerplate(body: &str) -> String {
                             || t2 == "finally {"
                         {
                             if let Some(bclose) = block_body_is_empty(&lines, end) {
-                                end = bclose + 1;
+                                end = if lines[bclose].trim() == "}" {
+                                    bclose + 1
+                                } else {
+                                    bclose
+                                };
                                 continue;
                             }
                             if let Some(bclose) = is_twr_suppression_tail(&lines, end) {
-                                end = bclose + 1;
+                                end = if lines[bclose].trim() == "}" {
+                                    bclose + 1
+                                } else {
+                                    bclose
+                                };
                                 continue;
                             }
                         }
                         break;
                     }
-                    i = end;
-                    continue;
+                    let remaining = lines.get(end).map(|l| l.trim()).unwrap_or("");
+                    if !remaining.starts_with("} catch (")
+                        && !remaining.starts_with("} finally")
+                        && remaining != "finally {"
+                    {
+                        i = end;
+                        continue;
+                    }
                 }
             }
         }

@@ -100,7 +100,7 @@ fn test_rename_variable() {
     // to `return new Object()`. Two uses of the same local keep a name.
     let bytecode: &[u8] = &[
         0x22, 0x00, 0x00, 0x00, // new-instance v0, type@0 Ljava/lang/Object;
-        0x38, 0x00, 0x02, 0x00, // if-eqz v0, +2
+        0x38, 0x00, 0x03, 0x00, // if-eqz v0, +3 -> second return at 10
         0x11, 0x00, // return-object v0
         0x11, 0x00, // return-object v0
     ];

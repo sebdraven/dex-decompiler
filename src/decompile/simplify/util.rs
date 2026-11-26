@@ -423,7 +423,7 @@ pub(crate) fn is_local_temp_name(var: &str) -> bool {
 /// Line contains an invoke (possibly on the RHS of an assignment).
 pub(crate) fn line_contains_call(line: &str) -> bool {
     let binding = strip_trailing_comment(line);
-    let t = binding.trim();
+    let t = strip_statement_label(binding.trim());
     if t.is_empty() {
         return false;
     }
@@ -442,6 +442,14 @@ pub(crate) fn line_contains_call(line: &str) -> bool {
         return false;
     }
     expr.contains('(') && expr.contains(')')
+}
+
+/// Statement `t` without its leading `label: ` (a label is not a variable).
+pub(crate) fn strip_statement_label(t: &str) -> &str {
+    match t.split_once(": ") {
+        Some((label, rest)) if is_java_ident(label) && label != "default" => rest,
+        _ => t,
+    }
 }
 
 /// Collect whole Java identifiers appearing in `line` (declaration order, deduped).

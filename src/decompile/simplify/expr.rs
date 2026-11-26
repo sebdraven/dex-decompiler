@@ -625,6 +625,39 @@ pub(crate) fn fold_2d_array_row_literals_once(body: &str) -> String {
     body.to_string()
 }
 
+/// A literal index, or its nearest straight-line constant definition. Keep that
+/// definition: its declaration may still be needed by a later reassignment.
+fn array_store_index(lines: &[&str], at: usize, index: &str, webs: &WebNames) -> Option<usize> {
+    if let Ok(value) = index.parse() {
+        return Some(value);
+    }
+    if !is_java_ident(index) || !webs.may_substitute(index) {
+        return None;
+    }
+    let indent = leading_indent(lines[at]);
+    for line in lines[..at].iter().rev() {
+        let binding = strip_trailing_comment(line);
+        let stmt = binding.trim();
+        if stmt.is_empty() || stmt.starts_with("//") {
+            continue;
+        }
+        // Do not cross a branch, loop header, or any other block boundary.
+        if leading_indent(line) != indent || !stmt.ends_with(';') {
+            return None;
+        }
+        if let Some((var, rhs)) = parse_simple_assign_line(line) {
+            if var == index {
+                return rhs.parse().ok();
+            }
+        }
+        // An increment or another unrecognized use may change the index.
+        if ident_occurs(stmt, index) {
+            return None;
+        }
+    }
+    None
+}
+
 pub(crate) fn fold_2d_array_row_literals(body: &str) -> String {
     let mut current = body.to_string();
     for _ in 0..8 {
@@ -639,10 +672,10 @@ pub(crate) fn fold_2d_array_row_literals(body: &str) -> String {
 
 /// `Integer[] a = new Integer[2]; a[0]=Integer.valueOf(4); a[1]=Integer.valueOf(5); Arrays.asList(a)`
 /// → `Arrays.asList(4, 5)` when `a` is only used by that `asList` call.
-pub(crate) fn fold_arrays_as_list_filled_array(body: &str) -> String {
+pub(crate) fn fold_arrays_as_list_filled_array(body: &str, webs: &WebNames) -> String {
     let mut current = body.to_string();
     for _ in 0..8 {
-        let next = fold_arrays_as_list_filled_array_once(&current);
+        let next = fold_arrays_as_list_filled_array_once(&current, webs);
         if next == current {
             break;
         }
@@ -651,7 +684,7 @@ pub(crate) fn fold_arrays_as_list_filled_array(body: &str) -> String {
     current
 }
 
-fn fold_arrays_as_list_filled_array_once(body: &str) -> String {
+fn fold_arrays_as_list_filled_array_once(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
     for i in 0..lines.len() {
         let Some((arr, _elem_ty, size)) = parse_sized_new_array(lines[i]) else {
@@ -675,7 +708,7 @@ fn fold_arrays_as_list_filled_array_once(body: &str) -> String {
             if store_arr != arr {
                 break;
             }
-            let Ok(idx) = idx_s.parse::<usize>() else {
+            let Some(idx) = array_store_index(&lines, j, &idx_s, webs) else {
                 break;
             };
             if idx >= size || elems[idx].is_some() {

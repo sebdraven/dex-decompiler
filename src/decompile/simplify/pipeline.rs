@@ -15,7 +15,7 @@ use super::util::*;
 /// When the use is a receiver (`var.` / `var[`), wrap casts/complex exprs in parentheses.
 /// and "invoke(...); vN = <result>;" into "vN = method(args);".
 /// Also collapses "if (cond) { return a; } else { return b; }" into "return cond ? a : b;" (JADX-style).
-/// When `is_constructor` is true, "receiver.<init>();" (no args) is simplified to "super();".
+/// `is_constructor` is kept for callers; `super(…)` / `this(…)` come from the bytecode.
 pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     simplify_method_body_with_webs(body, is_constructor, &WebNames::default())
 }
@@ -25,7 +25,7 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
 /// inlinable constant.
 pub(crate) fn simplify_method_body_with_webs(
     body: &str,
-    is_constructor: bool,
+    _is_constructor: bool,
     webs: &WebNames,
 ) -> String {
     let body = restore_synchronized_from_monitors(body);
@@ -371,7 +371,7 @@ pub(crate) fn simplify_method_body_with_webs(
     // `int[] a = new int[]{…}; int[][] m = new int[][]{ a, … }` → nested literal rows
     out = fold_2d_array_row_literals(&out);
     // `Integer[] a = new Integer[2]; a[0]=…; Arrays.asList(a)` → `Arrays.asList(…)`
-    out = fold_arrays_as_list_filled_array(&out);
+    out = fold_arrays_as_list_filled_array(&out, webs);
     // `int[] a = new int[]{…}; foo(a)` → `foo(new int[]{…})` (not into `new T[][]{ a }`)
     out = inline_filled_array_into_calls_with_webs(&out, webs);
     // `path = uri.getScheme(); if ("x".equals(path))` → inline getter into if when single-use.
@@ -391,35 +391,6 @@ pub(crate) fn simplify_method_body_with_webs(
     out = hoist_loop_bound_length_decl(&out);
     out = repair_missing_loop_else_break(&out);
     out = repair_register_reuse_scalars_with_webs(&out, webs);
-    // Only in constructors: simplify "receiver.<init>();" (no args) to "super();".
-    if is_constructor {
-        let mut simplified = String::new();
-        for line in out.lines() {
-            let binding = strip_trailing_comment(line);
-            let stmt = binding.trim();
-            let ind = leading_indent(line);
-            let comment_part = line.get(binding.len()..).unwrap_or("");
-            if stmt.ends_with(".<init>();") {
-                let prefix = stmt.trim_end_matches(".<init>();");
-                if prefix
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    && !prefix.is_empty()
-                {
-                    writeln!(simplified, "{}super();{}", ind, comment_part).ok();
-                    continue;
-                }
-            }
-            simplified.push_str(line);
-            if !line.is_empty() {
-                simplified.push('\n');
-            }
-        }
-        if simplified.ends_with('\n') && !out.ends_with('\n') {
-            simplified.pop();
-        }
-        out = simplified;
-    }
     // Rebase indentation to consistent 4-space levels (fixes over-indented bodies).
     out = normalize_java_indent(&out);
     out = repair_register_reuse_scalars_with_webs(&out, webs);

@@ -289,6 +289,14 @@ fn cleanup_decompiler_artifacts_once_with_webs(body: &str, webs: &WebNames) -> S
         if c.val.trim().ends_with(".ordinal()") {
             continue;
         }
+        // Keep resource bindings visible to the try-with-resources passes. Inlining
+        // a cast into its sole close() call hides the declaration/cleanup pairing.
+        if lines[c.def_idx + 1..c.end_idx]
+            .iter()
+            .any(|l| l.trim() == format!("{}.close();", c.var))
+        {
+            continue;
+        }
         // Allow `i`/`j`/`k` only for filled-array sizes/indices (`new T[i]`, `a[k]=…`).
         // Never inline them into loop tests or expressions like `j++ / i`.
         if !inlinable
