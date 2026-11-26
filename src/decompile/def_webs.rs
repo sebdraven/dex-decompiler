@@ -464,6 +464,7 @@ mod tests {
     fn webs_with_try(bytecode: &[u8], start: u32, end: u32, handler: u32) -> DefWebs {
         let instructions = dex_bytecode::decode_all(bytecode, 0).expect("decode");
         let mut cfg = MethodCfg::build(&instructions, bytecode, 0, &condition_no_branch);
+        cfg.split_after_terminals(&instructions, 0);
         cfg.split_at_offsets(&[handler]);
         let edges: Vec<ExcEdge> = cfg
             .exceptional_edges_for_range(start, end, &[handler])

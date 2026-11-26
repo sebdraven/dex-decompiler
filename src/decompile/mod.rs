@@ -6224,7 +6224,10 @@ impl<'a> Decompiler<'a> {
         code: &CodeItem,
         encoded: &EncodedMethod,
     ) {
+        // Analysis copy: its block ids never reach the emission, only instruction offsets
+        // (base 0, as `DefWebs` reads `Instruction::offset`).
         let mut cfg = cfg.clone();
+        cfg.split_after_terminals(instructions, 0);
         let mut exceptional_edges = Vec::new();
         let mut tries = Vec::new();
         let mut catch_types: DetHashMap<u32, String> = DetHashMap::default();
@@ -12288,6 +12291,7 @@ mod tests {
         let instructions = decode_all(&bytecode, 0).unwrap();
         let condition_for = |ins: &Instruction| format_condition(ins.mnemonic(), ins.operands());
         let mut cfg = MethodCfg::build(&instructions, &bytecode, 0, &condition_for);
+        cfg.split_after_terminals(&instructions, 0);
         cfg.split_at_offsets(&[0x1e]);
         let edges: Vec<def_webs::ExcEdge> = cfg
             .exceptional_edges_for_range(0, 0x0a, &[0x1e])
@@ -13458,29 +13462,89 @@ mod tests {
         assert!(!body.iter().any(|t| is_lone_declaration(t)), "{java}");
     }
 
+    /// The loop's only exit follows it: `int x;` before the loop, `x = fetch();` in it,
+    /// the loop left by `break` (or its do-while test), `showInt(x)` after it.
     #[test]
-    fn variable_with_its_use_inside_the_loop_stays_local() {
+    fn loop_exit_use_after_the_loop_is_declared_before_it() {
         let java = structured_static_k("()V", 1, 0, assigned_in_loop_body);
         let (_, body) = method_statements(&java, "m");
+        let depth = statement_depths(&body);
         let v = call_arg(&body, "showInt", &java);
         let loop_at = body
             .iter()
             .position(|t| is_loop_statement(t))
-            .expect("loop");
+            .unwrap_or_else(|| panic!("no loop:\n{java}"));
+        let loop_end = (loop_at + 1..body.len())
+            .find(|&k| depth[k] == depth[loop_at] && body[k].starts_with('}'))
+            .unwrap_or_else(|| panic!("unclosed loop:\n{java}"));
         let decl = body
             .iter()
-            .position(|t| typed_assignment(t, v))
-            .expect("declaration");
+            .position(|t| lone_declaration(t, v).is_some())
+            .unwrap_or_else(|| panic!("no `T {v};`:\n{java}"));
+        assert!(decl < loop_at, "`{v}` is not declared before the loop:\n{java}");
+        let inside = &body[loop_at + 1..loop_end];
+        assert!(
+            inside.iter().any(|t| plain_assignment(t, v) && t.contains("fetch(")),
+            "`{v}` is not assigned in the loop:\n{java}"
+        );
+        let do_while_exit = body[loop_end].starts_with("} while (");
+        assert!(
+            do_while_exit || inside.iter().any(|t| *t == "break;" || t.ends_with(" break;")),
+            "the loop has no exit:\n{java}"
+        );
+        assert!(
+            !inside.iter().any(|t| t.contains("showInt(") || t.starts_with("return")),
+            "{java}"
+        );
         let use_at = body
             .iter()
             .position(|t| t.contains("showInt("))
-            .expect("use");
-        assert!(loop_at < decl && decl < use_at, "{java}");
-        let depth: i32 = body[loop_at..use_at]
+            .unwrap_or_else(|| panic!("no use:\n{java}"));
+        assert!(use_at > loop_end && depth[use_at] == depth[loop_at], "{java}");
+        if let Some(ret) = body.iter().position(|t| t.starts_with("return")) {
+            assert!(ret > use_at && depth[ret] == depth[loop_at], "{java}");
+        }
+        assert!(!body.iter().any(|t| typed_assignment(t, v)), "{java}");
+    }
+
+    /// `static void m(int a) { touch(); do { int x = fetch(); showInt(x); showInt(x); } while (a != 0); }`
+    fn used_in_loop_body(index: &dyn Fn(&str) -> [u8; 2]) -> Vec<u8> {
+        let (touch, fetch, show) = (index("touch"), index("fetch"), index("showInt"));
+        vec![
+            0x71, 0x00, touch[0], touch[1], 0x00, 0x00, // 00: invoke-static {}, touch()V
+            0x71, 0x00, fetch[0], fetch[1], 0x00, 0x00, // 03: invoke-static {}, fetch()I
+            0x0a, 0x00, // 06: move-result v0
+            0x71, 0x10, show[0], show[1], 0x00, 0x00, // 07: invoke-static {v0}, showInt(I)V
+            0x71, 0x10, show[0], show[1], 0x00, 0x00, // 0a: invoke-static {v0}, showInt(I)V
+            0x39, 0x01, 0xf6, 0xff, // 0d: if-nez v1, -10 -> 03
+            0x0e, 0x00, // 0f: return-void
+        ]
+    }
+
+    /// Defined and read in the body of a loop that goes on: nothing is moved out of it.
+    #[test]
+    fn variable_defined_and_read_in_the_loop_stays_local() {
+        let java = structured_static_k("(I)V", 2, 1, used_in_loop_body);
+        let (_, body) = method_statements(&java, "m");
+        let depth = statement_depths(&body);
+        let v = call_arg(&body, "showInt", &java);
+        let loop_at = body
             .iter()
-            .map(|t| t.matches('{').count() as i32 - t.matches('}').count() as i32)
-            .sum();
-        assert!(depth > 0, "the fixture must keep its use inside the loop:\n{java}");
+            .position(|t| is_loop_statement(t))
+            .unwrap_or_else(|| panic!("no loop:\n{java}"));
+        let decl = body
+            .iter()
+            .position(|t| typed_assignment(t, v))
+            .unwrap_or_else(|| panic!("`{v}` is not declared at its assignment:\n{java}"));
+        assert!(loop_at < decl && depth[decl] > depth[loop_at], "{java}");
+        let uses: Vec<usize> = (0..body.len())
+            .filter(|&k| body[k].contains("showInt("))
+            .collect();
+        assert_eq!(uses.len(), 2, "{java}");
+        assert!(
+            uses.iter().all(|&k| k > decl && depth[k] == depth[decl]),
+            "the uses must stay in the loop with the definition:\n{java}"
+        );
         assert!(!body.iter().any(|t| is_lone_declaration(t)), "{java}");
     }
 

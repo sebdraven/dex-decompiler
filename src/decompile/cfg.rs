@@ -534,6 +534,32 @@ impl MethodCfg {
         self.blocks = blocks;
     }
 
+    /// Ends every block at its `return` or `throw`: the bytecode CFG can leave the code that
+    /// follows (a handler) in the same raw block, and a later `split_at_offsets` there would
+    /// let the return fall through into it. For data-flow analysis only: block ids change,
+    /// so the emission CFG never goes through it.
+    pub fn split_after_terminals(&mut self, instructions: &[Instruction], base_offset: usize) {
+        let is_exit = |ins: &Instruction| {
+            matches!(
+                ins.mnemonic(),
+                "return-void" | "return" | "return-wide" | "return-object" | "throw"
+            )
+        };
+        let at = |ins: &Instruction| (ins.offset as usize + base_offset) as u32;
+        let after_exits: Vec<u32> = instructions
+            .windows(2)
+            .filter(|pair| is_exit(&pair[0]))
+            .map(|pair| at(&pair[1]))
+            .collect();
+        self.split_at_offsets(&after_exits);
+        let exits: DetHashSet<u32> = instructions.iter().filter(|i| is_exit(i)).map(at).collect();
+        for block in &mut self.blocks {
+            if block.instruction_offsets.last().is_some_and(|off| exits.contains(off)) {
+                block.end = BlockEnd::Exit;
+            }
+        }
+    }
+
     /// All (from_block_id, to_block_id) edges for graph visualization.
     pub fn successor_edges(&self) -> Vec<(BlockId, BlockId)> {
         let mut edges = Vec::new();
@@ -929,6 +955,30 @@ mod tests {
         assert!(cfg.block_count() >= 1);
         assert!(matches!(cfg.blocks[cfg.entry].end, BlockEnd::Exit));
         assert!(cfg.loop_headers.is_empty());
+    }
+
+    /// Return and throw end normal flow on the analysis CFG even when handler code follows.
+    #[test]
+    fn split_after_terminals_keeps_exits_from_falling_into_handler_code() {
+        for opcode in [0x0e, 0x0f, 0x10, 0x11, 0x27] {
+            let bytecode = [
+                opcode, 0x00, // return or throw at 0
+                0x00, 0x00, // unreachable nop at 2
+                0x0d, 0x01, // move-exception v1 at 4
+                0x0e, 0x00, // return-void at 6
+            ];
+            let instructions = decode_all(&bytecode, 0).unwrap();
+            let mut cfg = MethodCfg::build(&instructions, &bytecode, 0, &condition_for);
+            cfg.split_after_terminals(&instructions, 0);
+            cfg.split_at_offsets(&[4]);
+            assert!(matches!(cfg.blocks[cfg.entry].end, BlockEnd::Exit), "{opcode:x}");
+            assert!(
+                cfg.successor_edges().iter().all(|&(from, _)| from != cfg.entry),
+                "{opcode:x}: {:?}",
+                cfg.successor_edges()
+            );
+            assert_eq!(cfg.blocks[cfg.entry].instruction_offsets, [0]);
+        }
     }
 
     /// Catch `goto` into the delayed `j = j + 1` store is a join, not a second loop (`foo4`).
