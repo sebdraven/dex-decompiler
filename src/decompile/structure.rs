@@ -63,6 +63,12 @@ struct Graph {
     loops: DetHashMap<BlockId, DetHashSet<BlockId>>,
     /// At least two predecessors through forward edges.
     merge: Vec<bool>,
+    /// The outermost loop whose only exit is the block, when the loop dominates it.
+    exit_owner: Vec<Option<BlockId>>,
+    /// Loop header → its only exit.
+    loop_exit: DetHashMap<BlockId, BlockId>,
+    /// Block reached through lone `goto`s.
+    through: Vec<BlockId>,
 }
 
 impl Graph {
@@ -188,6 +194,43 @@ impl Graph {
         let merge = (0..n)
             .map(|v| preds[v].iter().filter(|&&p| !dominates(v, p)).count() >= 2)
             .collect();
+        // A loop leaving to a single block is followed by it, wherever in the loop the
+        // test sits (dex_bytecode puts each branch in its own block, below the header).
+        // A lone `goto` reached from one block only leads to its target.
+        let lone_goto = |b: BlockId| {
+            matches!(cfg.blocks[b].end, BlockEnd::Goto(_))
+                && cfg.blocks[b].instruction_offsets.len() <= 1
+                && preds[b].len() == 1
+        };
+        let through_gotos = |mut t: BlockId| {
+            for _ in 0..n {
+                match succs[t].as_slice() {
+                    [s] if lone_goto(t) => t = *s,
+                    _ => break,
+                }
+            }
+            t
+        };
+        let mut exit_owner = vec![None; n];
+        let mut loop_exit = DetHashMap::default();
+        let mut outermost_first: Vec<(&BlockId, &DetHashSet<BlockId>)> = loops.iter().collect();
+        outermost_first.sort_by_key(|(h, body)| (std::cmp::Reverse(body.len()), rpo_num[**h]));
+        for (&h, body) in outermost_first {
+            let mut exits = body
+                .iter()
+                .flat_map(|&b| succs[b].iter().copied())
+                .filter(|t| !body.contains(t))
+                .map(through_gotos);
+            let Some(y) = exits.next() else {
+                continue;
+            };
+            if exits.any(|t| t != y) || !body.contains(&idom[y]) || exit_owner[y].is_some() {
+                continue;
+            }
+            exit_owner[y] = Some(h);
+            loop_exit.insert(h, y);
+        }
+        let through = (0..n).map(through_gotos).collect();
         Some(Self {
             rpo_num,
             idom,
@@ -196,6 +239,9 @@ impl Graph {
             children,
             loops,
             merge,
+            exit_owner,
+            loop_exit,
+            through,
         })
     }
 
@@ -277,23 +323,41 @@ impl Builder<'_> {
         }
         self.depth += 1;
         let g = self.g;
-        // A loop's dominated blocks outside the loop come after it; for any other
-        // block, only the merge nodes it dominates do.
+        // A loop's dominated blocks outside the loop come after it, and so does its only
+        // exit; for any other block, only the merge nodes it dominates do. A loop's exit
+        // is left to that loop.
+        let placed_here = |c: &BlockId| g.exit_owner[*c].is_none_or(|h| h == x);
         let (followers, inner): (Vec<BlockId>, Vec<BlockId>) = match g.loops.get(&x) {
-            Some(body) => (
-                g.children[x]
+            Some(body) => {
+                let exit = g.loop_exit.get(&x).copied();
+                // A lone `goto` to the exit stays where it is reached.
+                let to_exit = |c: &BlockId| exit.is_some_and(|y| *c != y && g.through[*c] == y);
+                let mut followers: Vec<BlockId> = g.children[x]
                     .iter()
                     .copied()
-                    .filter(|c| !body.contains(c))
-                    .collect(),
-                g.children[x]
-                    .iter()
-                    .copied()
-                    .filter(|c| body.contains(c) && g.merge[*c])
-                    .collect(),
-            ),
+                    .filter(|c| !body.contains(c) && placed_here(c) && !to_exit(c))
+                    .collect();
+                if let Some(y) = exit {
+                    if !followers.contains(&y) {
+                        followers.push(y);
+                    }
+                }
+                followers.sort_by_key(|&c| g.rpo_num[c]);
+                (
+                    followers,
+                    g.children[x]
+                        .iter()
+                        .copied()
+                        .filter(|c| body.contains(c) && g.merge[*c])
+                        .collect(),
+                )
+            }
             None => (
-                g.children[x].iter().copied().filter(|c| g.merge[*c]).collect(),
+                g.children[x]
+                    .iter()
+                    .copied()
+                    .filter(|c| g.merge[*c] && placed_here(c))
+                    .collect(),
                 Vec::new(),
             ),
         };
@@ -948,6 +1012,61 @@ mod tests {
         assert!(labels(&r).is_empty(), "{r:#?}");
         assert_eq!(breaks(&r, None), 2, "{r:#?}");
         assert_eq!(continues(&r, None), 1, "{r:#?}");
+    }
+
+    /// `breakInLoop`: the header only loads the bound, the tests sit in later blocks, and
+    /// the second test leaves through a lone `goto`.
+    #[test]
+    fn exit_tested_below_the_header_follows_the_loop() {
+        // 0 → 1 → 2: if (c1) goto 6; 3: if (c2) goto 5; 4: goto 6; 5: goto 1; 6: return
+        let cfg = cfg_of(vec![
+            BlockEnd::FallThrough,
+            BlockEnd::FallThrough,
+            cond("c1", 6, 3),
+            cond("c2", 5, 4),
+            BlockEnd::Goto(6),
+            BlockEnd::Goto(1),
+            BlockEnd::Exit,
+        ]);
+        let r = structured(&cfg);
+        let (at, next) = loop_then_block(&r, 1, 6);
+        assert_eq!(next, at + 1, "{r:#?}");
+        assert!(labels(&r).is_empty(), "{r:#?}");
+        assert_eq!(breaks(&r, None), 2, "{r:#?}");
+        assert_eq!(continues(&r, None), 1, "{r:#?}");
+    }
+
+    /// `merge`: both tests of the first loop leave to the header of the next loop.
+    #[test]
+    fn loops_left_from_tests_below_their_headers_are_successive() {
+        // 1: (header) 2: if (c1) goto 6; 3: 4: if (c2) goto 6; 5: goto 1;
+        // 6: (header) 7: if (c3) goto 9; 8: goto 6; 9: return
+        let cfg = cfg_of(vec![
+            BlockEnd::FallThrough,
+            BlockEnd::FallThrough,
+            cond("c1", 6, 3),
+            BlockEnd::FallThrough,
+            cond("c2", 6, 5),
+            BlockEnd::Goto(1),
+            BlockEnd::FallThrough,
+            cond("c3", 9, 8),
+            BlockEnd::Goto(6),
+            BlockEnd::Exit,
+        ]);
+        let r = structured(&cfg);
+        let items = top(&r);
+        let first = items
+            .iter()
+            .position(|c| matches!(c, Region::Loop { header: 1, .. }))
+            .unwrap_or_else(|| panic!("no top-level loop 1: {r:#?}"));
+        assert!(
+            matches!(items.get(first + 1), Some(Region::Loop { header: 6, .. })),
+            "{r:#?}"
+        );
+        assert!(matches!(items.get(first + 2), Some(Region::Block(9))), "{r:#?}");
+        assert!(labels(&r).is_empty(), "{r:#?}");
+        assert_eq!(breaks(&r, None), 3, "{r:#?}");
+        assert_eq!(continues(&r, None), 2, "{r:#?}");
     }
 
     #[test]

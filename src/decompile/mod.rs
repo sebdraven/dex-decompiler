@@ -471,6 +471,8 @@ pub struct Decompiler<'a> {
     hoist: RefCell<HoistState>,
     /// Constructor whose body is being emitted.
     ctor: RefCell<Option<CtorState>>,
+    /// Method (`insns_off`) and the `(invoke offset, register)` arguments written `null`.
+    null_args: RefCell<Option<(usize, DetHashSet<(u32, u32)>)>>,
 }
 
 /// What `this(…)` / `super(…)` emission needs from the constructor being emitted.
@@ -635,6 +637,7 @@ impl<'a> Decompiler<'a> {
             explicit_jumps: Cell::new(false),
             hoist: RefCell::new(HoistState::default()),
             ctor: RefCell::new(None),
+            null_args: RefCell::new(None),
         }
     }
 
@@ -674,6 +677,7 @@ impl<'a> Decompiler<'a> {
             explicit_jumps: Cell::new(false),
             hoist: RefCell::new(HoistState::default()),
             ctor: RefCell::new(None),
+            null_args: RefCell::new(None),
         }
     }
 
@@ -2322,8 +2326,10 @@ impl<'a> Decompiler<'a> {
         class_name: Option<&str>,
     ) -> Result<String> {
         let saved = self.ctor.replace(self.ctor_state(code, encoded));
+        let saved_nulls = self.null_args.take();
         let body = self.decompile_method_body_inner(code, encoded, class_name);
         *self.ctor.borrow_mut() = saved;
+        *self.null_args.borrow_mut() = saved_nulls;
         body
     }
 
@@ -2480,15 +2486,27 @@ impl<'a> Decompiler<'a> {
             format_condition(ins.mnemonic(), &resolved)
         };
         let mut cfg = MethodCfg::build(&instructions, insns_bytes, base_offset, &condition_for);
+        // The dominator-tree structurer takes this body (`whole_method_root`): the folds
+        // below that only it relies on leave the legacy and try/catch paths as they were.
+        let structured = self.mode == DecompilationMode::Restructure
+            && code.tries_size == 0
+            && !legacy_structurer()
+            && structure::build(&cfg, cfg.entry).is_some();
         // Folding needs the entry definitions of parameters and the catch edges (B2).
         self.prepare_def_webs(&cfg, &instructions, code, encoded);
         {
             let webs = self.method_webs.borrow();
             let webs = webs.as_ref().map(|(_, w)| w);
             Self::fold_constants_into_conditions(&mut cfg, &instructions, Some(self.dex), webs);
+            if let Some(webs) = webs.filter(|_| structured) {
+                Self::fold_array_lengths_into_conditions(&mut cfg, &instructions, webs);
+            }
         }
         self.fold_field_reads_into_conditions(&mut cfg, &instructions);
         self.fold_aget_into_switch_conditions(&mut cfg, &instructions);
+        if structured {
+            self.prepare_null_arguments(&mut cfg, &instructions, code);
+        }
         self.prepare_method_reg_types(
             &instructions,
             code.insns_off,
@@ -4748,6 +4766,23 @@ impl<'a> Decompiler<'a> {
                         }
                     }
                 }
+                if !loop_emitted && self.explicit_jumps.get() {
+                    loop_emitted = self.emit_entry_tested_loop(
+                        body,
+                        *header,
+                        cfg,
+                        instructions,
+                        base_off,
+                        encoded,
+                        code,
+                        out,
+                        indent,
+                        declared,
+                        global_used_regs,
+                        emit_range,
+                        class_name,
+                    )?;
+                }
                 if !loop_emitted {
                     let loop_break = region::loop_exit_break_target(body, *header, cfg);
                     let multi_exits = region::loop_prefix_multi_exit_ifs(body, *header);
@@ -4997,6 +5032,80 @@ impl<'a> Decompiler<'a> {
         }
     }
 
+    /// Explicit-jump loop whose body opens with exit tests that compute nothing (their
+    /// operands folded): `while (!t1 && !t2 …) { rest }`. False when it does not apply.
+    fn emit_entry_tested_loop(
+        &self,
+        body: &Region,
+        header: BlockId,
+        cfg: &MethodCfg,
+        instructions: &[Instruction],
+        base_off: usize,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+        out: &mut String,
+        indent: usize,
+        declared: &mut DetHashSet<String>,
+        global_used_regs: Option<&DetHashSet<u32>>,
+        emit_range: Option<(u32, u32)>,
+        class_name: Option<&str>,
+    ) -> Result<bool> {
+        let tests = region::loop_entry_tests(body, header, cfg);
+        let quiet = {
+            // Skipped regions must not be declaration sites.
+            let state = self.hoist.borrow();
+            let site = |r: &Region| state.sites.contains_key(&hoist::region_addr(r));
+            tests
+                .iter()
+                .take_while(|t| {
+                    let Region::Seq(parts) = t.seq else {
+                        return false;
+                    };
+                    !site(t.seq)
+                        && !parts.iter().any(|p| site(p))
+                        && blocks_compute_nothing(cfg, instructions, &t.blocks)
+                })
+                .count()
+        };
+        let Some(last) = quiet.checked_sub(1).map(|i| &tests[i]) else {
+            return Ok(false);
+        };
+        let condition = tests[..quiet]
+            .iter()
+            .map(|t| {
+                let c = negate_condition(t.condition);
+                if c.contains("||") || c.contains('?') {
+                    format!("({c})")
+                } else {
+                    c
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let ind = "    ".repeat(indent);
+        writeln!(out, "{}while ({}) {{", ind, shorten_java_names(&condition))
+            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        self.emit_region(
+            last.rest,
+            cfg,
+            instructions,
+            base_off,
+            encoded,
+            code,
+            out,
+            indent + 1,
+            Some(header),
+            None,
+            declared,
+            global_used_regs,
+            emit_range,
+            class_name,
+        )?;
+        writeln!(out, "{}}}", ind)
+            .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+        Ok(true)
+    }
+
     /// Fold numeric constants and param copies from instructions immediately before
     /// conditionals into the condition string.
     /// E.g. `const/16 v0, 1002; if-ne v4, v0` → `v4 != 1002`,
@@ -5225,6 +5334,169 @@ impl<'a> Decompiler<'a> {
             }
         }
         cfg.folded_const_offsets = folded.into_iter().collect();
+    }
+
+    /// `array-length vA, vB` right before `if-* vA` (in its block or in the one block
+    /// falling into it): the test reads `vB.length`, and the length is not emitted when
+    /// the test is its only read.
+    fn fold_array_lengths_into_conditions(
+        cfg: &mut MethodCfg,
+        instructions: &[Instruction],
+        webs: &DefWebs,
+    ) {
+        let previous: Vec<Option<u32>> = (0..cfg.blocks.len())
+            .map(|bid| {
+                let offs = &cfg.blocks[bid].instruction_offsets;
+                match offs.len() {
+                    0 => None,
+                    1 => match cfg.blocks_that_fall_through_to(bid).as_slice() {
+                        [p] => cfg.blocks[*p].instruction_offsets.last().copied(),
+                        _ => None,
+                    },
+                    n => Some(offs[n - 2]),
+                }
+            })
+            .collect();
+        let mut folded = Vec::new();
+        for (block, prev) in cfg.blocks.iter_mut().zip(previous) {
+            let BlockEnd::Conditional {
+                ref mut condition, ..
+            } = block.end
+            else {
+                continue;
+            };
+            let (Some(&branch), Some(prev)) = (block.instruction_offsets.last(), prev) else {
+                continue;
+            };
+            let Some(ins) = instructions.iter().find(|i| i.offset == prev) else {
+                continue;
+            };
+            if ins.mnemonic() != "array-length" {
+                continue;
+            }
+            let Some((length, array)) = parse_two_regs(ins.operands()) else {
+                continue;
+            };
+            if !webs.reads(branch).contains(&length)
+                || webs.reaching(branch, length) != BTreeSet::from([prev])
+                || webs.reaching(prev, array) != webs.reaching(branch, array)
+                || webs.use_count(length, prev) != 1
+            {
+                continue;
+            }
+            let mut map = DetHashMap::default();
+            map.insert(length, format!("v{array}.length"));
+            let next = replace_register_names(condition, &map);
+            if next != *condition {
+                *condition = next;
+                folded.push(prev);
+            }
+        }
+        cfg.folded_const_offsets.extend(folded);
+    }
+
+    /// A `null` constant read only as arguments of reference parameters of different types
+    /// has no declared type that fits every call: each argument is written `null`, and the
+    /// constant is not emitted.
+    fn prepare_null_arguments(
+        &self,
+        cfg: &mut MethodCfg,
+        instructions: &[Instruction],
+        code: &CodeItem,
+    ) {
+        let webs_slot = self.method_webs.borrow();
+        let Some((_, webs)) = webs_slot.as_ref().filter(|(off, _)| *off == code.insns_off) else {
+            return;
+        };
+        let mut args = DetHashSet::default();
+        for ins in instructions {
+            if !matches!(ins.mnemonic(), "const/4" | "const/16" | "const") {
+                continue;
+            }
+            let Some(reg) = parse_one_reg(ins.operands()) else {
+                continue;
+            };
+            let literal = ins.operands().rsplit(',').next().map(str::trim);
+            if literal.and_then(|v| v.parse::<i64>().ok()) != Some(0)
+                || self.debug_type_for_reg(reg).is_some()
+                || webs.members(webs.web(reg, ins.offset)).ne([(reg, ins.offset)])
+            {
+                continue;
+            }
+            let sites = webs.use_sites(reg, ins.offset);
+            let mut types = BTreeSet::new();
+            let all_reference_args = sites.iter().all(|&site| {
+                self.reference_param_types(instructions, site, reg)
+                    .map(|tys| types.extend(tys))
+                    .is_some()
+            });
+            if all_reference_args && !sites.is_empty() && types.len() >= 2 {
+                args.extend(sites.iter().map(|&site| (site, reg)));
+                cfg.folded_const_offsets.insert(ins.offset);
+            }
+        }
+        *self.null_args.borrow_mut() = Some((code.insns_off, args));
+    }
+
+    /// `args` of the invoke at `off`, with the arguments `prepare_null_arguments` chose
+    /// written `null` (a receiver never is).
+    fn with_null_arguments(&self, insns_off: usize, off: u32, args: &str, is_instance: bool) -> String {
+        let nulls = self.null_args.borrow();
+        let Some((_, nulls)) = nulls.as_ref().filter(|(o, _)| *o == insns_off) else {
+            return args.to_string();
+        };
+        if !nulls.iter().any(|&(site, _)| site == off) {
+            return args.to_string();
+        }
+        args.split(',')
+            .map(str::trim)
+            .enumerate()
+            .map(|(i, arg)| {
+                let reg = arg.strip_prefix('v').and_then(|r| r.parse::<u32>().ok());
+                match reg {
+                    Some(reg) if !(is_instance && i == 0) && nulls.contains(&(off, reg)) => "null",
+                    _ => arg,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Declared types of the parameters the invoke at `site` passes `reg` to; `None` unless
+    /// it is passed only to reference parameters (not as receiver).
+    fn reference_param_types(
+        &self,
+        instructions: &[Instruction],
+        site: u32,
+        reg: u32,
+    ) -> Option<Vec<String>> {
+        let ins = instructions.iter().find(|i| i.offset == site)?;
+        let m = ins.mnemonic();
+        if !m.starts_with("invoke-")
+            || m.starts_with("invoke-custom")
+            || m.starts_with("invoke-polymorphic")
+        {
+            return None;
+        }
+        let info = self.dex.get_method_info(invoke_method_idx(ins.operands())?).ok()?;
+        let (regs, _) = read_write::instruction_reads_writes(m, ins.operands());
+        let mut at = usize::from(!m.starts_with("invoke-static"));
+        if at == 1 && regs.first() == Some(&reg) {
+            return None;
+        }
+        let mut types = Vec::new();
+        for param in &info.params {
+            let wide = matches!(param.as_str(), "J" | "D");
+            if regs.get(at) == Some(&reg) {
+                if wide || !(param.starts_with('L') || param.starts_with('[')) {
+                    return None;
+                }
+                types.push(param.clone());
+            }
+            at += if wide { 2 } else { 1 };
+        }
+        (!types.is_empty() && regs.iter().filter(|&&r| r == reg).count() == types.len())
+            .then_some(types)
     }
 
     /// `iget v0, this, field; if-lez v0` → condition `this.field`, and the same for
@@ -7411,6 +7683,7 @@ impl<'a> Decompiler<'a> {
                     || m.starts_with("invoke-direct")
                     || is_super;
                 if let Some((target, args, param_types)) = parse_invoke_call_parts(&ops_resolved) {
+                    let args = self.with_null_arguments(base_off, ins.offset, &args, is_instance);
                     if let Some(ret) = self.invoke_return_type(ops) {
                         self.call_return_types
                             .borrow_mut()
@@ -8025,6 +8298,26 @@ fn invoke_method_idx(ops: &str) -> Option<u32> {
         .strip_prefix("method@")?
         .parse()
         .ok()
+}
+
+/// The blocks hold only folded instructions, `nop`s and, last, their test: they print nothing.
+fn blocks_compute_nothing(cfg: &MethodCfg, instructions: &[Instruction], blocks: &[BlockId]) -> bool {
+    let Some(&test) = blocks
+        .last()
+        .and_then(|&b| cfg.blocks[b].instruction_offsets.last())
+    else {
+        return false;
+    };
+    blocks
+        .iter()
+        .flat_map(|&b| cfg.blocks[b].instruction_offsets.iter().copied())
+        .all(|off| {
+            off == test
+                || cfg.folded_const_offsets.contains(&off)
+                || instructions
+                    .iter()
+                    .any(|i| i.offset == off && i.mnemonic() == "nop")
+        })
 }
 
 /// `reg` holds the incoming `this` just before `off`: directly or through `move-object`
@@ -13479,5 +13772,247 @@ mod tests {
         let read = body.iter().position(|s| s.contains("this.c"));
         let call = body.iter().position(|s| s == "super();");
         assert!(read.is_some() && call.is_some() && read < call, "{java}");
+    }
+
+    /// Brace depth of each statement of a body listed by `method_statements`.
+    fn statement_depths(body: &[&str]) -> Vec<usize> {
+        let mut depth = 0usize;
+        body.iter()
+            .map(|t| {
+                let closes_first = t.starts_with('}');
+                if closes_first {
+                    depth = depth.saturating_sub(1);
+                }
+                let at = depth;
+                let closes = t.matches('}').count() - usize::from(closes_first);
+                depth = (depth + t.matches('{').count()).saturating_sub(closes);
+                at
+            })
+            .collect()
+    }
+
+    /// The method's only parameter name, from its signature line.
+    fn sole_param<'a>(signature: &'a str, java: &str) -> &'a str {
+        signature
+            .split_once('(')
+            .and_then(|(_, r)| r.split_once(')'))
+            .and_then(|(p, _)| p.split_whitespace().last())
+            .unwrap_or_else(|| panic!("no parameter:\n{java}"))
+    }
+
+    /// `breakInLoop` as javac and d8 compile it: the header block only loads the bound, the
+    /// loop test and the `limit` test sit in the blocks below.
+    #[test]
+    fn break_in_loop_returns_after_the_loop() {
+        let java = {
+            let _env = StructurerEnv::set(None);
+            decompile_direct_methods(
+                "Lc/F;",
+                JAVA_OBJECT,
+                &[],
+                &[("Lc/F;", "breakInLoop", "(I)I")],
+                &[],
+                |_| {
+                    vec![built_direct("Lc/F;", "breakInLoop", "(I)I", 0x9, 4, 1, vec![
+                        0x12, 0x00, // 00: const/4 v0, 0
+                        0x12, 0x01, // 01: const/4 v1, 0
+                        0x13, 0x02, 0x64, 0x00, // 02: const/16 v2, 100
+                        0x35, 0x21, 0x09, 0x00, // 04: if-ge v1, v2, +9 → 0d
+                        0x34, 0x31, 0x03, 0x00, // 06: if-lt v1, v3, +3 → 09
+                        0x28, 0x05, // 08: goto +5 → 0d
+                        0xb0, 0x10, // 09: add-int/2addr v0, v1
+                        0xd8, 0x01, 0x01, 0x01, // 0a: add-int/lit8 v1, v1, 1
+                        0x28, 0xf6, // 0c: goto -10 → 02
+                        0x0f, 0x00, // 0d: return v0
+                    ])]
+                },
+            )
+        };
+        let (signature, body) = method_statements(&java, "breakInLoop");
+        let limit = sole_param(signature, &java);
+        let depth = statement_depths(&body);
+        let ret = body
+            .iter()
+            .position(|t| t.starts_with("return "))
+            .unwrap_or_else(|| panic!("no return:\n{java}"));
+        assert_eq!(depth[ret], 0, "the return follows the loop:\n{java}");
+        let loop_at = body[..ret]
+            .iter()
+            .position(|t| is_loop_statement(t))
+            .unwrap_or_else(|| panic!("no loop before the return:\n{java}"));
+        assert_eq!(depth[loop_at], 0, "{java}");
+        assert!(body.iter().all(|t| unlabeled(t) != "while (true) {"), "{java}");
+        assert!(
+            body[loop_at..ret].iter().any(|t| idents(t).contains(&limit)),
+            "the `{limit}` test stays in the loop:\n{java}"
+        );
+    }
+
+    /// `merge` as javac and d8 compile it: the copy loop leaves from two tests below its
+    /// header to the first drain loop.
+    #[test]
+    fn merge_loops_follow_one_another() {
+        const MERGE: &str = "([I[I)[I";
+        let java = {
+            let _env = StructurerEnv::set(None);
+            decompile_direct_methods(
+                "Lc/M;",
+                JAVA_OBJECT,
+                &[],
+                &[("Lc/M;", "merge", MERGE)],
+                &[],
+                |pools| {
+                    let ints = idx16(pools.ty("[I").expect("int[]"));
+                    vec![built_direct("Lc/M;", "merge", MERGE, 0x9, 8, 2, vec![
+                        0x21, 0x60, // 00: array-length v0, v6
+                        0x21, 0x71, // 01: array-length v1, v7
+                        0xb0, 0x10, // 02: add-int/2addr v0, v1
+                        0x23, 0x00, ints[0], ints[1], // 03: new-array v0, v0, int[]
+                        0x12, 0x01, // 05: const/4 v1, 0
+                        0x12, 0x02, // 06: const/4 v2, 0
+                        0x12, 0x03, // 07: const/4 v3, 0
+                        0x21, 0x64, // 08: array-length v4, v6
+                        0x35, 0x41, 0x21, 0x00, // 09: if-ge v1, v4, +0x21 → 2a
+                        0x21, 0x74, // 0b: array-length v4, v7
+                        0x35, 0x42, 0x1e, 0x00, // 0c: if-ge v2, v4, +0x1e → 2a
+                        0x44, 0x04, 0x06, 0x01, // 0e: aget v4, v6, v1
+                        0x44, 0x05, 0x07, 0x02, // 10: aget v5, v7, v2
+                        0x36, 0x54, 0x0d, 0x00, // 12: if-gt v4, v5, +0x0d → 1f
+                        0xd8, 0x04, 0x03, 0x01, // 14: add-int/lit8 v4, v3, 1
+                        0xd8, 0x05, 0x01, 0x01, // 16: add-int/lit8 v5, v1, 1
+                        0x44, 0x01, 0x06, 0x01, // 18: aget v1, v6, v1
+                        0x4b, 0x01, 0x00, 0x03, // 1a: aput v1, v0, v3
+                        0x01, 0x43, // 1c: move v3, v4
+                        0x01, 0x51, // 1d: move v1, v5
+                        0x28, 0xea, // 1e: goto → 08
+                        0xd8, 0x04, 0x03, 0x01, // 1f: add-int/lit8 v4, v3, 1
+                        0xd8, 0x05, 0x02, 0x01, // 21: add-int/lit8 v5, v2, 1
+                        0x44, 0x02, 0x07, 0x02, // 23: aget v2, v7, v2
+                        0x4b, 0x02, 0x00, 0x03, // 25: aput v2, v0, v3
+                        0x01, 0x43, // 27: move v3, v4
+                        0x01, 0x52, // 28: move v2, v5
+                        0x28, 0xdf, // 29: goto → 08
+                        0x21, 0x64, // 2a: array-length v4, v6
+                        0x35, 0x41, 0x0d, 0x00, // 2b: if-ge v1, v4, +0x0d → 38
+                        0xd8, 0x04, 0x03, 0x01, // 2d: add-int/lit8 v4, v3, 1
+                        0xd8, 0x05, 0x01, 0x01, // 2f: add-int/lit8 v5, v1, 1
+                        0x44, 0x01, 0x06, 0x01, // 31: aget v1, v6, v1
+                        0x4b, 0x01, 0x00, 0x03, // 33: aput v1, v0, v3
+                        0x01, 0x43, // 35: move v3, v4
+                        0x01, 0x51, // 36: move v1, v5
+                        0x28, 0xf3, // 37: goto → 2a
+                        0x21, 0x74, // 38: array-length v4, v7
+                        0x35, 0x42, 0x0d, 0x00, // 39: if-ge v2, v4, +0x0d → 46
+                        0xd8, 0x04, 0x03, 0x01, // 3b: add-int/lit8 v4, v3, 1
+                        0xd8, 0x05, 0x02, 0x01, // 3d: add-int/lit8 v5, v2, 1
+                        0x44, 0x02, 0x07, 0x02, // 3f: aget v2, v7, v2
+                        0x4b, 0x02, 0x00, 0x03, // 41: aput v2, v0, v3
+                        0x01, 0x43, // 43: move v3, v4
+                        0x01, 0x52, // 44: move v2, v5
+                        0x28, 0xf3, // 45: goto → 38
+                        0x11, 0x00, // 46: return-object v0
+                    ])]
+                },
+            )
+        };
+        let (_, body) = method_statements(&java, "merge");
+        let depth = statement_depths(&body);
+        let loops: Vec<usize> = (0..body.len())
+            .filter(|&k| depth[k] == 0 && is_loop_statement(body[k]))
+            .collect();
+        assert_eq!(loops.len(), 3, "a copy loop and two drain loops in a row:\n{java}");
+        let ret = body
+            .iter()
+            .rposition(|t| t.starts_with("return "))
+            .unwrap_or_else(|| panic!("no return:\n{java}"));
+        assert!(depth[ret] == 0 && ret > loops[2], "the return follows the loops:\n{java}");
+        assert!(body.iter().all(|t| unlabeled(t) != "while (true) {"), "{java}");
+        assert!(
+            unlabeled(body[loops[0]]).contains("&&"),
+            "the copy loop tests both indexes:\n{java}"
+        );
+    }
+
+    /// A test of the inner loop leaves the outer one too: `break L0;` on a labeled loop,
+    /// in a method whose only literal is `0`.
+    #[test]
+    fn loop_labels_keep_their_name() {
+        const SCAN: &str = "([III)V";
+        let java = {
+            let _env = StructurerEnv::set(None);
+            decompile_direct_methods("Lc/L;", JAVA_OBJECT, &[], &[("Lc/L;", "scan", SCAN)], &[], |_| {
+                vec![built_direct("Lc/L;", "scan", SCAN, 0x9, 6, 3, vec![
+                    0x12, 0x00, // 00: const/4 v0, 0
+                    0x35, 0x40, 0x0f, 0x00, // 01: if-ge v0, v4, +0x0f → 10
+                    0x12, 0x01, // 03: const/4 v1, 0
+                    0x35, 0x51, 0x09, 0x00, // 04: if-ge v1, v5, +9 → 0d
+                    0x44, 0x02, 0x03, 0x01, // 06: aget v2, v3, v1
+                    0x38, 0x02, 0x08, 0x00, // 08: if-eqz v2, +8 → 10
+                    0xd8, 0x01, 0x01, 0x01, // 0a: add-int/lit8 v1, v1, 1
+                    0x28, 0xf8, // 0c: goto -8 → 04
+                    0xd8, 0x00, 0x00, 0x01, // 0d: add-int/lit8 v0, v0, 1
+                    0x28, 0xf2, // 0f: goto -14 → 01
+                    0x0e, 0x00, // 10: return-void
+                ])]
+            })
+        };
+        let (_, body) = method_statements(&java, "scan");
+        let labels: Vec<&str> = body
+            .iter()
+            .filter_map(|t| t.split_once(": ").map(|(label, _)| label))
+            .filter(|label| idents(label) == [*label])
+            .collect();
+        let jumps: Vec<&str> = body
+            .iter()
+            .filter_map(|t| t.strip_prefix("break ").or_else(|| t.strip_prefix("continue ")))
+            .filter_map(|t| t.strip_suffix(';'))
+            .collect();
+        assert!(!jumps.is_empty(), "the inner loop leaves the outer one:\n{java}");
+        for label in &jumps {
+            assert!(labels.contains(label), "`{label}` labels no statement:\n{java}");
+        }
+        assert!(
+            !body.iter().any(|t| t.starts_with(|c: char| c.is_ascii_digit()) && t.contains(": ")),
+            "{java}"
+        );
+    }
+
+    /// Accessor constructors of two private inner classes: javac passes one `null`
+    /// register for both synthetic marker parameters.
+    #[test]
+    fn null_passed_to_unrelated_reference_parameters_is_written_null() {
+        const BY_A: &str = "(Lc/MA;)V";
+        const BY_B: &str = "(Lc/MB;)V";
+        let java = {
+            let _env = StructurerEnv::set(None);
+            decompile_direct_methods(
+                "Lc/N;",
+                JAVA_OBJECT,
+                &[],
+                &[("Lc/A;", "<init>", BY_A), ("Lc/B;", "<init>", BY_B), ("Lc/N;", "make", "()V")],
+                &[],
+                |pools| {
+                    let a = idx16(pools.ty("Lc/A;").expect("A"));
+                    let b = idx16(pools.ty("Lc/B;").expect("B"));
+                    let new_a = idx16(pools.method("Lc/A;", "<init>", BY_A).expect("A(MA)"));
+                    let new_b = idx16(pools.method("Lc/B;", "<init>", BY_B).expect("B(MB)"));
+                    vec![built_direct("Lc/N;", "make", "()V", 0x9, 3, 0, vec![
+                        0x22, 0x00, a[0], a[1], // 00: new-instance v0, A
+                        0x12, 0x01, // 02: const/4 v1, 0
+                        0x70, 0x20, new_a[0], new_a[1], 0x10, 0x00, // 03: invoke-direct {v0, v1}, A(MA)
+                        0x22, 0x02, b[0], b[1], // 06: new-instance v2, B
+                        0x70, 0x20, new_b[0], new_b[1], 0x12, 0x00, // 08: invoke-direct {v2, v1}, B(MB)
+                        0x0e, 0x00, // 0b: return-void
+                    ])]
+                },
+            )
+        };
+        let (_, body) = method_statements(&java, "make");
+        assert!(body.iter().all(|t| !t.contains("Object")), "{java}");
+        assert_eq!(
+            body.iter().map(|t| t.matches("(null)").count()).sum::<usize>(),
+            2,
+            "{java}"
+        );
     }
 }

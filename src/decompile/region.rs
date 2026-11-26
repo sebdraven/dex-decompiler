@@ -872,6 +872,74 @@ fn explicit_do_while(children: &[Region]) -> Option<(&str, Region, &Region)> {
     Some((condition.as_str(), Region::Seq(prefix.to_vec()), &EMPTY_REGION))
 }
 
+/// An exit test an explicit-jump loop body opens with: `blocks; if (condition) break;
+/// else rest`, the blocks falling through one into the next up to the conditional.
+pub struct EntryTest<'r> {
+    /// The sequence holding the blocks and the test.
+    pub seq: &'r Region,
+    pub blocks: Vec<BlockId>,
+    pub condition: &'r str,
+    pub rest: &'r Region,
+}
+
+/// The exit tests a loop body opens with, in order: the first starts at `header`, each
+/// next one opens the `else` of the previous.
+pub fn loop_entry_tests<'r>(
+    body: &'r Region,
+    header: BlockId,
+    cfg: &MethodCfg,
+) -> Vec<EntryTest<'r>> {
+    let mut tests: Vec<EntryTest<'r>> = Vec::new();
+    let mut seq = body;
+    while let Region::Seq(children) = seq {
+        let Some((
+            Region::If {
+                condition,
+                then_branch,
+                else_branch,
+            },
+            prefix,
+        )) = children.split_last()
+        else {
+            break;
+        };
+        if !is_lone_jump(then_branch, false) {
+            break;
+        }
+        let Some(blocks) = prefix
+            .iter()
+            .map(|r| match r {
+                Region::Block(b) => Some(*b),
+                _ => None,
+            })
+            .collect::<Option<Vec<BlockId>>>()
+        else {
+            break;
+        };
+        let Some(&last) = blocks.last() else {
+            break;
+        };
+        let chained = blocks.windows(2).all(|w| {
+            matches!(cfg.blocks[w[0]].end, BlockEnd::FallThrough)
+                && cfg.fall_through_block(w[0]) == Some(w[1])
+        });
+        if (tests.is_empty() && blocks[0] != header)
+            || !chained
+            || !matches!(cfg.blocks[last].end, BlockEnd::Conditional { .. })
+        {
+            break;
+        }
+        tests.push(EntryTest {
+            seq,
+            blocks,
+            condition: condition.as_str(),
+            rest: else_branch.as_ref(),
+        });
+        seq = else_branch.as_ref();
+    }
+    tests
+}
+
 /// Find a trailing `If(empty then, else exit)`; returns condition, else branch, and If index.
 fn trailing_continue_if(children: &[Region]) -> Option<(&str, &Region, usize)> {
     if let Some(Region::If {
