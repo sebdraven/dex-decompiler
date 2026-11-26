@@ -1905,11 +1905,9 @@ mod variable_reuse {
     fn numeric_literal_is_never_inlined_as_a_receiver() {
         let body = concat!("        p0 = 0;\n", "        p0.x.j(1);\n");
         let cleaned = cleanup_decompiler_artifacts(body);
-        let numeric_receiver = regex::Regex::new(r"\b0\.x").unwrap();
-        assert!(numeric_receiver.is_match("        0.x.j(1);"));
-        assert!(!numeric_receiver.is_match(&cleaned), "{cleaned}");
+        assert!(!cleaned.contains("0.x"), "{cleaned}");
         let simplified = simplify_method_body(body, false);
-        assert!(!numeric_receiver.is_match(&simplified), "{simplified}");
+        assert!(!simplified.contains("0.x"), "{simplified}");
     }
 
     /// D2 (001155): an undeclared temp is declared with the type of its definition.
