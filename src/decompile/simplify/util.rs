@@ -82,6 +82,34 @@ pub(crate) fn is_invoke_line(line: &str) -> bool {
         && (stmt.ends_with(" );") || stmt.ends_with(");"))
 }
 
+/// `T name;` alone, a declaration without initializer → Some((type, name)).
+pub(crate) fn parse_bare_decl(line: &str) -> Option<(String, String)> {
+    let binding = strip_trailing_comment(line);
+    let stmt = binding.trim().strip_suffix(';')?.trim_end();
+    if stmt.contains(&['=', '(', '"', '\''][..]) {
+        return None;
+    }
+    let (ty, name) = stmt.rsplit_once(' ')?;
+    let ty = ty.trim();
+    const NOT_TYPES: &[&str] = &[
+        "return", "throw", "break", "continue", "yield", "assert", "new", "else", "case", "goto",
+    ];
+    let type_like = ty.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && ty
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_$.[]<>, ".contains(c))
+        && (!ty.contains(' ') || ty.contains('<'));
+    (type_like && is_java_ident(name) && !NOT_TYPES.contains(&ty))
+        .then(|| (ty.to_string(), name.to_string()))
+}
+
+/// Some line of `lines` is `T var;`.
+pub(crate) fn has_bare_decl(lines: &[&str], var: &str) -> bool {
+    lines
+        .iter()
+        .any(|l| parse_bare_decl(l).is_some_and(|(_, v)| v == var))
+}
+
 /// Match "Type? var = expr;" → Some((var, expr)). Type is optional (e.g. `String result = "x";`).
 /// Match "Type? var = expr;" → Some((var, expr)). Type is optional (e.g. `String result = "x";`).
 pub(crate) fn parse_simple_assign_line(line: &str) -> Option<(String, String)> {

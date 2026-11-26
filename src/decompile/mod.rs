@@ -9,6 +9,7 @@ pub mod const_fields;
 mod def_webs;
 pub mod deobf;
 pub mod graph;
+mod hoist;
 mod ir;
 pub mod json_export;
 pub mod kotlin;
@@ -189,6 +190,16 @@ fn body_ends_with_exit(out: &str) -> bool {
         || t == "continue;"
         || t.starts_with("break ")
         || t.starts_with("continue ")
+}
+
+#[cfg(test)]
+fn hoist_disabled() -> bool {
+    HOIST_DISABLED.with(Cell::get)
+}
+
+#[cfg(not(test))]
+fn hoist_disabled() -> bool {
+    false
 }
 
 /// `DEX_DECOMPILER_STRUCTURER=legacy`: whole methods keep the greedy region builder.
@@ -456,6 +467,23 @@ pub struct Decompiler<'a> {
     /// The region tree being emitted carries its own `break` / `continue`
     /// (`structure::build`): block ends are not turned into jumps.
     explicit_jumps: Cell<bool>,
+    /// Declarations moved before a region of the tree being emitted.
+    hoist: RefCell<HoistState>,
+}
+
+#[derive(Default)]
+struct HoistState {
+    insns_off: usize,
+    sites: hoist::HoistSites,
+    /// Sites being emitted, innermost last: each web declared there and, once its first
+    /// typed assignment is reached, its declaration line.
+    open: Vec<(usize, Vec<(DefKey, Option<String>)>)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests compare against the output without hoisted declarations.
+    static HOIST_DISABLED: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(Default)]
@@ -591,6 +619,7 @@ impl<'a> Decompiler<'a> {
             method_names: RefCell::new(MethodNameState::default()),
             call_return_types: RefCell::new(DetHashMap::default()),
             explicit_jumps: Cell::new(false),
+            hoist: RefCell::new(HoistState::default()),
         }
     }
 
@@ -628,6 +657,7 @@ impl<'a> Decompiler<'a> {
             method_names: RefCell::new(MethodNameState::default()),
             call_return_types: RefCell::new(DetHashMap::default()),
             explicit_jumps: Cell::new(false),
+            hoist: RefCell::new(HoistState::default()),
         }
     }
 
@@ -2374,6 +2404,12 @@ impl<'a> Decompiler<'a> {
             self.seed_declared_from_params(&mut declared, code, encoded);
             if let Some((root, explicit)) = whole_method_root(&cfg, code.tries_size == 0) {
                 let saved = self.explicit_jumps.replace(explicit);
+                let hoist = if explicit {
+                    self.hoist_state(&root, &cfg, code)
+                } else {
+                    HoistState::default()
+                };
+                let saved_hoist = self.hoist.replace(hoist);
                 let emitted = self.emit_region(
                     &root,
                     &cfg,
@@ -2390,6 +2426,7 @@ impl<'a> Decompiler<'a> {
                     None,
                     class_name,
                 );
+                self.hoist.replace(saved_hoist);
                 self.explicit_jumps.set(saved);
                 emitted?;
             }
@@ -3698,6 +3735,70 @@ impl<'a> Decompiler<'a> {
         Ok(out)
     }
 
+    fn hoist_state(&self, root: &Region, cfg: &MethodCfg, code: &CodeItem) -> HoistState {
+        let slot = self.method_webs.borrow();
+        match slot.as_ref() {
+            Some((off, webs)) if *off == code.insns_off && !hoist_disabled() => HoistState {
+                insns_off: code.insns_off,
+                sites: hoist::hoist_sites(root, cfg, webs),
+                open: Vec::new(),
+            },
+            _ => HoistState::default(),
+        }
+    }
+
+    /// `region` is a declaration site not already being emitted: its webs are pending.
+    fn open_hoist_site(&self, region: &Region) -> bool {
+        let addr = hoist::region_addr(region);
+        let mut state = self.hoist.borrow_mut();
+        if state.open.iter().any(|(a, _)| *a == addr) {
+            return false;
+        }
+        let Some(webs) = state.sites.get(&addr) else {
+            return false;
+        };
+        let pending: Vec<(DefKey, Option<String>)> = webs.iter().map(|&w| (w, None)).collect();
+        state.open.push((addr, pending));
+        true
+    }
+
+    /// Declarations of the innermost open site whose webs were assigned in it.
+    fn close_hoist_site(&self) -> Vec<String> {
+        let mut state = self.hoist.borrow_mut();
+        state
+            .open
+            .pop()
+            .map(|(_, pending)| pending.into_iter().filter_map(|(_, d)| d).collect())
+            .unwrap_or_default()
+    }
+
+    /// `region`, or the single statement of its sequence, is a declaration site.
+    fn hoist_site_at(&self, region: &Region) -> bool {
+        let state = self.hoist.borrow();
+        let at = |r: &Region| state.sites.contains_key(&hoist::region_addr(r));
+        at(region) || matches!(region, Region::Seq(c) if c.iter().any(at))
+    }
+
+    /// First typed assignment of `var`, a web pending at an open site: its declaration
+    /// `ty var;` goes to that site, the assignment stays plain.
+    fn hoist_declaration(&self, var: &str, ty: &str) -> bool {
+        let mut state = self.hoist.borrow_mut();
+        let names = self.method_names.borrow();
+        if state.open.is_empty() || names.insns_off != state.insns_off {
+            return false;
+        }
+        for (_, pending) in state.open.iter_mut().rev() {
+            for (web, decl) in pending.iter_mut() {
+                if decl.is_none() && names.web_names.get(&*web).is_some_and(|n| n == var) {
+                    let line = format!("{} {};", shorten_type(ty), var);
+                    *decl = Some(shorten_java_names(&line.replace(REGISTER_SHIELD, "")));
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Emit Java from a region tree (structured control flow).
     /// Returns true if we emitted break (caller should stop emitting siblings).
     /// When emit_range is Some((min, max)), only emit instructions with offset in [min, max).
@@ -3719,6 +3820,31 @@ impl<'a> Decompiler<'a> {
         class_name: Option<&str>,
     ) -> Result<bool> {
         let ind = "    ".repeat(indent);
+        if self.open_hoist_site(region) {
+            let mut buf = String::new();
+            let emitted = self.emit_region(
+                region,
+                cfg,
+                instructions,
+                base_off,
+                encoded,
+                code,
+                &mut buf,
+                indent,
+                skip_goto_to,
+                break_target,
+                declared,
+                global_used_regs,
+                emit_range,
+                class_name,
+            );
+            for decl in self.close_hoist_site() {
+                writeln!(out, "{}{}", ind, decl)
+                    .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+            }
+            out.push_str(&buf);
+            return emitted;
+        }
         match region {
             Region::Block(block_id) => self.emit_block_instructions(
                 cfg,
@@ -5151,7 +5277,9 @@ impl<'a> Decompiler<'a> {
         let ind = "    ".repeat(indent);
         let mut current = else_branch;
         loop {
-            if let Some((cond, then_b, else_b)) = as_single_if(current) {
+            // A declaration before the inner `if` needs the `else` block around it.
+            let chain = as_single_if(current).filter(|_| !self.hoist_site_at(current));
+            if let Some((cond, then_b, else_b)) = chain {
                 mark_condition_idents_declared(cond, declared);
                 writeln!(out, "{}}} else if ({}) {{", ind, shorten_java_names(cond))
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
@@ -6835,7 +6963,7 @@ impl<'a> Decompiler<'a> {
                 // Handle compound assign markers from ExprSimplifyPass
                 if let Some(compound) = rhs_str.strip_prefix("__compound_") {
                     format_compound_line(compound, &var, name_map)
-                } else if declared.insert(var.clone()) {
+                } else if declared.insert(var.clone()) && !self.hoist_declaration(&var, ty) {
                     format!("{} {} = {};", shorten_type(ty), var, rhs_str)
                 } else {
                     format!("{} = {};", var, rhs_str)
@@ -12447,5 +12575,315 @@ mod tests {
         let (new_root, explicit) = new_root.expect("root");
         assert!(explicit, "the dominator structurer handles this body");
         assert_ne!(region::format_region_debug(&new_root, &cfg), previous);
+    }
+
+    const HOIST_CALLEES: &[(&str, &str)] = &[
+        ("touch", "()V"),
+        ("text", "()Ljava/lang/String;"),
+        ("show", "(Ljava/lang/String;)V"),
+        ("fetch", "()I"),
+        ("pick", "(I)I"),
+        ("showInt", "(I)V"),
+    ];
+
+    /// Decompiles static `k.K.m<proto>`, whose body `body` builds from the index of each
+    /// static method `k.K.<name>` of `HOIST_CALLEES`.
+    fn decompile_static_k(
+        proto: &str,
+        registers: u16,
+        ins: u16,
+        body: fn(&dyn Fn(&str) -> [u8; 2]) -> Vec<u8>,
+    ) -> String {
+        let mut builder = dex_parser::DexBuilder::new();
+        builder.intern_type("Ljava/lang/Object;");
+        for &(name, p) in HOIST_CALLEES {
+            builder.intern_method_ref("Lk/K;", name, p);
+        }
+        builder.intern_method_ref("Lk/K;", "m", proto);
+        let pools = builder.pool_maps();
+        let index = |name: &str| {
+            let (_, p) = HOIST_CALLEES
+                .iter()
+                .find(|(n, _)| *n == name)
+                .expect("callee");
+            le16(pools.method("Lk/K;", name, p))
+        };
+        let insns = body(&index);
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "Lk/K;".into(),
+            access_flags: 1,
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![],
+            direct_methods: vec![dex_parser::BuiltMethod {
+                class: "Lk/K;".into(),
+                name: "m".into(),
+                proto: proto.into(),
+                access_flags: 0x9,
+                direct: true,
+                code: Some(dex_parser::BuiltCode {
+                    registers_size: registers,
+                    ins_size: ins,
+                    outs_size: registers,
+                    insns,
+                    ..Default::default()
+                }),
+            }],
+            virtual_methods: vec![],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        Decompiler::new(&dex).decompile().expect("decompile")
+    }
+
+    fn structured_static_k(
+        proto: &str,
+        registers: u16,
+        ins: u16,
+        body: fn(&dyn Fn(&str) -> [u8; 2]) -> Vec<u8>,
+    ) -> String {
+        let _env = StructurerEnv::set(None);
+        decompile_static_k(proto, registers, ins, body)
+    }
+
+    /// `static void m(int a) { String s; if (a != 0) { touch(); s = text(); } else { s = null; } show(s); }`
+    fn if_else_object_body(index: &dyn Fn(&str) -> [u8; 2]) -> Vec<u8> {
+        let (touch, text, show) = (index("touch"), index("text"), index("show"));
+        vec![
+            0x39, 0x01, 0x04, 0x00, // 00: if-nez v1, +4 -> 04
+            0x12, 0x00, // 02: const/4 v0, 0 (null)
+            0x28, 0x08, // 03: goto +8 -> 0b
+            0x71, 0x00, touch[0], touch[1], 0x00, 0x00, // 04: invoke-static {}, touch()V
+            0x71, 0x00, text[0], text[1], 0x00, 0x00, // 07: invoke-static {}, text()String
+            0x0c, 0x00, // 0a: move-result-object v0
+            0x71, 0x10, show[0], show[1], 0x00, 0x00, // 0b: invoke-static {v0}, show(String)V
+            0x0e, 0x00, // 0e: return-void
+        ]
+    }
+
+    /// `static int m(int a) { int x; if (a != 0) { int y = fetch(); x = y - 1; } else { x = 0; } return pick(x); }`
+    fn if_else_int_body(index: &dyn Fn(&str) -> [u8; 2]) -> Vec<u8> {
+        let (fetch, pick) = (index("fetch"), index("pick"));
+        vec![
+            0x39, 0x01, 0x04, 0x00, // 00: if-nez v1, +4 -> 04
+            0x12, 0x00, // 02: const/4 v0, 0
+            0x28, 0x07, // 03: goto +7 -> 0a
+            0x71, 0x00, fetch[0], fetch[1], 0x00, 0x00, // 04: invoke-static {}, fetch()I
+            0x0a, 0x00, // 07: move-result v0
+            0xd8, 0x00, 0x00, 0xff, // 08: add-int/lit8 v0, v0, -1
+            0x71, 0x10, pick[0], pick[1], 0x00, 0x00, // 0a: invoke-static {v0}, pick(I)I
+            0x0a, 0x00, // 0d: move-result v0
+            0x0f, 0x00, // 0e: return v0
+        ]
+    }
+
+    /// `static void m(int a) { if (a != 0) { int x = fetch(); showInt(x); showInt(x); } }`
+    fn branch_only_body(index: &dyn Fn(&str) -> [u8; 2]) -> Vec<u8> {
+        let (fetch, show) = (index("fetch"), index("showInt"));
+        vec![
+            0x38, 0x01, 0x0c, 0x00, // 00: if-eqz v1, +12 -> 0c
+            0x71, 0x00, fetch[0], fetch[1], 0x00, 0x00, // 02: invoke-static {}, fetch()I
+            0x0a, 0x00, // 05: move-result v0
+            0x71, 0x10, show[0], show[1], 0x00, 0x00, // 06: invoke-static {v0}, showInt(I)V
+            0x71, 0x10, show[0], show[1], 0x00, 0x00, // 09: invoke-static {v0}, showInt(I)V
+            0x0e, 0x00, // 0c: return-void
+        ]
+    }
+
+    /// `static void m() { touch(); int x; do { x = fetch(); } while (x == 0); showInt(x); }`
+    fn assigned_in_loop_body(index: &dyn Fn(&str) -> [u8; 2]) -> Vec<u8> {
+        let (touch, fetch, show) = (index("touch"), index("fetch"), index("showInt"));
+        vec![
+            0x71, 0x00, touch[0], touch[1], 0x00, 0x00, // 00: invoke-static {}, touch()V
+            0x71, 0x00, fetch[0], fetch[1], 0x00, 0x00, // 03: invoke-static {}, fetch()I
+            0x0a, 0x00, // 06: move-result v0
+            0x38, 0x00, 0xfc, 0xff, // 07: if-eqz v0, -4 -> 03
+            0x71, 0x10, show[0], show[1], 0x00, 0x00, // 09: invoke-static {v0}, showInt(I)V
+            0x0e, 0x00, // 0c: return-void
+        ]
+    }
+
+    /// Argument of the first call to `callee`.
+    fn call_arg<'a>(body: &[&'a str], callee: &str, java: &str) -> &'a str {
+        let open = format!("{callee}(");
+        body.iter()
+            .find_map(|t| {
+                let at = t.find(&open)?;
+                t[at + open.len()..].split_once(')').map(|(a, _)| a.trim())
+            })
+            .unwrap_or_else(|| panic!("no call to {callee}:\n{java}"))
+    }
+
+    /// `T v;`: its type.
+    fn lone_declaration<'a>(t: &'a str, v: &str) -> Option<&'a str> {
+        let ty = t.strip_suffix(';')?.strip_suffix(v)?.strip_suffix(' ')?;
+        let keyword = JAVA_WORDS.contains(&ty) || ["return", "throw"].contains(&ty);
+        (!ty.is_empty() && !ty.contains(&[' ', '=', '('][..]) && !keyword).then_some(ty)
+    }
+
+    fn is_lone_declaration(t: &str) -> bool {
+        t.strip_suffix(';')
+            .and_then(|s| s.rsplit_once(' '))
+            .is_some_and(|(_, v)| idents(v) == [v] && lone_declaration(t, v).is_some())
+    }
+
+    fn typed_assignment(t: &str, v: &str) -> bool {
+        t.split_once(" = ").is_some_and(|(lhs, _)| {
+            matches!(lhs.split_whitespace().collect::<Vec<_>>().as_slice(), [_, n] if *n == v)
+        })
+    }
+
+    fn plain_assignment(t: &str, v: &str) -> bool {
+        t.starts_with(&format!("{v} = "))
+    }
+
+    /// `T v;` right before the `if`, one plain assignment of `v` in each branch, the use
+    /// after.
+    fn assert_declared_before_if(java: &str, callee: &str) {
+        let (_, body) = method_statements(java, "m");
+        let v = call_arg(&body, callee, java);
+        let decl = body
+            .iter()
+            .position(|t| lone_declaration(t, v).is_some())
+            .unwrap_or_else(|| panic!("no `T {v};`:\n{java}"));
+        assert!(
+            body.get(decl + 1).is_some_and(|t| t.starts_with("if (")),
+            "`{v}` is not declared right before the if:\n{java}"
+        );
+        let use_at = body
+            .iter()
+            .position(|t| t.contains(&format!("{callee}(")))
+            .expect("use");
+        let assigns: Vec<usize> = (0..body.len())
+            .filter(|&k| plain_assignment(body[k], v))
+            .collect();
+        assert_eq!(assigns.len(), 2, "{java}");
+        assert!(assigns.iter().all(|&k| decl + 1 < k && k < use_at), "{java}");
+        assert!(body[assigns[0]..assigns[1]].contains(&"} else {"), "{java}");
+        assert!(!body.iter().any(|t| typed_assignment(t, v)), "{java}");
+        assert_eq!(
+            body.iter().filter(|t| lone_declaration(t, v).is_some()).count(),
+            1,
+            "{java}"
+        );
+    }
+
+    #[test]
+    fn object_assigned_in_both_branches_is_declared_before_the_if() {
+        let java = structured_static_k("(I)V", 2, 1, if_else_object_body);
+        assert_declared_before_if(&java, "show");
+    }
+
+    #[test]
+    fn int_assigned_in_both_branches_is_declared_before_the_if() {
+        let java = structured_static_k("(I)I", 2, 1, if_else_int_body);
+        assert_declared_before_if(&java, "pick");
+        let (_, body) = method_statements(&java, "m");
+        let v = call_arg(&body, "pick", &java);
+        assert!(body.contains(&format!("int {v};").as_str()), "{java}");
+    }
+
+    #[test]
+    fn assignment_before_a_loop_keeps_its_declaration() {
+        let java = {
+            let _env = StructurerEnv::set(None);
+            sum_loop_class_java()
+        };
+        let (_, body) = method_statements(&java, "sum");
+        let loop_at = body
+            .iter()
+            .position(|t| is_loop_statement(t))
+            .unwrap_or_else(|| panic!("no loop:\n{java}"));
+        let sum = body
+            .iter()
+            .find_map(|t| t.strip_prefix("return ").and_then(|r| r.strip_suffix(';')))
+            .unwrap_or_else(|| panic!("no return:\n{java}"));
+        assert!(
+            body[..loop_at].iter().any(|t| typed_assignment(t, sum)),
+            "`{sum}` is not declared at its assignment before the loop:\n{java}"
+        );
+        assert!(!body.iter().any(|t| is_lone_declaration(t)), "{java}");
+    }
+
+    #[test]
+    fn variable_of_one_branch_is_declared_in_it() {
+        let java = structured_static_k("(I)V", 2, 1, branch_only_body);
+        let (_, body) = method_statements(&java, "m");
+        let v = call_arg(&body, "showInt", &java);
+        let if_at = body
+            .iter()
+            .position(|t| t.starts_with("if ("))
+            .unwrap_or_else(|| panic!("no if:\n{java}"));
+        let decl = body
+            .iter()
+            .position(|t| typed_assignment(t, v))
+            .unwrap_or_else(|| panic!("`{v}` is not declared at its assignment:\n{java}"));
+        assert!(if_at < decl, "{java}");
+        assert!(!body.iter().any(|t| is_lone_declaration(t)), "{java}");
+    }
+
+    #[test]
+    fn variable_assigned_in_a_loop_and_read_after_is_declared_before_it() {
+        let java = structured_static_k("()V", 1, 0, assigned_in_loop_body);
+        let (_, body) = method_statements(&java, "m");
+        let v = call_arg(&body, "showInt", &java);
+        let loop_at = body
+            .iter()
+            .position(|t| is_loop_statement(t))
+            .unwrap_or_else(|| panic!("no loop:\n{java}"));
+        let decl = body
+            .iter()
+            .position(|t| lone_declaration(t, v).is_some())
+            .unwrap_or_else(|| panic!("no `T {v};`:\n{java}"));
+        assert_eq!(decl + 1, loop_at, "{java}");
+        let use_at = body
+            .iter()
+            .position(|t| t.contains("showInt("))
+            .expect("use");
+        assert!(
+            (loop_at..use_at).any(|k| plain_assignment(body[k], v)),
+            "{java}"
+        );
+        assert!(!body.iter().any(|t| typed_assignment(t, v)), "{java}");
+    }
+
+    /// Clears `HOIST_DISABLED` when dropped.
+    struct Unhoisted;
+
+    impl Unhoisted {
+        fn set() -> Self {
+            HOIST_DISABLED.with(|d| d.set(true));
+            Unhoisted
+        }
+    }
+
+    impl Drop for Unhoisted {
+        fn drop(&mut self) {
+            HOIST_DISABLED.with(|d| d.set(false));
+        }
+    }
+
+    /// Under `legacy` the output is the one without hoisted declarations (that of the
+    /// tree before this pass), while the dominator structurer output changes.
+    #[test]
+    fn legacy_structurer_output_is_unchanged_by_hoisting() {
+        let java = || decompile_static_k("(I)V", 2, 1, if_else_object_body);
+        let (legacy, legacy_unhoisted) = {
+            let _env = StructurerEnv::set(Some("legacy"));
+            let hoisted = java();
+            let _off = Unhoisted::set();
+            (hoisted, java())
+        };
+        assert_eq!(legacy, legacy_unhoisted);
+        let (structured, structured_unhoisted) = {
+            let _env = StructurerEnv::set(None);
+            let hoisted = java();
+            let _off = Unhoisted::set();
+            (hoisted, java())
+        };
+        assert_ne!(structured, structured_unhoisted, "{structured}");
     }
 }
