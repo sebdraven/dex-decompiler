@@ -434,6 +434,31 @@ impl MethodCfg {
             entry,
             folded_const_offsets: HashSet::new(),
         };
+        // The bytecode CFG may leave unreachable handler code in the same raw
+        // block as a return. Split there before later handler splits, which
+        // otherwise introduce a spurious normal fallthrough into the handler.
+        let is_exit = |ins: &Instruction| {
+            matches!(
+                ins.mnemonic(),
+                "return-void" | "return" | "return-wide" | "return-object" | "throw"
+            )
+        };
+        let after_exits: Vec<u32> = instructions
+            .windows(2)
+            .filter(|pair| is_exit(&pair[0]))
+            .map(|pair| (pair[1].offset as usize + base_offset) as u32)
+            .collect();
+        cfg.split_at_offsets(&after_exits);
+        let exits: DetHashSet<u32> = instructions
+            .iter()
+            .filter(|ins| is_exit(ins))
+            .map(|ins| (ins.offset as usize + base_offset) as u32)
+            .collect();
+        for block in &mut cfg.blocks {
+            if block.instruction_offsets.last().is_some_and(|off| exits.contains(off)) {
+                block.end = BlockEnd::Exit;
+            }
+        }
         cfg.unmark_handler_copy_joins(instructions);
         cfg
     }
@@ -929,6 +954,29 @@ mod tests {
         assert!(cfg.block_count() >= 1);
         assert!(matches!(cfg.blocks[cfg.entry].end, BlockEnd::Exit));
         assert!(cfg.loop_headers.is_empty());
+    }
+
+    /// Return and throw terminate normal flow even when handler code follows.
+    #[test]
+    fn exits_do_not_fall_through_to_later_handler_code() {
+        for opcode in [0x0e, 0x0f, 0x10, 0x11, 0x27] {
+            let bytecode = [
+                opcode, 0x00, // return or throw at 0
+                0x00, 0x00, // unreachable nop at 2
+                0x0d, 0x01, // move-exception v1 at 4
+                0x0e, 0x00, // return-void at 6
+            ];
+            let instructions = decode_all(&bytecode, 0).unwrap();
+            let mut cfg = MethodCfg::build(&instructions, &bytecode, 0, &condition_for);
+            cfg.split_at_offsets(&[4]);
+            assert!(matches!(cfg.blocks[cfg.entry].end, BlockEnd::Exit), "{opcode:x}");
+            assert!(
+                cfg.successor_edges().iter().all(|&(from, _)| from != cfg.entry),
+                "{opcode:x}: {:?}",
+                cfg.successor_edges()
+            );
+            assert_eq!(cfg.blocks[cfg.entry].instruction_offsets, [0]);
+        }
     }
 
     /// Catch `goto` into the delayed `j = j + 1` store is a join, not a second loop (`foo4`).
