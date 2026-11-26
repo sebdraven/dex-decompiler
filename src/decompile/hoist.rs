@@ -204,3 +204,90 @@ fn declared_in_place(b: BlockId, o: &Occurrences) -> bool {
         .filter(|(ub, _)| *ub == b)
         .all(|(_, off)| *off > first_def)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bottom-tested loop: fetch into v0, repeat while zero, then show v0.
+    /// Supply its tree explicitly so this scope test is independent of the structurer's
+    /// choice to keep the exit tail inside the loop or place it after the loop.
+    fn loop_fixture() -> (MethodCfg, DefWebs, Region) {
+        let bytecode = [
+            0x71, 0x00, 0x00, 0x00, 0x00, 0x00, // 0: touch()
+            0x71, 0x00, 0x01, 0x00, 0x00, 0x00, // 6: fetch()
+            0x0a, 0x00, // 12: move-result v0
+            0x38, 0x00, 0xfc, 0xff, // 14: if-eqz v0 -> 6
+            0x71, 0x10, 0x02, 0x00, 0x00, 0x00, // 18: showInt(v0)
+            0x0e, 0x00, // 24: return-void
+        ];
+        let instructions = dex_bytecode::decode_all(&bytecode, 0).expect("decode");
+        let cfg = MethodCfg::build(&instructions, &bytecode, 0, &|_| "v0 == 0".into());
+        let webs = DefWebs::build(&cfg, &instructions, &[], &[]);
+        let block_at = |off| {
+            cfg.blocks
+                .iter()
+                .position(|b| b.instruction_offsets.contains(&off))
+                .expect("block")
+        };
+        let header = block_at(6);
+        let condition = block_at(14);
+        let mut body = vec![Region::Block(header)];
+        if condition != header {
+            body.push(Region::Block(condition));
+        }
+        body.push(Region::If {
+            condition: "v0 == 0".into(),
+            then_branch: Box::new(Region::Continue { label: None }),
+            else_branch: Box::new(Region::Break { label: None }),
+        });
+        let root = Region::Seq(vec![
+            Region::Block(block_at(0)),
+            Region::Loop {
+                header,
+                body: Box::new(Region::Seq(body)),
+            },
+            Region::Block(block_at(18)),
+        ]);
+        (cfg, webs, root)
+    }
+
+    #[test]
+    fn variable_assigned_in_a_loop_and_read_after_is_declared_before_it() {
+        let (cfg, webs, root) = loop_fixture();
+        let Region::Seq(children) = &root else {
+            panic!("sequence")
+        };
+        let sites = hoist_sites(&root, &cfg, &webs);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(
+            sites.get(&region_addr(&children[1])),
+            Some(&vec![webs.web(0, 12)])
+        );
+    }
+
+    #[test]
+    fn loop_declaration_precedes_its_label() {
+        let (cfg, webs, mut root) = loop_fixture();
+        let Region::Seq(children) = &mut root else {
+            panic!("sequence")
+        };
+        let loop_region = children.remove(1);
+        children.insert(
+            1,
+            Region::Labeled {
+                label: "L0".into(),
+                body: Box::new(loop_region),
+            },
+        );
+        let sites = hoist_sites(&root, &cfg, &webs);
+        let Region::Seq(children) = &root else {
+            panic!("sequence")
+        };
+        assert_eq!(sites.len(), 1);
+        assert_eq!(
+            sites.get(&region_addr(&children[1])),
+            Some(&vec![webs.web(0, 12)])
+        );
+    }
+}

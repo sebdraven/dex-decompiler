@@ -12594,6 +12594,22 @@ mod tests {
         ins: u16,
         body: fn(&dyn Fn(&str) -> [u8; 2]) -> Vec<u8>,
     ) -> String {
+        decompile_static_k_with_options(
+            proto,
+            registers,
+            ins,
+            body,
+            DecompilerOptions::default(),
+        )
+    }
+
+    fn decompile_static_k_with_options(
+        proto: &str,
+        registers: u16,
+        ins: u16,
+        body: fn(&dyn Fn(&str) -> [u8; 2]) -> Vec<u8>,
+        options: DecompilerOptions,
+    ) -> String {
         let mut builder = dex_parser::DexBuilder::new();
         builder.intern_type("Ljava/lang/Object;");
         for &(name, p) in HOIST_CALLEES {
@@ -12636,7 +12652,9 @@ mod tests {
         });
         let bytes = builder.finish().expect("dex");
         let dex = DexFile::parse(&bytes).expect("parse");
-        Decompiler::new(&dex).decompile().expect("decompile")
+        Decompiler::with_options(&dex, options)
+            .decompile()
+            .expect("decompile")
     }
 
     fn structured_static_k(
@@ -12693,7 +12711,7 @@ mod tests {
         ]
     }
 
-    /// `static void m() { touch(); int x; do { x = fetch(); } while (x == 0); showInt(x); }`
+    /// `static void m() { touch(); while (true) { int x = fetch(); if (x != 0) { showInt(x); return; } } }`
     fn assigned_in_loop_body(index: &dyn Fn(&str) -> [u8; 2]) -> Vec<u8> {
         let (touch, fetch, show) = (index("touch"), index("fetch"), index("showInt"));
         vec![
@@ -12720,8 +12738,23 @@ mod tests {
     /// `T v;`: its type.
     fn lone_declaration<'a>(t: &'a str, v: &str) -> Option<&'a str> {
         let ty = t.strip_suffix(';')?.strip_suffix(v)?.strip_suffix(' ')?;
-        let keyword = JAVA_WORDS.contains(&ty) || ["return", "throw"].contains(&ty);
+        let keyword = (JAVA_WORDS.contains(&ty) && ty != "int") || ty == "throw";
         (!ty.is_empty() && !ty.contains(&[' ', '=', '('][..]) && !keyword).then_some(ty)
+    }
+
+    #[test]
+    fn lone_declaration_accepts_types_but_not_statements() {
+        for ty in [
+            "boolean", "byte", "char", "short", "int", "long", "float", "double", "int[]", "String",
+        ] {
+            let line = format!("{ty} x;");
+            assert_eq!(lone_declaration(&line, "x"), Some(ty), "{line}");
+        }
+        for line in [
+            "return x;", "throw x;", "break x;", "continue x;", "x = x;", "foo(x);",
+        ] {
+            assert_eq!(lone_declaration(line, "x"), None, "{line}");
+        }
     }
 
     fn is_lone_declaration(t: &str) -> bool {
@@ -12778,6 +12811,31 @@ mod tests {
     }
 
     #[test]
+    fn renamed_variable_is_still_declared_before_the_if() {
+        let _env = StructurerEnv::set(None);
+        let original = decompile_static_k("(I)V", 2, 1, if_else_object_body);
+        let (_, body) = method_statements(&original, "m");
+        let var = call_arg(&body, "show", &original);
+        let mut renames = rename::RenameMap::default();
+        renames.variable.insert(
+            "k.K#m".to_string(),
+            [(var.to_string(), "label".to_string())].into_iter().collect(),
+        );
+        let java = decompile_static_k_with_options(
+            "(I)V",
+            2,
+            1,
+            if_else_object_body,
+            DecompilerOptions {
+                rename_map: Some(renames),
+                ..Default::default()
+            },
+        );
+        assert_declared_before_if(&java, "show");
+        assert!(java.contains("String label;"), "{java}");
+    }
+
+    #[test]
     fn int_assigned_in_both_branches_is_declared_before_the_if() {
         let java = structured_static_k("(I)I", 2, 1, if_else_int_body);
         assert_declared_before_if(&java, "pick");
@@ -12826,28 +12884,29 @@ mod tests {
     }
 
     #[test]
-    fn variable_assigned_in_a_loop_and_read_after_is_declared_before_it() {
+    fn variable_with_its_use_inside_the_loop_stays_local() {
         let java = structured_static_k("()V", 1, 0, assigned_in_loop_body);
         let (_, body) = method_statements(&java, "m");
         let v = call_arg(&body, "showInt", &java);
         let loop_at = body
             .iter()
             .position(|t| is_loop_statement(t))
-            .unwrap_or_else(|| panic!("no loop:\n{java}"));
+            .expect("loop");
         let decl = body
             .iter()
-            .position(|t| lone_declaration(t, v).is_some())
-            .unwrap_or_else(|| panic!("no `T {v};`:\n{java}"));
-        assert_eq!(decl + 1, loop_at, "{java}");
+            .position(|t| typed_assignment(t, v))
+            .expect("declaration");
         let use_at = body
             .iter()
             .position(|t| t.contains("showInt("))
             .expect("use");
-        assert!(
-            (loop_at..use_at).any(|k| plain_assignment(body[k], v)),
-            "{java}"
-        );
-        assert!(!body.iter().any(|t| typed_assignment(t, v)), "{java}");
+        assert!(loop_at < decl && decl < use_at, "{java}");
+        let depth: i32 = body[loop_at..use_at]
+            .iter()
+            .map(|t| t.matches('{').count() as i32 - t.matches('}').count() as i32)
+            .sum();
+        assert!(depth > 0, "the fixture must keep its use inside the loop:\n{java}");
+        assert!(!body.iter().any(|t| is_lone_declaration(t)), "{java}");
     }
 
     /// Clears `HOIST_DISABLED` when dropped.
