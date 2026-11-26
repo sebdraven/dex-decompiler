@@ -305,6 +305,10 @@ impl DefWebs {
         self.rw.get(&off).map(|(r, _)| r.as_slice()).unwrap_or(&[])
     }
 
+    pub(crate) fn writes(&self, off: u32) -> &[u32] {
+        self.rw.get(&off).map(|(_, w)| w.as_slice()).unwrap_or(&[])
+    }
+
     /// Representative of the web holding definition `def` of `reg`.
     pub(crate) fn web(&self, reg: u32, def: u32) -> DefKey {
         find(&self.parent, (reg, def))

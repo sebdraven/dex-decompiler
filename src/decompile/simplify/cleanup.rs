@@ -20,7 +20,12 @@ pub(crate) fn inline_static_field_refs(body: &str) -> String {
             // Only static/instance field paths (e.g. System.out), never string literals
             // like "android.permission.READ_…" which also contain '.', and never
             // const-class literals (`Context.class`) which look like dotted paths.
-            if is_java_ident(var) && is_simple_field_path(val) && !is_class_literal(val) {
+            // `T var;` then assignments on several paths: a variable, not an alias.
+            if is_java_ident(var)
+                && is_simple_field_path(val)
+                && !is_class_literal(val)
+                && !has_bare_decl(&lines, var)
+            {
                 let reg_num = extract_reg_number(var).map(String::from);
                 aliases.push((var.to_string(), val.to_string(), reg_num));
             }
@@ -360,7 +365,9 @@ fn cleanup_decompiler_artifacts_once_with_webs(body: &str, webs: &WebNames) -> S
                     && webs.substitution(&c.var).is_none()
                     && c.use_count == 0
                     && is_bare_reassign(lines[c.def_idx], &c.var)
-                    && is_cheap_literal_rhs(&c.val))
+                    && is_cheap_literal_rhs(&c.val)
+                    // One branch's assignment of a variable declared before the branches.
+                    && !has_bare_decl(&lines, &c.var))
         })
         .map(|(i, _)| cands[i].def_idx)
         .collect();
@@ -745,6 +752,9 @@ pub(crate) fn fix_undeclared_temp_assigns_with_webs(body: &str, webs: &WebNames)
         let binding = strip_trailing_comment(line);
         let t = binding.trim();
         let mut current = line.to_string();
+        if let Some((_, var)) = parse_bare_decl(line) {
+            declared.insert(var);
+        }
         if let Some((var, rhs)) = parse_simple_assign_line(line) {
             // `i`/`j`/`k` are usually parameters or already-declared indexes — don't shadow them.
             let temp = is_temp_like_name(&var) && !matches!(var.as_str(), "i" | "j" | "k");

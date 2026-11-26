@@ -2051,3 +2051,69 @@ mod variable_reuse {
         );
     }
 }
+
+/// `T x;` before branches that assign `x`, as the dominator-structured emitter writes it.
+mod hoisted_declarations {
+    use super::*;
+
+    const BRANCHES: &str = "        String label;
+        if (c) {
+            this.log();
+            label = this.title;
+        } else {
+            label = null;
+        }
+        this.show(label);";
+
+    #[test]
+    fn bare_declaration_is_parsed() {
+        assert_eq!(
+            parse_bare_decl("        java.lang.String s;"),
+            Some(("java.lang.String".to_string(), "s".to_string()))
+        );
+        assert_eq!(parse_bare_decl("        int[] a;").map(|d| d.1), Some("a".to_string()));
+        assert_eq!(parse_bare_decl("        return x;"), None);
+        assert_eq!(parse_bare_decl("        throw e;"), None);
+        assert_eq!(parse_bare_decl("        x = 1;"), None);
+        assert_eq!(parse_bare_decl("        foo(x);"), None);
+    }
+
+    #[test]
+    fn bare_declaration_declares_for_undeclared_temp_repair() {
+        let webs = WebNames {
+            frozen: ["label".to_string()].into_iter().collect(),
+            types: [("label".to_string(), "String".to_string())]
+                .into_iter()
+                .collect(),
+            ..WebNames::default()
+        };
+        assert_eq!(fix_undeclared_temp_assigns_with_webs(BRANCHES, &webs), BRANCHES);
+    }
+
+    #[test]
+    fn field_read_of_one_branch_is_not_an_alias() {
+        assert_eq!(inline_static_field_refs(BRANCHES), BRANCHES);
+    }
+
+    #[test]
+    fn literal_of_one_branch_is_not_a_dead_store() {
+        let out = cleanup_decompiler_artifacts_once(BRANCHES);
+        assert!(out.contains("label = null;"), "{out}");
+        assert!(out.contains("label = this.title;"), "{out}");
+    }
+
+    #[test]
+    fn folded_ternary_takes_the_bare_declaration() {
+        let body = "        int x;
+        if (c) {
+            x = 1;
+        } else {
+            x = 2;
+        }
+        this.use(x);";
+        assert_eq!(
+            fold_assign_ternary(body),
+            "        int x = c ? 1 : 2;\n        this.use(x);"
+        );
+    }
+}

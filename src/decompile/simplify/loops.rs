@@ -79,6 +79,10 @@ pub(crate) fn restore_foreach_iterator_once(body: &str) -> String {
         let Some((ty_opt, elem_var)) = parse_iterator_next_line(lines[k], &it) else {
             continue;
         };
+        // Declared before the loop (`T x;`): the element variable outlives it.
+        if has_bare_decl(&lines, &elem_var) {
+            continue;
+        }
         let indent = leading_indent(lines[j]);
         let ty = ty_opt.unwrap_or_else(|| "Object".to_string());
         let coll_expr = if coll.is_empty() {
@@ -453,7 +457,8 @@ pub(crate) fn fold_array_length_assigns_with_webs(body: &str, webs: &WebNames) -
             continue;
         }
         // D8 reuses `length` for successive array-length temps — never fold those.
-        if length_init_count.get(&var).copied().unwrap_or(0) != 1 {
+        // A variable declared alone (`int n;`) is not a temp either.
+        if length_init_count.get(&var).copied().unwrap_or(0) != 1 || has_bare_decl(&lines, &var) {
             continue;
         }
         let init_idx = lines
@@ -963,7 +968,8 @@ pub(crate) fn restore_counting_for_loop_once(body: &str) -> String {
         let other_assign = lines[w + 1..update_idx]
             .iter()
             .any(|l| assign_lhs_var(l).as_deref() == Some(idx_var.as_str()));
-        if other_assign {
+        // `int i;` before the loop: the index outlives it, no `for (int i …)`.
+        if other_assign || has_bare_decl(&lines, &idx_var) {
             continue;
         }
         let indent = leading_indent(lines[w]);
@@ -1349,7 +1355,7 @@ pub(crate) fn restore_foreach_array_once(body: &str) -> String {
         let Some((elem_ty, elem_var, arr2, idx2)) = parse_array_elem_assign_line(lines[k]) else {
             continue;
         };
-        if idx2 != idx_var {
+        if idx2 != idx_var || has_bare_decl(&lines, &elem_var) {
             continue;
         }
         let bound_resolved = resolve_length_bound(&lines, w, &bound)

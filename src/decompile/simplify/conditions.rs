@@ -1523,8 +1523,21 @@ pub(crate) fn fold_assign_ternary_once(body: &str) -> String {
             }
         };
         let indent = leading_indent(lines[i]);
+        // `T x;` right before the `if`: the folded assignment declares `x` again.
+        let decl = i
+            .checked_sub(1)
+            .filter(|&d| leading_indent(lines[d]) == indent && !lhs.contains(' '))
+            .and_then(|d| parse_bare_decl(lines[d]).map(|decl| (d, decl)))
+            .filter(|(_, (_, v))| *v == var_a);
+        let lhs = match &decl {
+            Some((_, (ty, _))) => format!("{ty} {lhs}"),
+            None => lhs,
+        };
         let mut out = String::new();
         for (idx, line) in lines.iter().enumerate() {
+            if decl.as_ref().is_some_and(|(d, _)| *d == idx) {
+                continue;
+            }
             if idx == i {
                 out.push_str(&format!(
                     "{}{} = {} ? {} : {};",
