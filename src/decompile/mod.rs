@@ -21,6 +21,7 @@ pub mod rename;
 pub mod resource_consts;
 mod simplify;
 pub mod ssa;
+mod structure;
 pub use simplify::restore_string_switch as simplify_restore_string_switch_for_tests;
 pub use simplify::simplify_method_body as simplify_method_body_for_tests;
 mod try_catch;
@@ -51,7 +52,7 @@ use region::{
 };
 use ssa::{apply_canonical_names, construct_ssa, phi_canonical_map, phi_registers, strip_phis};
 use simplify::is_temp_like_name;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
@@ -182,7 +183,28 @@ fn body_ends_with_exit(out: &str) -> bool {
         return false;
     };
     let t = last.trim();
-    t.starts_with("return") || t.starts_with("throw") || t == "break;" || t == "continue;"
+    t.starts_with("return")
+        || t.starts_with("throw")
+        || t == "break;"
+        || t == "continue;"
+        || t.starts_with("break ")
+        || t.starts_with("continue ")
+}
+
+/// `DEX_DECOMPILER_STRUCTURER=legacy`: whole methods keep the greedy region builder.
+fn legacy_structurer() -> bool {
+    std::env::var_os("DEX_DECOMPILER_STRUCTURER").is_some_and(|v| v == "legacy")
+}
+
+/// Region tree of a whole method body, and whether it carries its own jumps.
+/// The dominator-tree structurer is tried first when `structured` allows it.
+fn whole_method_root(cfg: &MethodCfg, structured: bool) -> Option<(Region, bool)> {
+    if structured && !legacy_structurer() {
+        if let Some(root) = structure::build(cfg, cfg.entry) {
+            return Some((root, true));
+        }
+    }
+    build_regions(cfg, cfg.entry).map(|root| (root, false))
 }
 
 fn is_synthetic_local_name(s: &str) -> bool {
@@ -431,6 +453,9 @@ pub struct Decompiler<'a> {
     method_names: RefCell<MethodNameState>,
     /// Invoke offset (as printed in IR comments) → declared Java return type.
     call_return_types: RefCell<DetHashMap<u32, String>>,
+    /// The region tree being emitted carries its own `break` / `continue`
+    /// (`structure::build`): block ends are not turned into jumps.
+    explicit_jumps: Cell<bool>,
 }
 
 #[derive(Default)]
@@ -565,6 +590,7 @@ impl<'a> Decompiler<'a> {
             method_local_types: RefCell::new(None),
             method_names: RefCell::new(MethodNameState::default()),
             call_return_types: RefCell::new(DetHashMap::default()),
+            explicit_jumps: Cell::new(false),
         }
     }
 
@@ -601,6 +627,7 @@ impl<'a> Decompiler<'a> {
             method_local_types: RefCell::new(None),
             method_names: RefCell::new(MethodNameState::default()),
             call_return_types: RefCell::new(DetHashMap::default()),
+            explicit_jumps: Cell::new(false),
         }
     }
 
@@ -1952,7 +1979,9 @@ impl<'a> Decompiler<'a> {
                 let saved_webs = self.method_webs.borrow_mut().take();
                 let saved_method_names = std::mem::take(&mut *self.method_names.borrow_mut());
                 let saved_call_returns = std::mem::take(&mut *self.call_return_types.borrow_mut());
+                let saved_explicit = self.explicit_jumps.replace(false);
                 let b = self.decompile_method_body(&code, &encoded, None).ok();
+                self.explicit_jumps.set(saved_explicit);
                 *self.method_reg_types.borrow_mut() = saved_types;
                 *self.method_reg_names.borrow_mut() = saved_names;
                 *self.method_debug_types.borrow_mut() = saved_debug;
@@ -2343,8 +2372,9 @@ impl<'a> Decompiler<'a> {
             let mut fallback = String::new();
             let mut declared = DetHashSet::default();
             self.seed_declared_from_params(&mut declared, code, encoded);
-            if let Some(root) = build_regions(&cfg, cfg.entry) {
-                self.emit_region(
+            if let Some((root, explicit)) = whole_method_root(&cfg, code.tries_size == 0) {
+                let saved = self.explicit_jumps.replace(explicit);
+                let emitted = self.emit_region(
                     &root,
                     &cfg,
                     &instructions,
@@ -2359,7 +2389,9 @@ impl<'a> Decompiler<'a> {
                     Some(&global_used_regs),
                     None,
                     class_name,
-                )?;
+                );
+                self.explicit_jumps.set(saved);
+                emitted?;
             }
             out = Some(fallback);
         }
@@ -3865,6 +3897,7 @@ impl<'a> Decompiler<'a> {
                             let else_empty = region_is_empty_with_cfg(else_branch, cfg);
                             if then_empty
                                 && !else_empty
+                                && !self.explicit_jumps.get()
                                 && skip_goto_to.is_some()
                                 && break_target == Some(*branch_target)
                             {
@@ -4005,10 +4038,14 @@ impl<'a> Decompiler<'a> {
                     } else {
                         (condition.clone(), then_branch, else_branch)
                     };
+                // With explicit jumps, a block's `goto` never prints `break;`.
+                let implicit_break = |r: &Region| {
+                    !self.explicit_jumps.get() && region::region_is_loop_break(r, cfg, break_target)
+                };
                 let then_empty_after = region_is_empty_with_cfg(then_branch, cfg)
-                    && !region::region_is_loop_break(then_branch, cfg, break_target);
+                    && !implicit_break(then_branch.as_ref());
                 let else_empty_after = region_is_empty_with_cfg(else_branch, cfg)
-                    && !region::region_is_loop_break(else_branch, cfg, break_target);
+                    && !implicit_break(else_branch.as_ref());
                 if then_empty_after && !else_empty_after {
                     let neg = negate_condition(&condition);
                     mark_condition_idents_declared(&neg, declared);
@@ -4583,7 +4620,12 @@ impl<'a> Decompiler<'a> {
                             || (*default_case != Some(*value)
                                 && region::region_contains_block(default, t)))
                     });
-                    if !emitted_break && !body_ends_with_exit(out) && !falls_through {
+                    // Explicit-jump arms already end in their own jump or exit.
+                    if !emitted_break
+                        && !self.explicit_jumps.get()
+                        && !body_ends_with_exit(out)
+                        && !falls_through
+                    {
                         writeln!(out, "{}    break;", ind)
                             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     }
@@ -4611,6 +4653,70 @@ impl<'a> Decompiler<'a> {
                 writeln!(out, "{}}}", ind)
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 Ok(false)
+            }
+            Region::Labeled { label, body } => {
+                if matches!(body.as_ref(), Region::Loop { .. }) {
+                    // The label goes on the loop statement itself.
+                    let mut buf = String::new();
+                    self.emit_region(
+                        body,
+                        cfg,
+                        instructions,
+                        base_off,
+                        encoded,
+                        code,
+                        &mut buf,
+                        indent,
+                        skip_goto_to,
+                        break_target,
+                        declared,
+                        global_used_regs,
+                        emit_range,
+                        class_name,
+                    )?;
+                    if let Some(at) = buf.find(|c: char| !c.is_whitespace()) {
+                        buf.insert_str(at, &format!("{label}: "));
+                    }
+                    out.push_str(&buf);
+                } else {
+                    writeln!(out, "{}{}: {{", ind, label)
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    self.emit_region(
+                        body,
+                        cfg,
+                        instructions,
+                        base_off,
+                        encoded,
+                        code,
+                        out,
+                        indent + 1,
+                        skip_goto_to,
+                        break_target,
+                        declared,
+                        global_used_regs,
+                        emit_range,
+                        class_name,
+                    )?;
+                    writeln!(out, "{}}}", ind)
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                }
+                Ok(false)
+            }
+            Region::Break { label } => {
+                match label {
+                    Some(l) => writeln!(out, "{}break {};", ind, l),
+                    None => writeln!(out, "{}break;", ind),
+                }
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                Ok(true)
+            }
+            Region::Continue { label } => {
+                match label {
+                    Some(l) => writeln!(out, "{}continue {};", ind, l),
+                    None => writeln!(out, "{}continue;", ind),
+                }
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                Ok(true)
             }
         }
     }
@@ -6680,6 +6786,9 @@ impl<'a> Decompiler<'a> {
                 writeln!(out, "{}{}", ind, line)
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
+        }
+        if self.explicit_jumps.get() {
+            return Ok(false);
         }
         match &block.end {
             BlockEnd::Goto(t) if break_target == Some(*t) => {
@@ -12096,5 +12205,247 @@ mod tests {
     fn replace_ident_in_body_skips_a_literal_with_an_escaped_quote() {
         let out = replace_ident_in_body(r#"f("a\"p0\"b", p0);"#, "p0", "context");
         assert_eq!(out, r#"f("a\"p0\"b", context);"#);
+    }
+
+    const STRUCTURER_VAR: &str = "DEX_DECOMPILER_STRUCTURER";
+    /// Serializes the tests that set `DEX_DECOMPILER_STRUCTURER`.
+    static STRUCTURER_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets the structurer variable while alive, then restores it.
+    struct StructurerEnv {
+        saved: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl StructurerEnv {
+        fn set(value: Option<&str>) -> Self {
+            let lock = STRUCTURER_ENV.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = std::env::var_os(STRUCTURER_VAR);
+            match value {
+                Some(v) => std::env::set_var(STRUCTURER_VAR, v),
+                None => std::env::remove_var(STRUCTURER_VAR),
+            }
+            Self { saved, _lock: lock }
+        }
+    }
+
+    impl Drop for StructurerEnv {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(STRUCTURER_VAR, v),
+                None => std::env::remove_var(STRUCTURER_VAR),
+            }
+        }
+    }
+
+    /// `static int sum(int n) { int s = 0; for (int i = 0; i < n; i++) s += i; return s; }`
+    const SUM_LOOP_INSNS: [u8; 18] = [
+        0x12, 0x00, // 00: const/4 v0, 0
+        0x12, 0x01, // 01: const/4 v1, 0
+        0x35, 0x21, 0x06, 0x00, // 02: if-ge v1, v2, +6 -> 08
+        0xb0, 0x10, // 04: add-int/2addr v0, v1
+        0xd8, 0x01, 0x01, 0x01, // 05: add-int/lit8 v1, v1, 1
+        0x28, 0xfb, // 07: goto -5 -> 02
+        0x0f, 0x00, // 08: return v0
+    ];
+
+    fn sum_loop_class_java() -> String {
+        let mut builder = dex_parser::DexBuilder::new();
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "LS/Sum;".into(),
+            access_flags: 1,
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![],
+            direct_methods: vec![dex_parser::BuiltMethod {
+                class: "LS/Sum;".into(),
+                name: "sum".into(),
+                proto: "(I)I".into(),
+                access_flags: 0x9,
+                direct: true,
+                code: Some(dex_parser::BuiltCode {
+                    registers_size: 3,
+                    ins_size: 1,
+                    outs_size: 0,
+                    insns: SUM_LOOP_INSNS.to_vec(),
+                    ..Default::default()
+                }),
+            }],
+            virtual_methods: vec![],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        Decompiler::new(&dex).decompile().expect("decompile")
+    }
+
+    const JAVA_WORDS: &[&str] = &[
+        "int", "while", "for", "do", "if", "else", "return", "break", "continue", "true", "false",
+    ];
+
+    fn idents(s: &str) -> Vec<&str> {
+        s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .filter(|w| {
+                w.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            })
+            .collect()
+    }
+
+    /// Signature line and trimmed statements of method `name`.
+    fn method_statements<'a>(java: &'a str, name: &str) -> (&'a str, Vec<&'a str>) {
+        let lines: Vec<&str> = java.lines().collect();
+        let call = format!(" {name}(");
+        let start = lines
+            .iter()
+            .position(|l| l.contains(&call) && l.trim_end().ends_with('{'))
+            .unwrap_or_else(|| panic!("no method {name}:\n{java}"));
+        let mut depth = 0i32;
+        let mut body = Vec::new();
+        for (k, l) in lines[start..].iter().enumerate() {
+            let t = l.trim();
+            if k > 0 && depth == 1 && t == "}" {
+                break;
+            }
+            if k > 0 && !t.is_empty() {
+                body.push(t);
+            }
+            depth += t.matches('{').count() as i32 - t.matches('}').count() as i32;
+        }
+        (lines[start].trim(), body)
+    }
+
+    /// Statement without a leading `label: `.
+    fn unlabeled(t: &str) -> &str {
+        match t.split_once(": ") {
+            Some((label, rest)) if idents(label) == [label] => rest,
+            _ => t,
+        }
+    }
+
+    fn is_loop_statement(t: &str) -> bool {
+        let t = unlabeled(t);
+        t.starts_with("while (") || t.starts_with("for (") || t.starts_with("do {")
+    }
+
+    /// `stmt` gives `v` a value that does not depend on `v` (a for loop by its init).
+    fn defines(stmt: &str, v: &str) -> bool {
+        let init = stmt
+            .strip_prefix("for (")
+            .and_then(|r| r.split(';').next())
+            .unwrap_or(stmt);
+        let init = init.strip_prefix("int ").unwrap_or(init);
+        init.split_once(" = ")
+            .is_some_and(|(lhs, rhs)| lhs.trim() == v && !idents(rhs).contains(&v))
+    }
+
+    /// In statement order, each name first appears where it receives a value.
+    fn assert_defined_before_use(body: &[&str], param: &str, java: &str) {
+        let labels: Vec<&str> = body
+            .iter()
+            .filter_map(|t| t.split_once(": ").map(|(l, _)| l))
+            .filter(|l| idents(l) == [*l])
+            .collect();
+        let mut defined: Vec<&str> = vec![param];
+        for &t in body {
+            let code = t.split("//").next().unwrap_or(t);
+            for v in idents(code) {
+                if JAVA_WORDS.contains(&v) || labels.contains(&v) || defined.contains(&v) {
+                    continue;
+                }
+                assert!(defines(code, v), "`{v}` used before it has a value:\n{java}");
+                defined.push(v);
+            }
+        }
+    }
+
+    #[test]
+    fn dominator_structurer_sum_loop_initializes_before_the_loop() {
+        let java = {
+            let _env = StructurerEnv::set(None);
+            sum_loop_class_java()
+        };
+        let (signature, body) = method_statements(&java, "sum");
+        let param = signature
+            .split_once("sum(")
+            .and_then(|(_, r)| r.split_once(')'))
+            .and_then(|(p, _)| p.split_whitespace().last())
+            .unwrap_or_else(|| panic!("no parameter:\n{java}"));
+        let loop_at = body
+            .iter()
+            .position(|t| is_loop_statement(t))
+            .unwrap_or_else(|| panic!("no loop:\n{java}"));
+        assert!(!java.contains("goto"), "{java}");
+
+        let sum = body
+            .iter()
+            .find_map(|t| t.strip_prefix("return ").and_then(|r| r.strip_suffix(';')))
+            .unwrap_or_else(|| panic!("no return:\n{java}"));
+        assert!(
+            body[..loop_at].iter().any(|t| defines(t, sum)),
+            "`{sum}` is not initialized before the loop:\n{java}"
+        );
+
+        let head = unlabeled(body[loop_at]);
+        let condition = if let Some(r) = head.strip_prefix("for (") {
+            r.split(';').nth(1).unwrap_or("")
+        } else if let Some(r) = head.strip_prefix("while (") {
+            r.rsplit_once(')').map_or(r, |(c, _)| c)
+        } else {
+            body.iter()
+                .find_map(|t| t.strip_prefix("} while ("))
+                .and_then(|r| r.rsplit_once(')'))
+                .map_or("", |(c, _)| c)
+        };
+        let counters: Vec<&str> = idents(condition)
+            .into_iter()
+            .filter(|v| *v != param && !JAVA_WORDS.contains(v))
+            .collect();
+        assert!(!counters.is_empty(), "no loop counter in `{condition}`:\n{java}");
+        for v in counters {
+            assert!(
+                body[..=loop_at].iter().any(|t| defines(t, v)),
+                "`{v}` is not initialized before the loop:\n{java}"
+            );
+        }
+        assert_defined_before_use(&body, param, &java);
+    }
+
+    /// With the variable, the whole-method path is the one before the dominator structurer:
+    /// same region tree as `build_regions`, emitted with implicit jumps (the flag stays off,
+    /// so the emitter takes its previous branches).
+    #[test]
+    fn legacy_structurer_env_keeps_the_previous_whole_method_path() {
+        let insns = decode_all(&SUM_LOOP_INSNS, 0).unwrap();
+        let cfg = MethodCfg::build(&insns, &SUM_LOOP_INSNS, 0, &|_| "cond".into());
+        let previous = region::format_region_debug(
+            &build_regions(&cfg, cfg.entry).expect("regions"),
+            &cfg,
+        );
+
+        let (legacy_java, legacy_root, legacy_again) = {
+            let _env = StructurerEnv::set(Some("legacy"));
+            (
+                sum_loop_class_java(),
+                whole_method_root(&cfg, true),
+                sum_loop_class_java(),
+            )
+        };
+        let (root, explicit) = legacy_root.expect("root");
+        assert!(!explicit);
+        assert_eq!(region::format_region_debug(&root, &cfg), previous);
+        assert_eq!(legacy_java, legacy_again);
+        assert!(!legacy_java.contains("L0"), "{legacy_java}");
+
+        let new_root = {
+            let _env = StructurerEnv::set(None);
+            whole_method_root(&cfg, true)
+        };
+        let (new_root, explicit) = new_root.expect("root");
+        assert!(explicit, "the dominator structurer handles this body");
+        assert_ne!(region::format_region_debug(&new_root, &cfg), previous);
     }
 }

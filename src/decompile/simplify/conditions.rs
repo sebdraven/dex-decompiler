@@ -1162,7 +1162,7 @@ pub(crate) fn remove_trailing_continues(body: &str) -> String {
             }
             ind == cont_indent && t != "continue;"
         });
-        if has_prior_sibling {
+        if has_prior_sibling && !inside_labeled_block_of_loop(&lines, i) {
             skip.insert(i);
         }
     }
@@ -1180,6 +1180,47 @@ pub(crate) fn remove_trailing_continues(body: &str) -> String {
         }
     }
     out
+}
+
+/// `label: {` opens a labeled block (not a loop).
+fn is_labeled_block_line(t: &str) -> bool {
+    t.strip_suffix(": {").is_some_and(|name| {
+        name != "default"
+            && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Line `i` sits in a labeled block nested inside its loop: falling off there leaves the
+/// block, so its `continue;` is not redundant.
+fn inside_labeled_block_of_loop(lines: &[&str], i: usize) -> bool {
+    let mut depth = 0usize;
+    for line in lines[..i].iter().rev() {
+        let stmt = strip_trailing_comment(line);
+        let t = stmt.trim();
+        for c in t.chars().rev() {
+            match c {
+                '}' => depth += 1,
+                '{' if depth > 0 => depth -= 1,
+                '{' => {
+                    if is_labeled_block_line(t) {
+                        return true;
+                    }
+                    let head = t.split_once(": ").map_or(t, |(_, rest)| rest);
+                    if head.starts_with("while ")
+                        || head.starts_with("while(")
+                        || head.starts_with("for ")
+                        || head.starts_with("for(")
+                        || head.starts_with("do {")
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// Merge nested `if (A) { if (B) { BODY } }` (no else on either) into `if (A && B) { BODY }`.

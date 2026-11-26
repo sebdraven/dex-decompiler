@@ -149,10 +149,11 @@ fn merge_region_tree_includes_return_before_simplify() {
                 else_branch,
                 ..
             } => has_exit(then_branch, cfg) || has_exit(else_branch, cfg),
-            Region::Loop { body, .. } => has_exit(body, cfg),
+            Region::Loop { body, .. } | Region::Labeled { body, .. } => has_exit(body, cfg),
             Region::Switch { cases, default, .. } => {
                 cases.iter().any(|(_, c)| has_exit(c, cfg)) || has_exit(default, cfg)
             }
+            Region::Break { .. } | Region::Continue { .. } => false,
         }
     }
     assert!(
