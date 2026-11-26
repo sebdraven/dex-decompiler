@@ -1,6 +1,7 @@
 //! Shared parsing, identifier, and structural helpers.
 
-use std::collections::{HashMap, HashSet};
+use crate::decompile::ir::map_outside_literals;
+use crate::decompile::{DetHashMap, DetHashSet};
 
 /// Strip trailing "  // ..." comment from a line to get the statement part.
 pub(crate) fn strip_trailing_comment(line: &str) -> String {
@@ -40,7 +41,7 @@ pub(crate) fn parse_invoke_args_and_method(line: &str) -> Option<(String, String
     // Find the last comma at paren depth 0 (method ref can contain commas in param types).
     let mut depth = 0u32;
     let mut last_comma_at = None;
-    for (i, c) in inner.chars().enumerate() {
+    for (i, c) in inner.char_indices() {
         match c {
             '(' => depth = depth.saturating_add(1),
             ')' => depth = depth.saturating_sub(1),
@@ -477,6 +478,63 @@ pub(crate) fn is_class_literal(s: &str) -> bool {
     ty.split('.').all(|p| !p.is_empty() && is_java_ident(p))
 }
 
+/// What the bytecode decided about the names of a body (def-use webs).
+#[derive(Default)]
+pub(crate) struct WebNames {
+    /// Parameters and `this`: defined on entry.
+    pub(crate) params: DetHashSet<String>,
+    /// Constants read once, in the region of their definition.
+    pub(crate) inlinable: DetHashSet<String>,
+    /// Name of a web: no text pass replaces it by a value unless it is inlinable.
+    pub(crate) frozen: DetHashSet<String>,
+    /// Java type of a web's name or a parameter, when the bytecode tells it.
+    pub(crate) types: DetHashMap<String, String>,
+}
+
+impl WebNames {
+    /// `Some(true)`: the bytecode allows replacing `name` by its value, whatever its form;
+    /// `Some(false)`: it forbids it; `None`: unknown to the webs, the text heuristics decide.
+    pub(crate) fn substitution(&self, name: &str) -> Option<bool> {
+        if self.inlinable.contains(name) {
+            Some(true)
+        } else if self.frozen.contains(name) || self.params.contains(name) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn may_substitute(&self, name: &str) -> bool {
+        self.substitution(name) != Some(false)
+    }
+
+    pub(crate) fn is_inlinable(&self, name: &str) -> bool {
+        self.substitution(name) == Some(true)
+    }
+}
+
+/// Numeric, `null`, boolean or char literal: never an object receiver (`0.x`, `null.f()`).
+/// String literals are legitimate receivers (`"RESP:".concat(s)`).
+pub(crate) fn is_non_object_literal(v: &str) -> bool {
+    let v = v.trim();
+    is_numeric_literal(v)
+        || matches!(v, "null" | "true" | "false")
+        || (v.len() >= 3 && v.starts_with('\'') && v.ends_with('\''))
+}
+
+/// `var` is the receiver of a member access or an index in `text` (`var.f`, `var[i]`).
+pub(crate) fn ident_is_receiver(text: &str, var: &str) -> bool {
+    if var.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    text.match_indices(var).any(|(at, _)| {
+        let before_ok = at == 0 || !(is_ident_byte(bytes[at - 1]) || bytes[at - 1] == b'.');
+        let next = bytes.get(at + var.len()).copied();
+        before_ok && matches!(next, Some(b'.') | Some(b'['))
+    })
+}
+
 /// `(Type) expr` — Type starts with uppercase letter / package.
 pub(crate) fn is_numeric_literal(s: &str) -> bool {
     let s = s.trim();
@@ -789,8 +847,8 @@ pub(crate) fn string_lit_in_predicate_cond(cond: &str) -> Option<String> {
 /// Drop `name = "lit";` when the next statement is `if ("lit".equals(…))` / negated form.
 pub(crate) fn rebuild_lines(
     lines: &[&str],
-    skip: &HashSet<usize>,
-    replacements: &HashMap<usize, String>,
+    skip: &DetHashSet<usize>,
+    replacements: &DetHashMap<usize, String>,
     trailing_nl: bool,
 ) -> String {
     let mut out = String::new();
@@ -942,6 +1000,17 @@ pub(crate) fn replace_ident_as_expr(text: &str, var: &str, replacement: &str) ->
     let needs_wrap = replacement.contains(' ')
         || (replacement.starts_with('(') && !replacement.ends_with(')'))
         || is_cast_expr(replacement);
+    map_outside_literals(text, |code| {
+        replace_ident_as_expr_in_code(code, var, replacement, needs_wrap)
+    })
+}
+
+fn replace_ident_as_expr_in_code(
+    text: &str,
+    var: &str,
+    replacement: &str,
+    needs_wrap: bool,
+) -> String {
     let bytes = text.as_bytes();
     let v = var.as_bytes();
     let mut out = String::with_capacity(text.len() + replacement.len());
@@ -953,8 +1022,9 @@ pub(crate) fn replace_ident_as_expr(text: &str, var: &str, replacement: &str) ->
             if before_ok && after_ok {
                 // Do not substitute into field names (`arr.length` is not variable `length`).
                 if i > 0 && bytes[i - 1] == b'.' {
-                    out.push(bytes[i] as char);
-                    i += 1;
+                    let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    out.push_str(&text[i..i + ch_len]);
+                    i += ch_len;
                     continue;
                 }
                 let next = bytes.get(i + v.len()).copied();
@@ -971,8 +1041,9 @@ pub(crate) fn replace_ident_as_expr(text: &str, var: &str, replacement: &str) ->
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&text[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -1157,7 +1228,7 @@ pub(crate) fn split_first_arg(args: &str) -> Option<String> {
     let mut depth = 0i32;
     let mut in_str = false;
     let mut escape = false;
-    for (i, c) in args.chars().enumerate() {
+    for (i, c) in args.char_indices() {
         if in_str {
             if escape {
                 escape = false;
@@ -1621,4 +1692,21 @@ pub(crate) fn is_filled_array_literal(rhs: &str) -> bool {
         return false;
     }
     rhs.contains("[]{") || rhs.contains("[] {")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_ident_as_expr_skips_literals() {
+        let out = replace_ident_as_expr(r#"k.equals("k") || k == 'k'"#, "k", "s");
+        assert_eq!(out, r#"s.equals("k") || s == 'k'"#);
+    }
+
+    #[test]
+    fn replace_ident_as_expr_skips_a_literal_with_an_escaped_quote() {
+        let out = replace_ident_as_expr(r#"f("a\"k\"b", k)"#, "k", "s");
+        assert_eq!(out, r#"f("a\"k\"b", s)"#);
+    }
 }

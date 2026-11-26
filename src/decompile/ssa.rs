@@ -3,7 +3,8 @@
 //! Used for method-level renaming. φ-nodes are stripped before Java emission;
 //! versions linked by a φ share one display name via [`phi_canonical_map`].
 
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
+use std::collections::BTreeSet;
 
 use super::cfg::{BlockId, MethodCfg};
 use super::graph::Graph;
@@ -21,8 +22,8 @@ fn cfg_to_graph(cfg: &MethodCfg) -> Graph {
     g
 }
 
-fn predecessors(cfg: &MethodCfg) -> HashMap<BlockId, Vec<BlockId>> {
-    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+fn predecessors(cfg: &MethodCfg) -> DetHashMap<BlockId, Vec<BlockId>> {
+    let mut preds: DetHashMap<BlockId, Vec<BlockId>> = DetHashMap::default();
     for (from, to) in cfg.successor_edges() {
         preds.entry(to).or_default().push(from);
     }
@@ -30,13 +31,13 @@ fn predecessors(cfg: &MethodCfg) -> HashMap<BlockId, Vec<BlockId>> {
 }
 
 /// Dominance frontiers: DF(b) = blocks where b's dominance "stops".
-fn dominance_frontiers(cfg: &MethodCfg) -> HashMap<BlockId, HashSet<BlockId>> {
+fn dominance_frontiers(cfg: &MethodCfg) -> DetHashMap<BlockId, DetHashSet<BlockId>> {
     let g = cfg_to_graph(cfg);
     let idom = g.immediate_dominators();
     let preds = predecessors(cfg);
-    let mut df: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
+    let mut df: DetHashMap<BlockId, DetHashSet<BlockId>> = DetHashMap::default();
     for bid in 0..cfg.blocks.len() {
-        df.insert(bid, HashSet::new());
+        df.insert(bid, DetHashSet::default());
     }
     for (bid, pred_list) in &preds {
         if pred_list.len() < 2 {
@@ -64,8 +65,8 @@ fn dominance_frontiers(cfg: &MethodCfg) -> HashMap<BlockId, HashSet<BlockId>> {
     df
 }
 
-fn defs_in_block(stmts: &[IrStmt]) -> HashSet<u32> {
-    let mut defs = HashSet::new();
+fn defs_in_block(stmts: &[IrStmt]) -> DetHashSet<u32> {
+    let mut defs = DetHashSet::default();
     for s in stmts {
         if let IrStmt::Assign { dst, .. } | IrStmt::Phi { dst, .. } = s {
             defs.insert(dst.reg);
@@ -78,16 +79,16 @@ fn defs_in_block(stmts: &[IrStmt]) -> HashSet<u32> {
 ///
 /// `blocks` maps each CFG block to its IR (pre-SSA). After this call, statements
 /// use SSA `VarId` versions and φ-nodes appear at the start of join blocks.
-pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut HashMap<BlockId, Vec<IrStmt>>) {
+pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut DetHashMap<BlockId, Vec<IrStmt>>) {
     if cfg.block_count() == 0 {
         return;
     }
     let df = dominance_frontiers(cfg);
     let preds = predecessors(cfg);
 
-    // Registers defined somewhere.
-    let mut all_regs: HashSet<u32> = HashSet::new();
-    let mut def_sites: HashMap<u32, HashSet<BlockId>> = HashMap::new();
+    // Registers defined somewhere; ordered: φ-nodes are inserted at block start in this order.
+    let mut all_regs: BTreeSet<u32> = BTreeSet::new();
+    let mut def_sites: DetHashMap<u32, DetHashSet<BlockId>> = DetHashMap::default();
     for (&bid, stmts) in blocks.iter() {
         for r in defs_in_block(stmts) {
             all_regs.insert(r);
@@ -103,7 +104,7 @@ pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut HashMap<BlockId, Vec<IrStmt>>
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let mut has_phi: HashSet<BlockId> = HashSet::new();
+        let mut has_phi: DetHashSet<BlockId> = DetHashSet::default();
         while let Some(b) = work.pop() {
             for &d in df.get(&b).into_iter().flatten() {
                 if has_phi.insert(d) {
@@ -128,14 +129,14 @@ pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut HashMap<BlockId, Vec<IrStmt>>
     }
 
     // Rename (stack-based).
-    let mut next_ver: HashMap<u32, u32> = HashMap::new();
-    let mut stacks: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut next_ver: DetHashMap<u32, u32> = DetHashMap::default();
+    let mut stacks: DetHashMap<u32, Vec<u32>> = DetHashMap::default();
     for &r in &all_regs {
         next_ver.insert(r, 0);
         stacks.insert(r, vec![0]); // version 0 = params / undefined
     }
 
-    fn rename_expr(expr: IrExpr, stacks: &HashMap<u32, Vec<u32>>) -> IrExpr {
+    fn rename_expr(expr: IrExpr, stacks: &DetHashMap<u32, Vec<u32>>) -> IrExpr {
         match expr {
             IrExpr::Var(v) => {
                 let ver = stacks
@@ -154,9 +155,9 @@ pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut HashMap<BlockId, Vec<IrStmt>>
         }
     }
 
-    fn rename_text(s: &str, stacks: &HashMap<u32, Vec<u32>>) -> String {
+    fn rename_text(s: &str, stacks: &DetHashMap<u32, Vec<u32>>) -> String {
         // Reuse pass.rs style via a local map of current versions.
-        let cur: HashMap<u32, u32> = stacks
+        let cur: DetHashMap<u32, u32> = stacks
             .iter()
             .filter_map(|(r, st)| st.last().copied().map(|v| (*r, v)))
             .collect();
@@ -165,8 +166,8 @@ pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut HashMap<BlockId, Vec<IrStmt>>
 
     fn new_name(
         reg: u32,
-        next_ver: &mut HashMap<u32, u32>,
-        stacks: &mut HashMap<u32, Vec<u32>>,
+        next_ver: &mut DetHashMap<u32, u32>,
+        stacks: &mut DetHashMap<u32, Vec<u32>>,
     ) -> VarId {
         let v = next_ver.entry(reg).or_insert(0);
         *v += 1;
@@ -178,7 +179,7 @@ pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut HashMap<BlockId, Vec<IrStmt>>
     // Dominator tree children.
     let g = cfg_to_graph(cfg);
     let idom = g.immediate_dominators();
-    let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut children: DetHashMap<BlockId, Vec<BlockId>> = DetHashMap::default();
     for bid in 0..cfg.blocks.len() {
         if let Some(Some(dom)) = idom.get(&bid.to_string()) {
             if let Ok(d) = dom.parse::<BlockId>() {
@@ -190,11 +191,11 @@ pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut HashMap<BlockId, Vec<IrStmt>>
     fn rename_block(
         bid: BlockId,
         cfg: &MethodCfg,
-        blocks: &mut HashMap<BlockId, Vec<IrStmt>>,
-        preds: &HashMap<BlockId, Vec<BlockId>>,
-        children: &HashMap<BlockId, Vec<BlockId>>,
-        next_ver: &mut HashMap<u32, u32>,
-        stacks: &mut HashMap<u32, Vec<u32>>,
+        blocks: &mut DetHashMap<BlockId, Vec<IrStmt>>,
+        preds: &DetHashMap<BlockId, Vec<BlockId>>,
+        children: &DetHashMap<BlockId, Vec<BlockId>>,
+        next_ver: &mut DetHashMap<u32, u32>,
+        stacks: &mut DetHashMap<u32, Vec<u32>>,
     ) {
         let mut pushed: Vec<u32> = Vec::new();
         if let Some(stmts) = blocks.get_mut(&bid) {
@@ -272,10 +273,10 @@ pub fn construct_ssa(cfg: &MethodCfg, blocks: &mut HashMap<BlockId, Vec<IrStmt>>
 }
 
 /// Map each SSA value to a canonical representative (φ webs ∪ identity).
-pub fn phi_canonical_map(blocks: &HashMap<BlockId, Vec<IrStmt>>) -> HashMap<VarId, VarId> {
-    let mut parent: HashMap<VarId, VarId> = HashMap::new();
+pub fn phi_canonical_map(blocks: &DetHashMap<BlockId, Vec<IrStmt>>) -> DetHashMap<VarId, VarId> {
+    let mut parent: DetHashMap<VarId, VarId> = DetHashMap::default();
 
-    fn find(parent: &mut HashMap<VarId, VarId>, x: VarId) -> VarId {
+    fn find(parent: &mut DetHashMap<VarId, VarId>, x: VarId) -> VarId {
         let p = parent.get(&x).copied().unwrap_or(x);
         if p != x {
             let root = find(parent, p);
@@ -285,11 +286,12 @@ pub fn phi_canonical_map(blocks: &HashMap<BlockId, Vec<IrStmt>>) -> HashMap<VarI
             x
         }
     }
-    fn union(parent: &mut HashMap<VarId, VarId>, a: VarId, b: VarId) {
+    // The smallest member is the root, whatever the union order.
+    fn union(parent: &mut DetHashMap<VarId, VarId>, a: VarId, b: VarId) {
         let ra = find(parent, a);
         let rb = find(parent, b);
         if ra != rb {
-            parent.insert(rb, ra);
+            parent.insert(ra.max(rb), ra.min(rb));
         }
     }
 
@@ -306,7 +308,7 @@ pub fn phi_canonical_map(blocks: &HashMap<BlockId, Vec<IrStmt>>) -> HashMap<VarI
     }
 
     let keys: Vec<VarId> = parent.keys().copied().collect();
-    let mut out = HashMap::new();
+    let mut out = DetHashMap::default();
     for k in keys {
         out.insert(k, find(&mut parent, k));
     }
@@ -314,15 +316,15 @@ pub fn phi_canonical_map(blocks: &HashMap<BlockId, Vec<IrStmt>>) -> HashMap<VarI
 }
 
 /// Drop φ-nodes (Java cannot express them). Call after [`phi_canonical_map`].
-pub fn strip_phis(blocks: &mut HashMap<BlockId, Vec<IrStmt>>) {
+pub fn strip_phis(blocks: &mut DetHashMap<BlockId, Vec<IrStmt>>) {
     for stmts in blocks.values_mut() {
         stmts.retain(|s| !matches!(s, IrStmt::Phi { .. }));
     }
 }
 
 /// Registers that receive at least one φ (useful for shared naming in restructure mode).
-pub fn phi_registers(blocks: &HashMap<BlockId, Vec<IrStmt>>) -> HashSet<u32> {
-    let mut regs = HashSet::new();
+pub fn phi_registers(blocks: &DetHashMap<BlockId, Vec<IrStmt>>) -> DetHashSet<u32> {
+    let mut regs = DetHashSet::default();
     for stmts in blocks.values() {
         for s in stmts {
             if let IrStmt::Phi { dst, .. } = s {
@@ -335,17 +337,19 @@ pub fn phi_registers(blocks: &HashMap<BlockId, Vec<IrStmt>>) -> HashSet<u32> {
 
 /// Apply φ-web canonicalization to a name map (share one Java name across versions).
 pub fn apply_canonical_names(
-    name_map: &mut HashMap<VarId, String>,
-    canonical: &HashMap<VarId, VarId>,
+    name_map: &mut DetHashMap<VarId, String>,
+    canonical: &DetHashMap<VarId, VarId>,
 ) {
-    // Ensure each web root has a name (prefer any existing member's name).
-    let snapshot: Vec<(VarId, String)> = name_map.iter().map(|(k, v)| (*k, v.clone())).collect();
+    // Ensure each web root has a name (prefer the smallest member's name).
+    let mut snapshot: Vec<(VarId, String)> =
+        name_map.iter().map(|(k, v)| (*k, v.clone())).collect();
+    snapshot.sort();
     for (vid, name) in &snapshot {
         if let Some(canon) = canonical.get(vid) {
             name_map.entry(*canon).or_insert_with(|| name.clone());
         }
     }
-    let canon_names: HashMap<VarId, String> = name_map
+    let canon_names: DetHashMap<VarId, String> = name_map
         .iter()
         .filter_map(|(v, n)| {
             let c = canonical.get(v).copied().unwrap_or(*v);
@@ -371,7 +375,7 @@ mod tests {
 
     #[test]
     fn phi_canonical_unions_incomings() {
-        let mut blocks = HashMap::new();
+        let mut blocks = DetHashMap::default();
         blocks.insert(
             0,
             vec![Stmt::Phi {
@@ -386,7 +390,7 @@ mod tests {
 
     #[test]
     fn strip_phis_removes_nodes() {
-        let mut blocks = HashMap::new();
+        let mut blocks = DetHashMap::default();
         blocks.insert(
             0,
             vec![
@@ -408,7 +412,6 @@ mod tests {
     #[test]
     fn construct_ssa_diamond_inserts_phi() {
         use crate::decompile::cfg::{BlockEnd, CfgBlock, MethodCfg};
-        use std::collections::HashSet;
 
         // Diamond: 0 → 1, 0 → 2, 1 → 3, 2 → 3
         let cfg = MethodCfg {
@@ -442,12 +445,12 @@ mod tests {
                     instruction_offsets: vec![],
                 },
             ],
-            block_by_start: HashMap::new(),
-            loop_headers: HashSet::new(),
+            block_by_start: std::collections::HashMap::new(),
+            loop_headers: std::collections::HashSet::new(),
             entry: 0,
-            folded_const_offsets: HashSet::new(),
+            folded_const_offsets: std::collections::HashSet::new(),
         };
-        let mut blocks = HashMap::new();
+        let mut blocks = DetHashMap::default();
         blocks.insert(0, vec![]);
         blocks.insert(
             1,

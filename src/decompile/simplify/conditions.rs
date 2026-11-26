@@ -1,14 +1,14 @@
 //! Condition folding, else-if chains, and boolean polish passes.
 
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
 
 use super::util::*;
 
 /// Fold string-literal equals temps into `if` conditions and collapse `!(!x)`.
-pub(crate) fn fold_equals_into_conditions(body: &str) -> String {
+pub(crate) fn fold_equals_into_conditions_with_webs(body: &str, webs: &WebNames) -> String {
     let mut current = body.to_string();
     for _ in 0..6 {
-        let next = fold_equals_into_conditions_once(&current);
+        let next = fold_equals_into_conditions_once(&current, webs);
         let next = collapse_double_not_conditions(&next);
         if next == current {
             break;
@@ -18,10 +18,10 @@ pub(crate) fn fold_equals_into_conditions(body: &str) -> String {
     current
 }
 
-pub(crate) fn fold_equals_into_conditions_once(body: &str) -> String {
+fn fold_equals_into_conditions_once(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip: HashSet<usize> = HashSet::new();
-    let mut replacements: HashMap<usize, String> = HashMap::new();
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
+    let mut replacements: DetHashMap<usize, String> = DetHashMap::default();
 
     for i in 0..lines.len() {
         if skip.contains(&i) {
@@ -32,12 +32,18 @@ pub(crate) fn fold_equals_into_conditions_once(body: &str) -> String {
         let Some((bvar, equals_expr)) = parse_equals_assign(lines[i]) else {
             continue;
         };
+        if !webs.may_substitute(&bvar) {
+            continue;
+        }
         // Optional preceding lit assign used once in equals_expr.
         let mut lit_idx: Option<usize> = None;
         let mut equals_expr = equals_expr;
         if i > 0 {
             if let Some((lvar, lval)) = parse_simple_assign_line(lines[i - 1]) {
-                if is_string_literal(&lval) && ident_occurs(&equals_expr, &lvar) {
+                if is_string_literal(&lval)
+                    && webs.may_substitute(&lvar)
+                    && ident_occurs(&equals_expr, &lvar)
+                {
                     equals_expr = replace_ident_as_expr(&equals_expr, &lvar, &lval);
                     lit_idx = Some(i - 1);
                 }
@@ -130,8 +136,8 @@ pub(crate) fn fold_instanceof_into_conditions(body: &str) -> String {
 
 pub(crate) fn fold_instanceof_into_conditions_once(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip: HashSet<usize> = HashSet::new();
-    let mut replacements: HashMap<usize, String> = HashMap::new();
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
+    let mut replacements: DetHashMap<usize, String> = DetHashMap::default();
 
     for i in 0..lines.len() {
         if skip.contains(&i) {
@@ -265,7 +271,7 @@ pub(crate) fn collapse_double_not(cond: &str) -> String {
 /// Drop `name = "lit";` when the next statement is `if ("lit".equals(…))` / negated form.
 pub(crate) fn drop_string_lits_folded_into_if(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip: HashSet<usize> = HashSet::new();
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
     for i in 0..lines.len().saturating_sub(1) {
         let Some((var, lit)) = parse_simple_assign_line(lines[i]) else {
             continue;
@@ -314,7 +320,7 @@ pub(crate) fn drop_string_lits_folded_into_if(body: &str) -> String {
     if skip.is_empty() {
         return body.to_string();
     }
-    rebuild_lines(&lines, &skip, &HashMap::new(), body.ends_with('\n'))
+    rebuild_lines(&lines, &skip, &DetHashMap::default(), body.ends_with('\n'))
 }
 
 /// Flip `if (!(pred)) { THEN } else { ELSE }` → `if (pred) { ELSE } else { THEN }`
@@ -520,10 +526,10 @@ pub(crate) fn flatten_else_if_once(body: &str) -> String {
 /// }
 /// ```
 /// into `if ("a".equals(uri.getScheme()) && "b".equals(uri.getHost())) { BODY }`
-pub(crate) fn merge_nested_uri_component_checks(body: &str) -> String {
+pub(crate) fn merge_nested_uri_component_checks_with_webs(body: &str, webs: &WebNames) -> String {
     let mut current = body.to_string();
     for _ in 0..4 {
-        let next = merge_nested_uri_component_checks_once(&current);
+        let next = merge_nested_uri_component_checks_once(&current, webs);
         if next == current {
             break;
         }
@@ -541,12 +547,15 @@ pub(crate) fn is_uri_component_getter(rhs: &str) -> bool {
         || r.ends_with(".getFragment()")
 }
 
-pub(crate) fn merge_nested_uri_component_checks_once(body: &str) -> String {
+fn merge_nested_uri_component_checks_once(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
     for i in 0..lines.len().saturating_sub(1) {
         let Some((var1, getter1)) = parse_simple_assign_line(lines[i]) else {
             continue;
         };
+        if !webs.may_substitute(&var1) {
+            continue;
+        }
         if !is_uri_component_getter(&getter1) {
             continue;
         }
@@ -651,10 +660,10 @@ pub(crate) fn merge_nested_uri_component_checks_once(body: &str) -> String {
 /// before reassignment (or only used in that if condition).
 /// Inline `path = uri.getPath();` into a following equals-if when `path` is not used afterward
 /// before reassignment (or only used in that if condition).
-pub(crate) fn inline_single_use_into_equals_if(body: &str) -> String {
+pub(crate) fn inline_single_use_into_equals_if_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip: HashSet<usize> = HashSet::new();
-    let mut replacements: HashMap<usize, String> = HashMap::new();
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
+    let mut replacements: DetHashMap<usize, String> = DetHashMap::default();
     for i in 0..lines.len() {
         if skip.contains(&i) {
             continue;
@@ -662,6 +671,9 @@ pub(crate) fn inline_single_use_into_equals_if(body: &str) -> String {
         let Some((var, getter)) = parse_simple_assign_line(lines[i]) else {
             continue;
         };
+        if !webs.may_substitute(&var) {
+            continue;
+        }
         if !is_uri_component_getter(&getter) && !getter.contains(".getQueryParameter(") {
             continue;
         }
@@ -791,19 +803,20 @@ pub(crate) fn polish_booleanish_int_args(body: &str) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = body[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
 
-pub(crate) fn polish_null_comparisons_in_body(body: &str) -> String {
+pub(crate) fn polish_null_comparisons_in_body_with_webs(body: &str, webs: &WebNames) -> String {
     let mut out = String::new();
     for (idx, line) in body.lines().enumerate() {
         let mut current = line.to_string();
         // if (x == 0) / if (x != 0)
         if let Some(cond) = parse_if_condition(line) {
-            let new_cond = polish_null_in_condition(&cond);
+            let new_cond = polish_null_in_condition(&cond, webs);
             if new_cond != cond {
                 current = format!("{}if ({}) {{", leading_indent(line), new_cond);
             }
@@ -821,11 +834,20 @@ pub(crate) fn polish_null_comparisons_in_body(body: &str) -> String {
     out
 }
 
-pub(crate) fn polish_null_in_condition(cond: &str) -> String {
+/// A name the webs know is read with its type (`!z`, `x == null`), or left as `== 0`
+/// when that type is primitive or unknown; other names keep the naming heuristics.
+pub(crate) fn polish_null_in_condition(cond: &str, webs: &WebNames) -> String {
     let c = cond.trim();
     for (suf, null_suf) in [(" == 0", " == null"), (" != 0", " != null")] {
         if let Some(name) = c.strip_suffix(suf) {
             let name = name.trim();
+            if is_java_ident(name) && webs.substitution(name).is_some() {
+                return webs
+                    .types
+                    .get(name)
+                    .and_then(|ty| crate::decompile::typed_zero_test(name, suf == " == 0", ty))
+                    .unwrap_or_else(|| c.to_string());
+            }
             if is_java_ident(name)
                 && !looks_like_primitive_local(name)
                 && !looks_like_boolean_local(name)
@@ -1119,7 +1141,7 @@ pub(crate) fn looks_like_primitive_local(name: &str) -> bool {
 /// `while (…) { continue; }` back-edges still round-trip in tests / empty loop bodies.
 pub(crate) fn remove_trailing_continues(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip = std::collections::HashSet::new();
+    let mut skip = DetHashSet::default();
     for i in 0..lines.len() {
         if lines[i].trim() != "continue;" {
             continue;
@@ -1140,7 +1162,7 @@ pub(crate) fn remove_trailing_continues(body: &str) -> String {
             }
             ind == cont_indent && t != "continue;"
         });
-        if has_prior_sibling {
+        if has_prior_sibling && !inside_labeled_block_of_loop(&lines, i) {
             skip.insert(i);
         }
     }
@@ -1158,6 +1180,47 @@ pub(crate) fn remove_trailing_continues(body: &str) -> String {
         }
     }
     out
+}
+
+/// `label: {` opens a labeled block (not a loop).
+fn is_labeled_block_line(t: &str) -> bool {
+    t.strip_suffix(": {").is_some_and(|name| {
+        name != "default"
+            && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Line `i` sits in a labeled block nested inside its loop: falling off there leaves the
+/// block, so its `continue;` is not redundant.
+fn inside_labeled_block_of_loop(lines: &[&str], i: usize) -> bool {
+    let mut depth = 0usize;
+    for line in lines[..i].iter().rev() {
+        let stmt = strip_trailing_comment(line);
+        let t = stmt.trim();
+        for c in t.chars().rev() {
+            match c {
+                '}' => depth += 1,
+                '{' if depth > 0 => depth -= 1,
+                '{' => {
+                    if is_labeled_block_line(t) {
+                        return true;
+                    }
+                    let head = t.split_once(": ").map_or(t, |(_, rest)| rest);
+                    if head.starts_with("while ")
+                        || head.starts_with("while(")
+                        || head.starts_with("for ")
+                        || head.starts_with("for(")
+                        || head.starts_with("do {")
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// Merge nested `if (A) { if (B) { BODY } }` (no else on either) into `if (A && B) { BODY }`.

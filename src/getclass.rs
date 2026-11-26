@@ -53,7 +53,7 @@ pub fn find_dex_defining_class(bytes: &[u8], descriptor: &str) -> Result<Vec<u8>
     #[cfg(not(target_arch = "wasm32"))]
     {
         use rayon::prelude::*;
-        let found = entries.par_iter().find_map_any(|e| {
+        let found = entries.par_iter().find_map_first(|e| {
             let data = index.read_entry(e).ok()?;
             for (_name, dex_bytes) in iter_logical_dexes(&e.filename, data) {
                 if dex_defines_class(&dex_bytes, descriptor) {

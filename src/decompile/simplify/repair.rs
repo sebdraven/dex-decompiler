@@ -1,6 +1,6 @@
 //! Repair SSA/register-reuse artifacts in decompiled bodies.
 
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
 
 use super::loops::parse_index_compare_bound;
 use super::util::*;
@@ -18,14 +18,16 @@ pub(crate) fn forward_array_scalar_literal(name: &str) -> Option<String> {
 /// Undeclared `localN` / literal temps in call args — usually dropped `const` loads.
 pub(crate) fn repair_undeclared_temps_in_call_args(
     current: &mut String,
-    assigned: &HashSet<String>,
-    literal_by_temp: &HashMap<String, String>,
+    assigned: &DetHashSet<String>,
+    literal_by_temp: &DetHashMap<String, String>,
+    webs: &WebNames,
 ) {
     if !line_contains_call(current) {
         return;
     }
     for ident in collect_idents_in_line(current) {
-        if assigned.contains(&ident) {
+        // A web's name read without definition stays visible (S4).
+        if assigned.contains(&ident) || !webs.may_substitute(&ident) {
             continue;
         }
         // `local0.method` / `sb.append` is an object receiver, not a dropped int const.
@@ -55,10 +57,11 @@ pub(crate) fn repair_undeclared_temps_in_call_args(
 pub(crate) fn repair_forward_array_scalar_uses(
     current: &mut String,
     line_idx: usize,
-    array_decls: &HashMap<String, usize>,
+    array_decls: &DetHashMap<String, usize>,
+    webs: &WebNames,
 ) {
     for (name, decl_idx) in array_decls {
-        if line_idx >= *decl_idx || !ident_occurs(current, name) {
+        if line_idx >= *decl_idx || !ident_occurs(current, name) || !webs.may_substitute(name) {
             continue;
         }
         if current.contains(&format!("int[] {name}"))
@@ -84,13 +87,13 @@ pub(crate) fn repair_forward_array_scalar_uses(
 
 /// `int[] arr0 = new int[arr0]` after `y = 5` — the size register was overwritten by the array.
 /// Use the nearest preceding integer literal (`new int[5]`), never a double `0.0`.
-pub(crate) fn repair_self_sized_new_array(body: &str) -> String {
+pub(crate) fn repair_self_sized_new_array_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
     let mut out = String::new();
     for (idx, line) in lines.iter().enumerate() {
         let mut current = line.to_string();
         if let Some((arr, element, size)) = parse_new_array_decl(line) {
-            if size == arr {
+            if size == arr && webs.may_substitute(&size) {
                 if let Some(lit) = preceding_int_literal(&lines, idx) {
                     current = current.replacen(
                         &format!("new {element}[{size}]"),
@@ -159,7 +162,7 @@ fn ident_used_as_receiver(line: &str, ident: &str) -> bool {
 /// `i = i0 + 1` / `int j = i1 + 1` after SSA unify → `i++` / `j++`.
 pub(crate) fn repair_ssa_temp_increments(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut declared: HashSet<String> = HashSet::new();
+    let mut declared: DetHashSet<String> = DetHashSet::default();
     for line in &lines {
         if let Some(eq) = strip_trailing_comment(line).trim().find(" = ") {
             let binding = strip_trailing_comment(line);
@@ -204,11 +207,17 @@ pub(crate) fn repair_ssa_temp_increments(body: &str) -> String {
 }
 
 /// Fix scalar uses of names that belong to later array locals, and undeclared temps in calls.
-/// Fix scalar uses of names that belong to later array locals, and undeclared temps in calls.
 pub(crate) fn repair_register_reuse_scalars(body: &str) -> String {
+    repair_register_reuse_scalars_with_webs(body, &WebNames::default())
+}
+
+/// Parameters (and `this`) are defined on entry, so a parameter never assigned in the
+/// body is not a dropped temp (`arr1` must not become `1`, R4). A web's name is never
+/// replaced by a literal unless it is an inlinable constant.
+pub(crate) fn repair_register_reuse_scalars_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut assigned: HashSet<String> = HashSet::new();
-    let mut array_decls: HashMap<String, usize> = HashMap::new();
+    let mut assigned: DetHashSet<String> = webs.params.clone();
+    let mut array_decls: DetHashMap<String, usize> = DetHashMap::default();
     for (i, line) in lines.iter().enumerate() {
         let binding = strip_trailing_comment(line);
         let t = binding.trim();
@@ -228,7 +237,7 @@ pub(crate) fn repair_register_reuse_scalars(body: &str) -> String {
             }
         }
     }
-    let mut literal_by_temp: HashMap<String, String> = HashMap::new();
+    let mut literal_by_temp: DetHashMap<String, String> = DetHashMap::default();
     for line in &lines {
         if let Some((var, val)) = parse_simple_assign_line(line) {
             if is_temp_like_name(&var) && is_cheap_literal_rhs(&val) {
@@ -239,8 +248,8 @@ pub(crate) fn repair_register_reuse_scalars(body: &str) -> String {
     let mut out = String::new();
     for (idx, line) in lines.iter().enumerate() {
         let mut current = line.to_string();
-        repair_forward_array_scalar_uses(&mut current, idx, &array_decls);
-        repair_undeclared_temps_in_call_args(&mut current, &assigned, &literal_by_temp);
+        repair_forward_array_scalar_uses(&mut current, idx, &array_decls, webs);
+        repair_undeclared_temps_in_call_args(&mut current, &assigned, &literal_by_temp, webs);
         let binding = strip_trailing_comment(&current);
         let stmt = binding.trim();
         // For-loop headers contain `var = init; cond; update` — not SSA reuse assigns.
@@ -267,7 +276,8 @@ pub(crate) fn repair_register_reuse_scalars(body: &str) -> String {
                                 current = format!("{indent}{lhs_var}++;{comment}");
                             }
                         }
-                    } else if is_temp_like_name(lhs_var)
+                    } else if webs.may_substitute(lhs_var)
+                        && (webs.is_inlinable(lhs_var) || is_temp_like_name(lhs_var))
                         && ident_occurs(rhs, lhs_var)
                         && !is_simple_arith_expr(rhs)
                     {
@@ -284,6 +294,10 @@ pub(crate) fn repair_register_reuse_scalars(body: &str) -> String {
                             } else {
                                 None
                             }
+                        });
+                        // `local6 = local6.edit()` must not become `2131230978.edit()` (R3).
+                        let lit = lit.filter(|l| {
+                            !(is_non_object_literal(l) && ident_is_receiver(rhs, lhs_var))
                         });
                         if let Some(lit) = lit {
                             let patched = replace_ident_as_expr(rhs, lhs_var, &lit);
@@ -322,9 +336,14 @@ fn preceding_same_var_literal(lines: &[&str], idx: usize, var: &str) -> Option<S
 }
 
 /// `var = foo(..., var);` after SSA unify — restore the call arg from the pre-call const.
+#[cfg(test)]
 pub(crate) fn repair_self_referential_call_args(body: &str) -> String {
+    repair_self_referential_call_args_with_webs(body, &WebNames::default())
+}
+
+pub(crate) fn repair_self_referential_call_args_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut literal_temps: HashMap<String, String> = HashMap::new();
+    let mut literal_temps: DetHashMap<String, String> = DetHashMap::default();
     for line in &lines {
         let Some((var, val)) = parse_simple_assign_line(line) else {
             continue;
@@ -346,7 +365,8 @@ pub(crate) fn repair_self_referential_call_args(body: &str) -> String {
                 let lhs = t[..eq].trim();
                 let lhs_var = lhs.rsplit(' ').next().unwrap_or(lhs);
                 let rhs = t[eq + 3..].trim_end_matches(';').trim();
-                if is_temp_like_name(lhs_var)
+                if webs.may_substitute(lhs_var)
+                    && (webs.is_inlinable(lhs_var) || is_temp_like_name(lhs_var))
                     && ident_occurs(rhs, lhs_var)
                     && !is_simple_arith_expr(rhs)
                 {
@@ -364,6 +384,9 @@ pub(crate) fn repair_self_referential_call_args(body: &str) -> String {
                             None
                         }
                     });
+                    // `local6 = local6.edit()` must not become `2131230978.edit()` (R3).
+                    let lit =
+                        lit.filter(|l| !(is_non_object_literal(l) && ident_is_receiver(rhs, lhs_var)));
                     if let Some(lit) = lit {
                         let patched = replace_ident_as_expr(rhs, lhs_var, &lit);
                         if patched != rhs && !patched.contains(';') {

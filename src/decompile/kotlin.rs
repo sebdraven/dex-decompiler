@@ -4,6 +4,7 @@
 //! When `d1`/`d2` are present, decodes via Kotlin JVM BitEncoding (or base64)
 //! and walks Class protobuf fields for flags, fq name, properties, functions.
 
+use crate::decompile::DetHashSet;
 use dex_parser::ClassDef;
 use regex::Regex;
 
@@ -598,7 +599,7 @@ struct StringTableRecord {
 pub struct JvmNameResolver {
     strings: Vec<String>,
     records: Vec<StringTableRecord>,
-    local_name_indices: std::collections::HashSet<i32>,
+    local_name_indices: DetHashSet<i32>,
 }
 
 impl JvmNameResolver {
@@ -607,7 +608,7 @@ impl JvmNameResolver {
         Self {
             strings: d2.to_vec(),
             records: Vec::new(),
-            local_name_indices: std::collections::HashSet::new(),
+            local_name_indices: DetHashSet::default(),
         }
     }
 
@@ -772,7 +773,7 @@ fn read_packed_int32s(bytes: &[u8]) -> Vec<i32> {
 /// Parse `JvmProtoBuf.StringTableTypes` and expand `range` like Kotlin `toExpandedRecordsList`.
 pub fn parse_string_table_types(bytes: &[u8], d2: &[String]) -> JvmNameResolver {
     let mut records_raw = Vec::new();
-    let mut local_name = std::collections::HashSet::new();
+    let mut local_name = DetHashSet::default();
     for (num, val) in read_protobuf_fields(bytes) {
         match (num, val) {
             (1, ProtoVal::Len(raw)) => {
@@ -1261,7 +1262,7 @@ pub fn suggest_property_field_renames(
         return Vec::new();
     }
     let mut out = Vec::new();
-    let mut used_props = std::collections::HashSet::new();
+    let mut used_props = DetHashSet::default();
     // Prefer exact case-insensitive matches first.
     for f in field_names {
         if let Some(p) = property_names

@@ -6,11 +6,13 @@ pub mod accessors;
 pub mod annotations;
 pub mod cfg;
 pub mod const_fields;
+mod def_webs;
 pub mod deobf;
 pub mod graph;
 mod ir;
 pub mod json_export;
 pub mod kotlin;
+pub(crate) mod local_types;
 pub mod mapping;
 pub mod pass;
 mod read_write;
@@ -19,6 +21,7 @@ pub mod rename;
 pub mod resource_consts;
 mod simplify;
 pub mod ssa;
+mod structure;
 pub use simplify::restore_string_switch as simplify_restore_string_switch_for_tests;
 pub use simplify::simplify_method_body as simplify_method_body_for_tests;
 mod try_catch;
@@ -33,9 +36,11 @@ pub mod value_flow;
 use crate::error::{DexDecompilerError, Result};
 use crate::java;
 use cfg::{BlockEnd, BlockId, MethodCfg};
+use def_webs::{DefKey, DefWebs, ENTRY_DEF};
 use dex_bytecode::{decode_all, Instruction};
 use dex_parser::{ClassDef, CodeItem, DexFile, EncodedMethod, NO_INDEX};
 use ir::{Expr as IrExpr, Stmt as IrStmt, VarId};
+use local_types::{LocalTypes, THROWABLE};
 use pass::{
     run_dead_assign_with_used_regs, used_regs, ConstructorMergePass, CopyPropPass, DeadAssignPass,
     ExprSimplifyPass, InlineFilledArrayPass, InvokeChainPass, Pass, PassRunner, SsaRenamePass,
@@ -47,9 +52,10 @@ use region::{
 };
 use ssa::{apply_canonical_names, construct_ssa, phi_canonical_map, phi_registers, strip_phis};
 use simplify::is_temp_like_name;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
+use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use type_infer::{
     build_var_names_with_regs, enrich_types_with_field_index, infer_types_cached,
     is_primitive_java_type, FieldTypeIndex, MethodReturnIndex, preferred_debug_type_for_reg,
@@ -59,6 +65,10 @@ use value_flow::{
     build_api_return_sources, build_insn_labels, build_instruction_rw_map, build_invoke_method_map,
     ValueFlowAnalysisOwned,
 };
+
+/// Hash tables with fixed keys: iteration order depends on the contents only, never on the run.
+pub(crate) type DetHashMap<K, V> = HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
+pub(crate) type DetHashSet<T> = HashSet<T, BuildHasherDefault<DefaultHasher>>;
 
 /// Decompilation strategy (jadx-inspired).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -88,7 +98,7 @@ pub struct DecompilerOptions {
     /// Prefer DEX debug_info local/parameter names when present (default: true).
     pub use_debug_names: bool,
     /// Optional resource id → `R.type.name` (from `resources.arsc` / R classes).
-    pub resource_map: Option<std::collections::HashMap<u32, String>>,
+    pub resource_map: Option<HashMap<u32, String>>,
 }
 
 impl Default for DecompilerOptions {
@@ -173,7 +183,28 @@ fn body_ends_with_exit(out: &str) -> bool {
         return false;
     };
     let t = last.trim();
-    t.starts_with("return") || t.starts_with("throw") || t == "break;" || t == "continue;"
+    t.starts_with("return")
+        || t.starts_with("throw")
+        || t == "break;"
+        || t == "continue;"
+        || t.starts_with("break ")
+        || t.starts_with("continue ")
+}
+
+/// `DEX_DECOMPILER_STRUCTURER=legacy`: whole methods keep the greedy region builder.
+fn legacy_structurer() -> bool {
+    std::env::var_os("DEX_DECOMPILER_STRUCTURER").is_some_and(|v| v == "legacy")
+}
+
+/// Region tree of a whole method body, and whether it carries its own jumps.
+/// The dominator-tree structurer is tried first when `structured` allows it.
+fn whole_method_root(cfg: &MethodCfg, structured: bool) -> Option<(Region, bool)> {
+    if structured && !legacy_structurer() {
+        if let Some(root) = structure::build(cfg, cfg.entry) {
+            return Some((root, true));
+        }
+    }
+    build_regions(cfg, cfg.entry).map(|root| (root, false))
 }
 
 fn is_synthetic_local_name(s: &str) -> bool {
@@ -222,6 +253,65 @@ fn is_signature_style_name(s: &str) -> bool {
         )
 }
 
+/// `prefix + digits` names minted by `name_for_var` / `param_display_name` (`s0`, `obj3`).
+fn is_counter_name(name: &str) -> bool {
+    let Some(at) = name.find(|c: char| c.is_ascii_digit()) else {
+        return false;
+    };
+    let (prefix, digits) = name.split_at(at);
+    digits.bytes().all(|b| b.is_ascii_digit())
+        && matches!(
+            prefix,
+            "i" | "z"
+                | "l"
+                | "s"
+                | "f"
+                | "d"
+                | "c"
+                | "p"
+                | "obj"
+                | "sb"
+                | "intent"
+                | "uri"
+                | "bundle"
+                | "ctx"
+                | "view"
+                | "cls"
+                | "arr"
+                | "ex"
+                | "list"
+                | "map"
+                | "set"
+                | "v"
+                | "local"
+        )
+}
+
+/// Register of each declared parameter. Parameters fill `[registers_size - ins_size,
+/// registers_size)`; `long` / `double` take two slots. `this` leads when `ins_size` is one
+/// more than the declared width (access flags only break a tie on malformed code).
+fn param_registers(code: &CodeItem, is_static: bool, param_types: &[String]) -> Vec<u32> {
+    let width_of = |ty: &str| if matches!(ty, "long" | "double" | "J" | "D") { 2 } else { 1 };
+    let declared: u32 = param_types.iter().map(|ty| width_of(ty.as_str())).sum();
+    let ins_size = code.ins_size as u32;
+    let has_this = if ins_size == declared + 1 {
+        true
+    } else if ins_size == declared {
+        false
+    } else {
+        !is_static
+    };
+    let mut slot = (code.registers_size as u32).saturating_sub(ins_size) + u32::from(has_this);
+    param_types
+        .iter()
+        .map(|ty| {
+            let reg = slot;
+            slot += width_of(ty.as_str());
+            reg
+        })
+        .collect()
+}
+
 fn is_java_ident(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -235,9 +325,10 @@ fn is_java_ident(name: &str) -> bool {
 
 /// Merge `debug_info.parameter_names` with `DBG_START_LOCAL` names on param registers.
 /// Locals fill gaps so the signature matches the body (`grantResults` vs `arr2`).
-fn debug_param_names_from_tables(
+/// `register_names` comes from dex-parser (std hasher); lookups only.
+fn debug_param_names_from_tables<S: BuildHasher>(
     parameter_names: &[Option<String>],
-    register_names: &HashMap<u32, String>,
+    register_names: &HashMap<u32, String, S>,
     param_base: u32,
     is_static: bool,
     param_types: &[String],
@@ -266,9 +357,9 @@ fn debug_param_names_from_tables(
 
 /// Names already used in an `if (` / `else if (` condition are in scope.
 /// Prevents `if (b == 10) { int b = b + 1; }` when `b` is a prior SSA version.
-fn mark_condition_idents_declared(condition: &str, declared: &mut HashSet<String>) {
+fn mark_condition_idents_declared(condition: &str, declared: &mut DetHashSet<String>) {
     let mut cur = String::new();
-    let flush = |cur: &mut String, declared: &mut HashSet<String>| {
+    let flush = |cur: &mut String, declared: &mut DetHashSet<String>| {
         if cur.is_empty() {
             return;
         }
@@ -323,15 +414,15 @@ pub struct Decompiler<'a> {
     mode: DecompilationMode,
     use_debug_names: bool,
     /// Registers that have φ-nodes in the current method (shared Java names across versions).
-    phi_regs: RefCell<HashSet<u32>>,
+    phi_regs: RefCell<DetHashSet<u32>>,
     /// Lazy index: class_name -> (dex_slot, ClassDef). Slot 0 = primary `dex`, 1+ = `extra_dexes`.
-    class_def_index: RefCell<Option<HashMap<String, (usize, ClassDef)>>>,
+    class_def_index: RefCell<Option<DetHashMap<String, (usize, ClassDef)>>>,
     /// Lazy index: enclosing_class -> (inner_class_name, constructor_param_count) for inner classes extending Thread.
-    inner_thread_index: RefCell<Option<HashMap<String, Vec<(String, usize)>>>>,
+    inner_thread_index: RefCell<Option<DetHashMap<String, Vec<(String, usize)>>>>,
     /// Lazy index: enclosing -> (inner, ctor_params, superclass_or_iface) for general anonymous inlining.
-    inner_anon_index: RefCell<Option<HashMap<String, Vec<(String, usize, String)>>>>,
+    inner_anon_index: RefCell<Option<DetHashMap<String, Vec<(String, usize, String)>>>>,
     /// Cache: inner_class_name -> decompiled run() body (before capture replacement). Avoids re-decompiling same run().
-    inner_run_body_cache: RefCell<HashMap<String, String>>,
+    inner_run_body_cache: RefCell<DetHashMap<String, String>>,
     /// Nesting depth for lambda body inlining (avoid recursive explode).
     lambda_inline_depth: RefCell<u32>,
     /// Literal → `Class.FIELD` replacements for the class currently being decompiled.
@@ -343,17 +434,128 @@ pub struct Decompiler<'a> {
     /// Extra DEXes for cross-DEX inner/anonymous class lookup (APK multi-dex).
     extra_dexes: Vec<&'a DexFile>,
     /// Register → Java type for the method currently being decompiled (cross-block enrichment).
-    method_reg_types: RefCell<Option<HashMap<u32, String>>>,
+    method_reg_types: RefCell<Option<DetHashMap<u32, String>>>,
     /// Register → preferred Java name for the method (stable across CFG blocks).
-    method_reg_names: RefCell<Option<HashMap<u32, String>>>,
+    method_reg_names: RefCell<Option<DetHashMap<u32, String>>>,
     /// Register → Java type from DEX debug locals (`float`, `double`, …).
-    method_debug_types: RefCell<Option<HashMap<u32, String>>>,
+    method_debug_types: RefCell<Option<DetHashMap<u32, String>>>,
     /// Return type of the method currently being decompiled (`long`, `double`, …).
     method_return_type: RefCell<Option<String>>,
     /// Lazy DEX-wide field owner→name→type index (amortized across methods / CFG blocks).
     field_type_index: RefCell<Option<FieldTypeIndex>>,
     /// Lazy DEX-wide method return-type index (amortized across methods / CFG blocks).
     method_return_index: RefCell<Option<MethodReturnIndex>>,
+    /// Def-use webs of the method being decompiled, keyed by its `insns_off`.
+    method_webs: RefCell<Option<(usize, DefWebs)>>,
+    /// Types of `method_webs` by local type inference, keyed by the same `insns_off`.
+    method_local_types: RefCell<Option<(usize, LocalTypes)>>,
+    /// Per-method name ownership, so two variables (webs) never share a synthetic name.
+    method_names: RefCell<MethodNameState>,
+    /// Invoke offset (as printed in IR comments) → declared Java return type.
+    call_return_types: RefCell<DetHashMap<u32, String>>,
+    /// The region tree being emitted carries its own `break` / `continue`
+    /// (`structure::build`): block ends are not turned into jumps.
+    explicit_jumps: Cell<bool>,
+}
+
+#[derive(Default)]
+struct MethodNameState {
+    insns_off: usize,
+    /// Reserved or claimed name → its single owner.
+    owners: DetHashMap<String, NameOwner>,
+    /// Web → its name in this method.
+    web_names: DetHashMap<DefKey, String>,
+    /// Web → Java type inferred for it in the emitted body.
+    web_types: DetHashMap<DefKey, String>,
+}
+
+/// Owner key for the SSA versions of a register that no web accounts for.
+const NO_WEB: u32 = u32::MAX - 1;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameOwner {
+    /// Method-wide name of a register: goes to the first of its webs that asks.
+    Reg(u32),
+    Web(DefKey),
+    /// `CATCH_VAR`: shared by every move-exception web, never claimed by another web.
+    Catch,
+}
+
+/// Variable of every emitted catch clause; the move-exception web takes this name.
+const CATCH_VAR: &str = "e";
+
+impl MethodNameState {
+    fn name_exception(&mut self, web: DefKey) -> String {
+        self.owners
+            .entry(CATCH_VAR.to_string())
+            .or_insert(NameOwner::Catch);
+        self.web_names.insert(web, CATCH_VAR.to_string());
+        CATCH_VAR.to_string()
+    }
+
+    /// A name belongs to one web (R1). A register's method-wide name goes to the first of
+    /// its webs that asks; any other web gets `name_rN`, then `name_rN_k`.
+    fn claim(&mut self, name: &str, web: DefKey) -> String {
+        let mut candidate = name.to_string();
+        let mut k = 0u32;
+        loop {
+            match self.owners.get(&candidate).copied() {
+                None => break,
+                Some(NameOwner::Web(owner)) if owner == web => return candidate,
+                Some(NameOwner::Reg(reg)) if reg == web.0 => break,
+                Some(_) => {}
+            }
+            candidate = if k == 0 {
+                format!("{}_r{}", name, web.0)
+            } else {
+                format!("{}_r{}_{}", name, web.0, k)
+            };
+            k += 1;
+        }
+        self.owners.insert(candidate.clone(), NameOwner::Web(web));
+        candidate
+    }
+}
+
+/// Definitions behind the SSA versions of the IR built from `seq`: version k of a register
+/// is its k-th IR definition in `seq`, version 0 the value read before the first one.
+struct VersionDefs<'w> {
+    webs: &'w DefWebs,
+    offsets: Vec<u32>,
+    defs_by_reg: DetHashMap<u32, Vec<u32>>,
+    /// `move-result` → the instruction it is folded into.
+    merged: DetHashMap<u32, u32>,
+}
+
+impl VersionDefs<'_> {
+    /// The IR printed for instruction `site` defines `vid`: its own definition, or the call
+    /// its `move-result` was folded into.
+    fn defined_at(&self, vid: VarId, site: u32) -> bool {
+        let def = vid
+            .ver
+            .checked_sub(1)
+            .and_then(|k| self.defs_by_reg.get(&vid.reg)?.get(k as usize).copied());
+        def.is_some_and(|d| d == site || self.merged.get(&d) == Some(&site))
+    }
+
+    fn defs(&self, vid: VarId) -> BTreeSet<u32> {
+        let defs = self.defs_by_reg.get(&vid.reg);
+        if vid.ver > 0 {
+            let def = defs.and_then(|d| d.get(vid.ver as usize - 1));
+            return def.map(|&off| BTreeSet::from([off])).unwrap_or_default();
+        }
+        let first_def = defs.and_then(|d| d.first().copied());
+        let probe = self
+            .offsets
+            .iter()
+            .copied()
+            .take_while(|off| first_def.is_none_or(|d| *off <= d))
+            .find(|off| self.webs.reads(*off).contains(&vid.reg))
+            .or_else(|| self.offsets.first().copied());
+        probe
+            .map(|off| self.webs.reaching(off, vid.reg))
+            .unwrap_or_default()
+    }
 }
 
 impl<'a> Decompiler<'a> {
@@ -368,11 +570,11 @@ impl<'a> Decompiler<'a> {
             rename_map: None,
             mode: DecompilationMode::Restructure,
             use_debug_names: true,
-            phi_regs: RefCell::new(HashSet::new()),
+            phi_regs: RefCell::new(DetHashSet::default()),
             class_def_index: RefCell::new(None),
             inner_thread_index: RefCell::new(None),
             inner_anon_index: RefCell::new(None),
-            inner_run_body_cache: RefCell::new(HashMap::new()),
+            inner_run_body_cache: RefCell::new(DetHashMap::default()),
             lambda_inline_depth: RefCell::new(0),
             const_field_reps: RefCell::new(Vec::new()),
             resource_reps,
@@ -384,6 +586,11 @@ impl<'a> Decompiler<'a> {
             method_return_type: RefCell::new(None),
             field_type_index: RefCell::new(None),
             method_return_index: RefCell::new(None),
+            method_webs: RefCell::new(None),
+            method_local_types: RefCell::new(None),
+            method_names: RefCell::new(MethodNameState::default()),
+            call_return_types: RefCell::new(DetHashMap::default()),
+            explicit_jumps: Cell::new(false),
         }
     }
 
@@ -400,11 +607,11 @@ impl<'a> Decompiler<'a> {
             rename_map: options.rename_map,
             mode: options.mode,
             use_debug_names: options.use_debug_names,
-            phi_regs: RefCell::new(HashSet::new()),
+            phi_regs: RefCell::new(DetHashSet::default()),
             class_def_index: RefCell::new(None),
             inner_thread_index: RefCell::new(None),
             inner_anon_index: RefCell::new(None),
-            inner_run_body_cache: RefCell::new(HashMap::new()),
+            inner_run_body_cache: RefCell::new(DetHashMap::default()),
             lambda_inline_depth: RefCell::new(0),
             const_field_reps: RefCell::new(Vec::new()),
             resource_reps,
@@ -416,6 +623,11 @@ impl<'a> Decompiler<'a> {
             method_return_type: RefCell::new(None),
             field_type_index: RefCell::new(None),
             method_return_index: RefCell::new(None),
+            method_webs: RefCell::new(None),
+            method_local_types: RefCell::new(None),
+            method_names: RefCell::new(MethodNameState::default()),
+            call_return_types: RefCell::new(DetHashMap::default()),
+            explicit_jumps: Cell::new(false),
         }
     }
 
@@ -439,32 +651,235 @@ impl<'a> Decompiler<'a> {
         }
     }
 
-    /// Type-infer for a method body, reusing cached field / return indexes.
+    /// Type-infer for a method body, reusing cached field / return indexes. With `seq`, the
+    /// instructions `stmts` come from, local type inference takes over from the heuristics.
     fn infer_types_for(
         &self,
         encoded: &EncodedMethod,
         code: &CodeItem,
         stmts: &[IrStmt],
-    ) -> HashMap<VarId, String> {
+        seq: Option<&[Instruction]>,
+    ) -> DetHashMap<VarId, String> {
         self.ensure_type_indexes();
         let fields = self.field_type_index.borrow();
         let returns = self.method_return_index.borrow();
-        infer_types_cached(
+        let mut types = infer_types_cached(
             self.dex,
             encoded,
             code,
             stmts,
             fields.as_ref().expect("field index"),
             returns.as_ref().expect("return index"),
-        )
+        );
+        // A call result is typed by the callee's signature (D2). Receiver-style targets
+        // (`v3.getSystemService`) lose the class, and the register-wide fallback would
+        // paint the type of another definition of the same register.
+        let declared = self.call_return_types.borrow();
+        if !declared.is_empty() {
+            for stmt in stmts {
+                let IrStmt::Assign {
+                    dst,
+                    rhs: IrExpr::Call { .. },
+                    comment: Some(comment),
+                } = stmt
+                else {
+                    continue;
+                };
+                let Some(ret) = comment_insn_offset(comment).and_then(|off| declared.get(&off))
+                else {
+                    continue;
+                };
+                let ty = call_result_type(ret, types.get(dst).map(|s| s.as_str()));
+                types.insert(*dst, ty);
+            }
+        }
+        if let Some(seq) = seq {
+            self.apply_local_types(&mut types, stmts, seq, code);
+        }
+        types
+    }
+
+    /// A version whose definitions all fall in webs of one resolved type takes that type;
+    /// registers with a debug type keep theirs.
+    fn apply_local_types(
+        &self,
+        types: &mut DetHashMap<VarId, String>,
+        stmts: &[IrStmt],
+        seq: &[Instruction],
+        code: &CodeItem,
+    ) {
+        let webs_slot = self.method_webs.borrow();
+        let local_slot = self.method_local_types.borrow();
+        let Some((webs_off, webs)) = webs_slot.as_ref() else {
+            return;
+        };
+        let Some((local_off, local)) = local_slot.as_ref() else {
+            return;
+        };
+        if *webs_off != code.insns_off || *local_off != code.insns_off {
+            return;
+        }
+        let debug = self.method_debug_types.borrow();
+        let versions = self.version_defs(webs, seq);
+        let insns_off = u32::try_from(code.insns_off).ok();
+        let sites: DetHashMap<VarId, u32> = stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                IrStmt::Assign {
+                    dst,
+                    comment: Some(comment),
+                    ..
+                } => Some((*dst, comment_insn_offset(comment)?.checked_sub(insns_off?)?)),
+                _ => None,
+            })
+            .collect();
+        let vids: BTreeSet<VarId> = stmts.iter().flat_map(type_infer::vars_in_stmt).collect();
+        for vid in vids {
+            if debug.as_ref().is_some_and(|d| d.contains_key(&vid.reg)) {
+                continue;
+            }
+            let traced = sites
+                .get(&vid)
+                .is_some_and(|&site| versions.defined_at(vid, site));
+            if vid.ver > 0 && !traced {
+                continue;
+            }
+            let defs = versions.defs(vid);
+            // A load left outside its cast does not have the cast type yet.
+            if defs.iter().any(|&def| local.is_cast_load(vid.reg, def)) {
+                continue;
+            }
+            let mut found = defs
+                .into_iter()
+                .map(|def| local.java_type(webs.web(vid.reg, def)));
+            let Some(Some(ty)) = found.next() else {
+                continue;
+            };
+            if found.all(|t| t.as_deref() == Some(ty.as_str())) {
+                types.insert(vid, ty);
+            }
+        }
+    }
+
+    /// Type local type inference gives every definition of `reg` reaching `off`.
+    fn local_type_at(
+        &self,
+        webs_off: usize,
+        webs: &DefWebs,
+        off: u32,
+        reg: u32,
+    ) -> Option<String> {
+        let local_slot = self.method_local_types.borrow();
+        let (local_off, local) = local_slot.as_ref()?;
+        if *local_off != webs_off || self.debug_type_for_reg(reg).is_some() {
+            return None;
+        }
+        let reaching = webs.reaching(off, reg);
+        let mut found = reaching
+            .into_iter()
+            .map(|def| local.java_type(webs.web(reg, def)));
+        let ty = found.next()??;
+        found
+            .all(|t| t.as_deref() == Some(ty.as_str()))
+            .then_some(ty)
+    }
+
+    /// Type local type inference gives the value `reg` receives at `def`, in the method
+    /// starting at `insns_off`.
+    fn local_def_type(&self, insns_off: usize, reg: u32, def: u32) -> Option<String> {
+        let webs_slot = self.method_webs.borrow();
+        let local_slot = self.method_local_types.borrow();
+        let (webs_off, webs) = webs_slot.as_ref()?;
+        let (local_off, local) = local_slot.as_ref()?;
+        if *webs_off != insns_off || *local_off != insns_off {
+            return None;
+        }
+        local.java_type(webs.web(reg, def))
+    }
+
+    /// Type local type inference gives the constant `instructions[idx]` writes to `reg`;
+    /// debug-typed registers keep their own rules.
+    fn local_const_type(
+        &self,
+        insns_off: usize,
+        reg: u32,
+        instructions: &[Instruction],
+        idx: usize,
+    ) -> Option<String> {
+        if self.debug_type_for_reg(reg).is_some() {
+            return None;
+        }
+        let def = instructions.get(idx)?.offset;
+        self.local_def_type(insns_off, reg, def)
+    }
+
+    /// `null`, `true` / `false` or a char literal for the constant `bits` defined at `def`,
+    /// from the type local type inference resolved; debug-typed registers keep the number.
+    fn int_literal_at(&self, insns_off: usize, reg: u32, def: u32, bits: &str) -> Option<String> {
+        if self.debug_type_for_reg(reg).is_some() {
+            return None;
+        }
+        let value = bits.trim().parse().ok()?;
+        let ty = self.local_def_type(insns_off, reg, def)?;
+        local_types::int_literal(value, &ty)
+    }
+
+    /// Java type `reg` holds just before `off`, read off the instructions defining it;
+    /// `None` unless every reaching definition gives the same one.
+    fn def_type_at(&self, instructions: &[Instruction], off: u32, reg: u32) -> Option<String> {
+        let webs_slot = self.method_webs.borrow();
+        let (webs_off, webs) = webs_slot.as_ref()?;
+        if let Some(ty) = self.local_type_at(*webs_off, webs, off, reg) {
+            return Some(ty);
+        }
+        let mut found: Option<String> = None;
+        for def in webs.reaching(off, reg) {
+            let idx = instructions
+                .binary_search_by_key(&def, |ins| ins.offset as u32)
+                .ok()?;
+            let ty = match instructions[idx].mnemonic() {
+                "array-length" | "cmpl-float" | "cmpg-float" | "cmpl-double" | "cmpg-double"
+                | "cmp-long" => "int".to_string(),
+                "instance-of" | "iget-boolean" | "sget-boolean" | "aget-boolean" => {
+                    "boolean".to_string()
+                }
+                "move-result" => {
+                    let invoke = &instructions[idx.checked_sub(1)?];
+                    if !invoke.mnemonic().starts_with("invoke-") {
+                        return None;
+                    }
+                    self.invoke_return_type(invoke.operands())?
+                }
+                _ => return None,
+            };
+            match &found {
+                Some(prev) if *prev != ty => return None,
+                _ => found = Some(ty),
+            }
+        }
+        found
+    }
+
+    /// Declared Java return type of an invoke's `method@N` operand (`None` for void).
+    fn invoke_return_type(&self, ops: &str) -> Option<String> {
+        let idx: u32 = ops
+            .rsplit(',')
+            .next()?
+            .trim()
+            .strip_prefix("method@")?
+            .parse()
+            .ok()?;
+        let info = self.dex.get_method_info(idx).ok()?;
+        let ret = java::descriptor_to_java(&info.return_type);
+        (ret != "void").then_some(ret)
     }
 
     /// Enrich per-block types from method-wide / debug maps, reusing the field index.
     fn enrich_types_for(
         &self,
-        type_map: &mut HashMap<VarId, String>,
-        reg_types: &HashMap<u32, String>,
-        debug_types: Option<&HashMap<u32, String>>,
+        type_map: &mut DetHashMap<VarId, String>,
+        reg_types: &DetHashMap<u32, String>,
+        debug_types: Option<&DetHashMap<u32, String>>,
         stmts: &[IrStmt],
     ) {
         self.ensure_type_indexes();
@@ -545,7 +960,7 @@ impl<'a> Decompiler<'a> {
         if self.class_def_index.borrow().is_some() {
             return Ok(());
         }
-        let mut map = HashMap::new();
+        let mut map = DetHashMap::default();
         let mut ingest = |slot: usize, dex: &DexFile| -> Result<()> {
             for class_def_result in dex.class_defs() {
                 let class_def =
@@ -580,7 +995,7 @@ impl<'a> Decompiler<'a> {
             return Ok(());
         }
         let thread_java = java::descriptor_to_java("Ljava/lang/Thread;");
-        let mut map: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        let mut map: DetHashMap<String, Vec<(String, usize)>> = DetHashMap::default();
         let mut ingest = |dex: &DexFile| -> Result<()> {
             for class_def_result in dex.class_defs() {
                 let class_def =
@@ -853,7 +1268,6 @@ impl<'a> Decompiler<'a> {
         progress: Option<&(dyn Fn(usize, usize, &str) + Sync)>,
     ) -> Result<()> {
         use rayon::prelude::*;
-        use std::collections::HashSet;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         if dexes.is_empty() {
@@ -865,7 +1279,7 @@ impl<'a> Decompiler<'a> {
 
         // (dex_index, ClassDef, class_name)
         let mut jobs: Vec<(usize, ClassDef, String)> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: DetHashSet<String> = DetHashSet::default();
         for (di, dex) in dexes.iter().enumerate() {
             let probe = Decompiler::with_options(dex, options.clone());
             for (class_def, class_name) in probe.collect_included_classes()? {
@@ -1083,7 +1497,7 @@ impl<'a> Decompiler<'a> {
                 .collect();
             *self.accessor_reps.borrow_mut() =
                 accessors::build_accessor_replacements(self.dex, &class_name, &methods);
-            let init_by_idx: HashMap<u32, &const_fields::StaticInit> =
+            let init_by_idx: DetHashMap<u32, &const_fields::StaticInit> =
                 static_inits.iter().map(|s| (s.field_idx, s)).collect();
 
             if is_enum {
@@ -1172,7 +1586,7 @@ impl<'a> Decompiler<'a> {
                     }
                 }
             }
-            let field_names: HashSet<String> = instance_fields
+            let field_names: DetHashSet<String> = instance_fields
                 .iter()
                 .map(|(_, _, name)| name.clone())
                 .collect();
@@ -1555,7 +1969,28 @@ impl<'a> Decompiler<'a> {
                 cached.clone()
             } else {
                 let code = self.dex.get_code_item(encoded.code_off).ok()?;
-                let b = self.decompile_method_body(&code, &encoded, None).ok()?;
+                // The lambda body is decompiled in the middle of the enclosing method:
+                // keep the enclosing method's per-register state.
+                let saved_types = self.method_reg_types.borrow_mut().take();
+                let saved_names = self.method_reg_names.borrow_mut().take();
+                let saved_debug = self.method_debug_types.borrow_mut().take();
+                let saved_return = self.method_return_type.borrow_mut().take();
+                let saved_phi = std::mem::take(&mut *self.phi_regs.borrow_mut());
+                let saved_webs = self.method_webs.borrow_mut().take();
+                let saved_method_names = std::mem::take(&mut *self.method_names.borrow_mut());
+                let saved_call_returns = std::mem::take(&mut *self.call_return_types.borrow_mut());
+                let saved_explicit = self.explicit_jumps.replace(false);
+                let b = self.decompile_method_body(&code, &encoded, None).ok();
+                self.explicit_jumps.set(saved_explicit);
+                *self.method_reg_types.borrow_mut() = saved_types;
+                *self.method_reg_names.borrow_mut() = saved_names;
+                *self.method_debug_types.borrow_mut() = saved_debug;
+                *self.method_return_type.borrow_mut() = saved_return;
+                *self.phi_regs.borrow_mut() = saved_phi;
+                *self.method_webs.borrow_mut() = saved_webs;
+                *self.method_names.borrow_mut() = saved_method_names;
+                *self.call_return_types.borrow_mut() = saved_call_returns;
+                let b = b?;
                 cache.insert(cache_key, b.clone());
                 b
             }
@@ -1835,6 +2270,9 @@ impl<'a> Decompiler<'a> {
         if instructions.is_empty() {
             return Ok("        // (no instructions)\n".to_string());
         }
+        if *self.lambda_inline_depth.borrow() == 0 {
+            self.call_return_types.borrow_mut().clear();
+        }
 
         *self.method_return_type.borrow_mut() = self
             .dex
@@ -1862,7 +2300,13 @@ impl<'a> Decompiler<'a> {
             format_condition(ins.mnemonic(), &resolved)
         };
         let mut cfg = MethodCfg::build(&instructions, insns_bytes, base_offset, &condition_for);
-        Self::fold_constants_into_conditions(&mut cfg, &instructions, Some(self.dex));
+        // Folding needs the entry definitions of parameters and the catch edges (B2).
+        self.prepare_def_webs(&cfg, &instructions, code, encoded);
+        {
+            let webs = self.method_webs.borrow();
+            let webs = webs.as_ref().map(|(_, w)| w);
+            Self::fold_constants_into_conditions(&mut cfg, &instructions, Some(self.dex), webs);
+        }
         self.fold_field_reads_into_conditions(&mut cfg, &instructions);
         self.fold_aget_into_switch_conditions(&mut cfg, &instructions);
         self.prepare_method_reg_types(
@@ -1873,6 +2317,7 @@ impl<'a> Decompiler<'a> {
             insns_bytes,
             class_name,
         );
+        self.seed_name_owners(encoded, code, class_name);
         self.rename_condition_registers(&mut cfg, &instructions, encoded, code);
         self.rename_switch_conditions(&mut cfg);
         if cfg.block_count() == 0 {
@@ -1925,10 +2370,11 @@ impl<'a> Decompiler<'a> {
 
         if out.is_none() {
             let mut fallback = String::new();
-            let mut declared = HashSet::new();
+            let mut declared = DetHashSet::default();
             self.seed_declared_from_params(&mut declared, code, encoded);
-            if let Some(root) = build_regions(&cfg, cfg.entry) {
-                self.emit_region(
+            if let Some((root, explicit)) = whole_method_root(&cfg, code.tries_size == 0) {
+                let saved = self.explicit_jumps.replace(explicit);
+                let emitted = self.emit_region(
                     &root,
                     &cfg,
                     &instructions,
@@ -1943,7 +2389,9 @@ impl<'a> Decompiler<'a> {
                     Some(&global_used_regs),
                     None,
                     class_name,
-                )?;
+                );
+                self.explicit_jumps.set(saved);
+                emitted?;
             }
             out = Some(fallback);
         }
@@ -1954,7 +2402,8 @@ impl<'a> Decompiler<'a> {
             {
                 eprintln!("=== PRE-SIMPLIFY bfs ===\n{out}\n=== END PRE-SIMPLIFY ===");
             }
-            out = simplify::simplify_method_body(&out, is_constructor);
+            let webs = self.simplify_webs(encoded, code);
+            out = simplify::simplify_method_body_with_webs(&out, is_constructor, &webs);
             out = self.wrap_caught_postinc_div(&out, &instructions, encoded, code);
             out = simplify::restore_string_switch(&out);
             if let Some(enclosing) = class_name {
@@ -2161,7 +2610,7 @@ impl<'a> Decompiler<'a> {
             return Ok(None);
         }
         let indent = first_line.len() - first_line.trim_start().len();
-        let indent_str: String = first_line.chars().take(indent).collect();
+        let indent_str = first_line[..indent].to_string();
         let mut body = {
             let mut cache = self.inner_run_body_cache.borrow_mut();
             let cache_key = format!("{inner_class_name}#{sam_name}");
@@ -2222,7 +2671,7 @@ impl<'a> Decompiler<'a> {
         if self.inner_anon_index.borrow().is_some() {
             return Ok(());
         }
-        let mut map: HashMap<String, Vec<(String, usize, String)>> = HashMap::new();
+        let mut map: DetHashMap<String, Vec<(String, usize, String)>> = DetHashMap::default();
         let mut ingest = |dex: &DexFile| -> Result<()> {
             for class_def_result in dex.class_defs() {
                 let class_def =
@@ -2294,7 +2743,7 @@ impl<'a> Decompiler<'a> {
         first_line: &str,
     ) -> Result<Option<(String, usize)>> {
         let indent = first_line.len() - first_line.trim_start().len();
-        let indent_str: String = first_line.chars().take(indent).collect();
+        let indent_str = first_line[..indent].to_string();
         let Some(inner_class_name) = self.find_inner_thread_class(enclosing_class, args.len())?
         else {
             return Ok(None);
@@ -2478,7 +2927,7 @@ impl<'a> Decompiler<'a> {
         instructions: &[Instruction],
         code: &CodeItem,
         encoded: &EncodedMethod,
-        global_used_regs: &HashSet<u32>,
+        global_used_regs: &DetHashSet<u32>,
         class_name: Option<&str>,
     ) -> Result<String> {
         let data = self.dex.data.as_ref();
@@ -2501,7 +2950,7 @@ impl<'a> Decompiler<'a> {
         pairs.sort_by_key(|(t, _)| t.start_addr);
         let code_end_byte = (code.insns_size as u32) * 2;
 
-        let blocks_overlapping = |lo: u32, hi: u32| -> HashSet<BlockId> {
+        let blocks_overlapping = |lo: u32, hi: u32| -> DetHashSet<BlockId> {
             cfg.blocks
                 .iter()
                 .enumerate()
@@ -2518,7 +2967,7 @@ impl<'a> Decompiler<'a> {
         };
 
         let mut full = String::new();
-        let mut declared = HashSet::new();
+        let mut declared = DetHashSet::default();
         self.seed_declared_from_params(&mut declared, code, encoded);
         let mut cursor: u32 = 0;
 
@@ -2842,8 +3291,8 @@ impl<'a> Decompiler<'a> {
                 }
                 writeln!(
                     full,
-                    "            }} catch ({} e) {{",
-                    typed_handlers[re_idx].type_name
+                    "            }} catch ({} {}) {{",
+                    typed_handlers[re_idx].type_name, CATCH_VAR
                 )
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 full.push_str(&typed_handlers[re_idx].body);
@@ -2854,8 +3303,8 @@ impl<'a> Decompiler<'a> {
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 writeln!(
                     full,
-                    "        }} catch ({} e) {{",
-                    typed_handlers[ex_idx].type_name
+                    "        }} catch ({} {}) {{",
+                    typed_handlers[ex_idx].type_name, CATCH_VAR
                 )
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 full.push_str(&typed_handlers[ex_idx].body);
@@ -2871,7 +3320,7 @@ impl<'a> Decompiler<'a> {
                 }
 
                 for h in &typed_handlers {
-                    writeln!(full, "        }} catch ({} e) {{", h.type_name)
+                    writeln!(full, "        }} catch ({} {}) {{", h.type_name, CATCH_VAR)
                         .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     full.push_str(&h.body);
                     if !h.body.ends_with('\n') {
@@ -2915,7 +3364,7 @@ impl<'a> Decompiler<'a> {
                             )?;
                         }
                         let cleaned = strip_finally_exception_noise(&handler_body);
-                        writeln!(full, "        }} catch (Throwable e) {{")
+                        writeln!(full, "        }} catch (Throwable {}) {{", CATCH_VAR)
                             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                         full.push_str(&cleaned);
                         if !cleaned.ends_with('\n') {
@@ -3001,7 +3450,7 @@ impl<'a> Decompiler<'a> {
                 .get_type(type_addr.type_idx)
                 .map_err(|e| DexDecompilerError::Parse(e.to_string()))
                 .map(|d| shorten_java_names(&java::descriptor_to_java(&d)))?;
-            writeln!(out, "        }} catch ({} e) {{", type_name)
+            writeln!(out, "        }} catch ({} {}) {{", type_name, CATCH_VAR)
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             writeln!(
                 out,
@@ -3023,7 +3472,7 @@ impl<'a> Decompiler<'a> {
                 )
                 .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             } else {
-                writeln!(out, "        }} catch (Throwable e) {{")
+                writeln!(out, "        }} catch (Throwable {}) {{", CATCH_VAR)
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 writeln!(
                     out,
@@ -3048,7 +3497,7 @@ impl<'a> Decompiler<'a> {
         class_name: Option<&str>,
     ) -> Result<String> {
         let code_insns = code.insns_slice(&*self.dex.data);
-        let mut block_ir: HashMap<BlockId, Vec<IrStmt>> = HashMap::new();
+        let mut block_ir: DetHashMap<BlockId, Vec<IrStmt>> = DetHashMap::default();
         for bid in 0..cfg.block_count() {
             let seq = self.block_instruction_seq(cfg, instructions, bid, None, false, None);
             let stmts =
@@ -3064,7 +3513,7 @@ impl<'a> Decompiler<'a> {
         strip_phis(&mut block_ir);
 
         let mut out = String::new();
-        let mut declared = HashSet::new();
+        let mut declared = DetHashSet::default();
         self.seed_declared_from_params(&mut declared, code, encoded);
         let global_used_regs = self.method_used_regs(cfg, instructions, code.insns_off, code_insns);
         for bid in 0..cfg.block_count() {
@@ -3074,7 +3523,8 @@ impl<'a> Decompiler<'a> {
             let stmts = block_ir.remove(&bid).unwrap_or_default();
             let stmts = CopyPropPass.run(stmts);
             let stmts = run_dead_assign_with_used_regs(stmts, &global_used_regs);
-            let type_map = self.infer_types_for(encoded, code, &stmts);
+            // φ-based versions: not the per-block numbering local types map from.
+            let type_map = self.infer_types_for(encoded, code, &stmts, None);
             let registers_size = code.registers_size as u32;
             let ins_size = code.ins_size as u32;
             let is_static = (encoded.access_flags & 0x8) != 0;
@@ -3105,7 +3555,7 @@ impl<'a> Decompiler<'a> {
         _encoded: &EncodedMethod,
     ) {
         let code_insns = code.insns_slice(&*self.dex.data);
-        let mut block_ir: HashMap<BlockId, Vec<IrStmt>> = HashMap::new();
+        let mut block_ir: DetHashMap<BlockId, Vec<IrStmt>> = DetHashMap::default();
         for bid in 0..cfg.block_count() {
             let seq = self.block_instruction_seq(cfg, instructions, bid, None, false, None);
             let Ok(stmts) =
@@ -3124,18 +3574,20 @@ impl<'a> Decompiler<'a> {
     /// Share one Java name across SSA versions of φ-web registers **only when types match**.
     fn apply_phi_register_names(
         &self,
-        name_map: &mut HashMap<VarId, String>,
-        type_map: &HashMap<VarId, String>,
+        name_map: &mut DetHashMap<VarId, String>,
+        type_map: &DetHashMap<VarId, String>,
     ) {
         let phi_regs = self.phi_regs.borrow();
         if phi_regs.is_empty() {
             return;
         }
-        let vids: Vec<VarId> = name_map
+        let mut vids: Vec<VarId> = name_map
             .keys()
             .copied()
             .filter(|v| phi_regs.contains(&v.reg))
             .collect();
+        // Pairs are merged one after another: the order decides which name spreads.
+        vids.sort();
         for i in 0..vids.len() {
             for j in (i + 1)..vids.len() {
                 let a = vids[i];
@@ -3182,7 +3634,7 @@ impl<'a> Decompiler<'a> {
         let mut out = String::new();
         let stmts = self.instructions_to_ir(instructions, base_off, code_insns, None)?;
         let stmts = self.default_pass_runner().run(stmts);
-        let type_map = self.infer_types_for(encoded, code, &stmts);
+        let type_map = self.infer_types_for(encoded, code, &stmts, Some(instructions));
         let registers_size = code.registers_size as u32;
         let ins_size = code.ins_size as u32;
         let is_static = (encoded.access_flags & 0x8) != 0;
@@ -3191,7 +3643,7 @@ impl<'a> Decompiler<'a> {
         self.apply_debug_names_to_name_map(&mut name_map, &type_map, code, encoded);
         self.apply_signature_param_names(&mut name_map, encoded, code);
         self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
-        let mut declared = HashSet::new();
+        let mut declared = DetHashSet::default();
         for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), &mut declared) {
             if !line.is_empty() {
                 writeln!(&mut out, "        {}", line)
@@ -3206,7 +3658,8 @@ impl<'a> Decompiler<'a> {
                 .get_method_info(encoded.method_idx)
                 .map(|info| info.name == "<init>")
                 .unwrap_or(false);
-            out = simplify::simplify_method_body(&out, is_constructor);
+            let webs = self.simplify_webs(encoded, code);
+            out = simplify::simplify_method_body_with_webs(&out, is_constructor, &webs);
             out = simplify::restore_string_switch(&out);
             if let Some(enclosing) = class_name {
                 out = self.inline_anonymous_classes(&out, enclosing)?;
@@ -3260,8 +3713,8 @@ impl<'a> Decompiler<'a> {
         indent: usize,
         skip_goto_to: Option<BlockId>,
         break_target: Option<BlockId>,
-        declared: &mut HashSet<String>,
-        global_used_regs: Option<&HashSet<u32>>,
+        declared: &mut DetHashSet<String>,
+        global_used_regs: Option<&DetHashSet<u32>>,
         emit_range: Option<(u32, u32)>,
         class_name: Option<&str>,
     ) -> Result<bool> {
@@ -3444,6 +3897,7 @@ impl<'a> Decompiler<'a> {
                             let else_empty = region_is_empty_with_cfg(else_branch, cfg);
                             if then_empty
                                 && !else_empty
+                                && !self.explicit_jumps.get()
                                 && skip_goto_to.is_some()
                                 && break_target == Some(*branch_target)
                             {
@@ -3584,10 +4038,14 @@ impl<'a> Decompiler<'a> {
                     } else {
                         (condition.clone(), then_branch, else_branch)
                     };
+                // With explicit jumps, a block's `goto` never prints `break;`.
+                let implicit_break = |r: &Region| {
+                    !self.explicit_jumps.get() && region::region_is_loop_break(r, cfg, break_target)
+                };
                 let then_empty_after = region_is_empty_with_cfg(then_branch, cfg)
-                    && !region::region_is_loop_break(then_branch, cfg, break_target);
+                    && !implicit_break(then_branch.as_ref());
                 let else_empty_after = region_is_empty_with_cfg(else_branch, cfg)
-                    && !region::region_is_loop_break(else_branch, cfg, break_target);
+                    && !implicit_break(else_branch.as_ref());
                 if then_empty_after && !else_empty_after {
                     let neg = negate_condition(&condition);
                     mark_condition_idents_declared(&neg, declared);
@@ -4162,7 +4620,12 @@ impl<'a> Decompiler<'a> {
                             || (*default_case != Some(*value)
                                 && region::region_contains_block(default, t)))
                     });
-                    if !emitted_break && !body_ends_with_exit(out) && !falls_through {
+                    // Explicit-jump arms already end in their own jump or exit.
+                    if !emitted_break
+                        && !self.explicit_jumps.get()
+                        && !body_ends_with_exit(out)
+                        && !falls_through
+                    {
                         writeln!(out, "{}    break;", ind)
                             .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                     }
@@ -4191,6 +4654,70 @@ impl<'a> Decompiler<'a> {
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
                 Ok(false)
             }
+            Region::Labeled { label, body } => {
+                if matches!(body.as_ref(), Region::Loop { .. }) {
+                    // The label goes on the loop statement itself.
+                    let mut buf = String::new();
+                    self.emit_region(
+                        body,
+                        cfg,
+                        instructions,
+                        base_off,
+                        encoded,
+                        code,
+                        &mut buf,
+                        indent,
+                        skip_goto_to,
+                        break_target,
+                        declared,
+                        global_used_regs,
+                        emit_range,
+                        class_name,
+                    )?;
+                    if let Some(at) = buf.find(|c: char| !c.is_whitespace()) {
+                        buf.insert_str(at, &format!("{label}: "));
+                    }
+                    out.push_str(&buf);
+                } else {
+                    writeln!(out, "{}{}: {{", ind, label)
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                    self.emit_region(
+                        body,
+                        cfg,
+                        instructions,
+                        base_off,
+                        encoded,
+                        code,
+                        out,
+                        indent + 1,
+                        skip_goto_to,
+                        break_target,
+                        declared,
+                        global_used_regs,
+                        emit_range,
+                        class_name,
+                    )?;
+                    writeln!(out, "{}}}", ind)
+                        .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                }
+                Ok(false)
+            }
+            Region::Break { label } => {
+                match label {
+                    Some(l) => writeln!(out, "{}break {};", ind, l),
+                    None => writeln!(out, "{}break;", ind),
+                }
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                Ok(true)
+            }
+            Region::Continue { label } => {
+                match label {
+                    Some(l) => writeln!(out, "{}continue {};", ind, l),
+                    None => writeln!(out, "{}continue;", ind),
+                }
+                .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
+                Ok(true)
+            }
         }
     }
 
@@ -4206,12 +4733,15 @@ impl<'a> Decompiler<'a> {
     /// branch as a block start, so `const/16 v2, 100; if-ge v1, v2` often lands in
     /// two blocks (`[const]` → `[if-ge]`). Without this, loop bounds become undefined
     /// temps (`while (i < i2)`).
+    /// `webs`: the method's def-use webs (parameter entry definitions, catch edges). When
+    /// absent, webs are built from `cfg` alone.
     fn fold_constants_into_conditions(
         cfg: &mut MethodCfg,
         instructions: &[Instruction],
         dex: Option<&DexFile>,
+        webs: Option<&DefWebs>,
     ) {
-        let mut mutated = HashSet::new();
+        let mut mutated = DetHashSet::default();
         for ins in instructions {
             let m = ins.mnemonic();
             if matches!(
@@ -4268,13 +4798,40 @@ impl<'a> Decompiler<'a> {
                 offs
             })
             .collect();
-        let mut folded: HashSet<u32> = HashSet::new();
+        // A definition is substituted only if it is the sole definition reaching the
+        // point that consumes it, and dropped only if that is its sole use (D1, D6).
+        let local_webs;
+        let webs = match webs {
+            Some(w) => w,
+            None => {
+                local_webs = DefWebs::build(cfg, instructions, &[], &[]);
+                &local_webs
+            }
+        };
+        let mut folded: DetHashSet<u32> = DetHashSet::default();
         for (bid, block) in cfg.blocks.iter_mut().enumerate() {
             if let BlockEnd::Conditional {
                 ref mut condition, ..
             } = block.end
             {
                 let offs = block.instruction_offsets.clone();
+                let Some(&branch_off) = offs.last() else {
+                    continue;
+                };
+                // Register named in the condition → offset where its value is read.
+                let mut consumer: DetHashMap<u32, u32> = webs
+                    .reads(branch_off)
+                    .iter()
+                    .map(|&reg| (reg, branch_off))
+                    .collect();
+                let only_def_reaching = |consumer: &DetHashMap<u32, u32>, reg: u32, def: u32| {
+                    consumer
+                        .get(&reg)
+                        .is_some_and(|&at| webs.reaching(at, reg) == BTreeSet::from([def]))
+                };
+                let same_value = |reg: u32, def: u32| {
+                    webs.reaching(def, reg) == webs.reaching(branch_off, reg)
+                };
                 // Same-block materialization before the if (skip the if itself).
                 let same_block_foldable: Vec<u32> = if offs.len() >= 2 {
                     offs[..offs.len() - 1].to_vec()
@@ -4304,12 +4861,18 @@ impl<'a> Decompiler<'a> {
                                 if is_loop && mutated.contains(&reg) {
                                     continue;
                                 }
-                                let mut map = HashMap::new();
+                                if !only_def_reaching(&consumer, reg, off) {
+                                    continue;
+                                }
+                                let mut map = DetHashMap::default();
                                 map.insert(reg, parts[1].to_string());
                                 let next = replace_register_names(condition, &map);
                                 if next != *condition {
                                     *condition = next;
-                                    folded.insert(off);
+                                    consumer.remove(&reg);
+                                    if webs.use_count(reg, off) == 1 {
+                                        folded.insert(off);
+                                    }
                                 }
                             }
                         }
@@ -4329,12 +4892,19 @@ impl<'a> Decompiler<'a> {
                             if is_loop && mutated.contains(&dst) {
                                 continue;
                             }
-                            let mut map = HashMap::new();
+                            if !only_def_reaching(&consumer, dst, off) || !same_value(src, off) {
+                                continue;
+                            }
+                            let mut map = DetHashMap::default();
                             map.insert(dst, format!("v{}", src));
                             let next = replace_register_names(condition, &map);
                             if next != *condition {
                                 *condition = next;
-                                folded.insert(off);
+                                consumer.remove(&dst);
+                                consumer.insert(src, off);
+                                if webs.use_count(dst, off) == 1 {
+                                    folded.insert(off);
+                                }
                             }
                         }
                     } else if m == "instance-of" {
@@ -4345,19 +4915,32 @@ impl<'a> Decompiler<'a> {
                                 if is_loop && mutated.contains(&dst) {
                                     continue;
                                 }
-                                let src = parse_one_reg(parts[1])
+                                if !only_def_reaching(&consumer, dst, off) {
+                                    continue;
+                                }
+                                let src_reg = parse_one_reg(parts[1]);
+                                if src_reg.is_some_and(|s| !same_value(s, off)) {
+                                    continue;
+                                }
+                                let src = src_reg
                                     .map(|s| format!("v{}", s))
                                     .unwrap_or_else(|| parts[1].to_string());
                                 let ty = dex
                                     .map(|d| resolve_one(d, parts[2]))
                                     .unwrap_or_else(|| parts[2].to_string());
                                 let expr = format!("{} instanceof {}", src, ty);
-                                let mut map = HashMap::new();
+                                let mut map = DetHashMap::default();
                                 map.insert(dst, expr);
                                 let next = replace_register_names(condition, &map);
                                 if next != *condition {
                                     *condition = next;
-                                    folded.insert(off);
+                                    consumer.remove(&dst);
+                                    if let Some(s) = src_reg {
+                                        consumer.insert(s, off);
+                                    }
+                                    if webs.use_count(dst, off) == 1 {
+                                        folded.insert(off);
+                                    }
                                 }
                             }
                         }
@@ -4365,7 +4948,7 @@ impl<'a> Decompiler<'a> {
                 }
             }
         }
-        cfg.folded_const_offsets = folded;
+        cfg.folded_const_offsets = folded.into_iter().collect();
     }
 
     /// `iget v0, this, field; if-lez v0` → condition `this.field`, and the same for
@@ -4391,7 +4974,7 @@ impl<'a> Decompiler<'a> {
             let Some((iget_off, expr)) = self.field_expr_reaching(instructions, probe, reg) else {
                 continue;
             };
-            let mut map = HashMap::new();
+            let mut map = DetHashMap::default();
             map.insert(reg, expr);
             match &mut block.end {
                 BlockEnd::Conditional { condition, .. } | BlockEnd::Switch { condition, .. } => {
@@ -4508,7 +5091,7 @@ impl<'a> Decompiler<'a> {
             // Keep index as a register so `idx = e.ordinal()` stays in the body
             // (fixture tests look for `ordinal()`; full enum restore can still run later).
             let expr = format!("v{arr}[v{idx}]");
-            let mut map = HashMap::new();
+            let mut map = DetHashMap::default();
             map.insert(reg, expr.clone());
             let next = replace_register_names(condition, &map);
             if next != *condition {
@@ -4528,9 +5111,20 @@ impl<'a> Decompiler<'a> {
             return;
         }
         for block in &mut cfg.blocks {
+            let Some(&switch_off) = block.instruction_offsets.last() else {
+                continue;
+            };
             if let BlockEnd::Switch { condition, .. } = &mut block.end {
-                // Already folded to `arr[idx]` / `arr[vN.ordinal()]` — rename regs inside.
-                *condition = replace_register_names(condition, &names);
+                // Already folded to `arr[idx]` / `arr[vN.ordinal()]` — rename regs inside,
+                // each with the name of the web it holds at the switch.
+                let mut local = names.clone();
+                let mentioned = regs_mentioned_in_operands(condition);
+                for reg in self.regs_in_def_order(switch_off, mentioned) {
+                    if let Some(name) = local.get_mut(&reg) {
+                        *name = self.web_name_at(switch_off, reg, name);
+                    }
+                }
+                *condition = replace_register_names(condition, &local);
             }
         }
     }
@@ -4549,8 +5143,8 @@ impl<'a> Decompiler<'a> {
         indent: usize,
         skip_goto_to: Option<BlockId>,
         break_target: Option<BlockId>,
-        declared: &mut HashSet<String>,
-        global_used_regs: Option<&HashSet<u32>>,
+        declared: &mut DetHashSet<String>,
+        global_used_regs: Option<&DetHashSet<u32>>,
         emit_range: Option<(u32, u32)>,
         class_name: Option<&str>,
     ) -> Result<()> {
@@ -4634,7 +5228,7 @@ impl<'a> Decompiler<'a> {
     fn predecessor_blocks_for_condition_naming(cfg: &MethodCfg, target: BlockId) -> Vec<BlockId> {
         let mut out = Vec::new();
         let mut frontier = vec![target];
-        let mut seen = HashSet::from([target]);
+        let mut seen = DetHashSet::from_iter([target]);
         for _ in 0..2 {
             let mut next = Vec::new();
             for &t in &frontier {
@@ -4714,8 +5308,8 @@ impl<'a> Decompiler<'a> {
             // Include fall-through predecessor blocks so `invoke; move-result` + `if-nez`
             // in adjacent blocks still names the tested value as `obj1`, not stale `obj0`.
             let seq = self.block_instruction_seq_for_condition_naming(cfg, instructions, block_id);
-            let mut local_names: HashMap<u32, String> = HashMap::new();
-            let mut local_types: HashMap<u32, String> = HashMap::new();
+            let mut local_names: DetHashMap<u32, String> = DetHashMap::default();
+            let mut local_types: DetHashMap<u32, String> = DetHashMap::default();
             if !seq.is_empty() {
                 let stmts = self
                     .instructions_to_ir(&seq, base_off, code_insns, Some(instructions))
@@ -4728,14 +5322,14 @@ impl<'a> Decompiler<'a> {
                 runner.add(ExprSimplifyPass);
                 runner.add(InlineFilledArrayPass);
                 let stmts = runner.run(stmts);
-                let types = self.infer_types_for(encoded, code, &stmts);
+                let types = self.infer_types_for(encoded, code, &stmts, Some(seq.as_slice()));
                 let mut name_map =
                     build_var_names_with_regs(&stmts, &types, registers_size, ins_size, is_static);
                 self.apply_debug_names_to_name_map(&mut name_map, &types, code, encoded);
                 self.apply_signature_param_names(&mut name_map, encoded, code);
 
                 // Highest SSA version per register in this block = value reaching the condition.
-                let mut best_ver: HashMap<u32, u32> = HashMap::new();
+                let mut best_ver: DetHashMap<u32, u32> = DetHashMap::default();
                 for (vid, name) in &name_map {
                     let prev = best_ver.get(&vid.reg).copied().unwrap_or(0);
                     if !local_names.contains_key(&vid.reg) || vid.ver >= prev {
@@ -4809,6 +5403,42 @@ impl<'a> Decompiler<'a> {
                 }
             }
 
+            // Same per-web names as the emitted body (D1, D5, R1).
+            if let Some(&branch_off) = cfg.blocks[block_id].instruction_offsets.last() {
+                // The tested value's type comes from its definitions, not from the register.
+                let tested: Vec<u32> = self
+                    .method_webs
+                    .borrow()
+                    .as_ref()
+                    .map(|(_, webs)| webs.reads(branch_off).to_vec())
+                    .unwrap_or_default();
+                for reg in tested {
+                    if let Some(ty) = self.def_type_at(instructions, branch_off, reg) {
+                        local_types.insert(reg, ty);
+                        if let Some(name) = merged.get(&reg) {
+                            local_names.entry(reg).or_insert_with(|| name.clone());
+                        }
+                    }
+                }
+                self.apply_condition_web_names(&mut merged, branch_off, &local_types, encoded, code);
+                let mentioned = match &cfg.blocks[block_id].end {
+                    BlockEnd::Conditional { condition, .. } => {
+                        regs_mentioned_in_operands(condition)
+                    }
+                    _ => Vec::new(),
+                };
+                for reg in self.regs_in_def_order(branch_off, mentioned) {
+                    if let Some(name) = merged.get_mut(&reg) {
+                        *name = self.web_name_at(branch_off, reg, name);
+                    }
+                }
+            }
+            for (reg, name) in local_names.iter_mut() {
+                if let Some(merged_name) = merged.get(reg) {
+                    *name = merged_name.clone();
+                }
+            }
+
             if let BlockEnd::Conditional {
                 ref mut condition, ..
             } = cfg.blocks[block_id].end
@@ -4828,7 +5458,7 @@ impl<'a> Decompiler<'a> {
         instructions: &[Instruction],
         base_off: usize,
         code_insns: &[u8],
-    ) -> HashSet<u32> {
+    ) -> DetHashSet<u32> {
         let mut runner = PassRunner::new();
         runner.add(InvokeChainPass);
         runner.add(SsaRenamePass);
@@ -4866,7 +5496,7 @@ impl<'a> Decompiler<'a> {
             *self.method_debug_types.borrow_mut() = None;
             return;
         };
-        let mut map = HashMap::new();
+        let mut map = DetHashMap::default();
         for (reg, desc) in &dbg.register_types {
             let java = java::descriptor_to_java(desc);
             if !java.is_empty() {
@@ -4906,9 +5536,9 @@ impl<'a> Decompiler<'a> {
         runner.add(ExprSimplifyPass);
         runner.add(InlineFilledArrayPass);
         let stmts = runner.run(stmts);
-        let types = self.infer_types_for(encoded, code, &stmts);
-        let mut by_reg: HashMap<u32, String> = HashMap::new();
-        let mut ver_seen: HashMap<u32, u32> = HashMap::new();
+        let types = self.infer_types_for(encoded, code, &stmts, Some(instructions));
+        let mut by_reg: DetHashMap<u32, String> = DetHashMap::default();
+        let mut ver_seen: DetHashMap<u32, u32> = DetHashMap::default();
         for (vid, ty) in &types {
             let prev_ver = ver_seen.get(&vid.reg).copied().unwrap_or(0);
             let replace = match by_reg.get(&vid.reg) {
@@ -4937,15 +5567,27 @@ impl<'a> Decompiler<'a> {
 
         // One stable display name per register, preferring names whose SSA type matches the
         // method-level type (so `permissions` wins over a prior string temp on the same reg).
-        let mut names_by_reg: HashMap<u32, String> = HashMap::new();
-        let mut used_names: HashSet<String> = HashSet::new();
+        let mut names_by_reg: DetHashMap<u32, String> = DetHashMap::default();
+        let mut used_names: DetHashSet<String> = DetHashSet::default();
         let mut regs: Vec<u32> = name_map.keys().map(|v| v.reg).collect();
         regs.sort_unstable();
         regs.dedup();
+        // The `_N` counter below follows the bytecode: first definition address, then register.
+        let mut first_def: DetHashMap<u32, u32> = DetHashMap::default();
+        for ins in instructions {
+            let (_, writes) = read_write::instruction_reads_writes(ins.mnemonic(), ins.operands());
+            for w in writes {
+                first_def.entry(w).or_insert(ins.offset as u32);
+            }
+        }
+        regs.sort_by_key(|reg| (first_def.get(reg).copied().unwrap_or(ENTRY_DEF), *reg));
+        // Equal scores: the smallest version wins.
+        let mut entries: Vec<(&VarId, &String)> = name_map.iter().collect();
+        entries.sort();
         for reg in regs {
             let method_ty = by_reg.get(&reg).map(|s| s.as_str());
             let mut best: Option<(i32, String)> = None;
-            for (vid, name) in &name_map {
+            for &(vid, name) in &entries {
                 if vid.reg != reg {
                     continue;
                 }
@@ -5008,19 +5650,632 @@ impl<'a> Decompiler<'a> {
         }
         if self.use_debug_names && code.debug_info_off != 0 {
             if let Ok(dbg) = self.dex.debug_info_for_code(code) {
-                let param_base = registers_size.saturating_sub(ins_size);
-                let param_name_offset = if is_static { 0usize } else { 1usize };
+                let param_regs = self.declared_param_registers(encoded, code);
                 for (i, pname) in dbg.parameter_names.iter().enumerate() {
                     let Some(name) = pname.as_ref() else { continue };
                     if !is_java_ident(name) {
                         continue;
                     }
-                    let reg = param_base + param_name_offset as u32 + i as u32;
+                    let Some(&reg) = param_regs.get(i) else {
+                        continue;
+                    };
                     names_by_reg.insert(reg, name.clone());
                 }
             }
         }
         *self.method_reg_names.borrow_mut() = Some(names_by_reg);
+    }
+
+    /// Method-wide def-use webs; catch handlers are reached from their protected blocks.
+    fn prepare_def_webs(
+        &self,
+        cfg: &MethodCfg,
+        instructions: &[Instruction],
+        code: &CodeItem,
+        encoded: &EncodedMethod,
+    ) {
+        let mut cfg = cfg.clone();
+        let mut exceptional_edges = Vec::new();
+        let mut tries = Vec::new();
+        let mut catch_types: DetHashMap<u32, String> = DetHashMap::default();
+        let mut catch = |addr: u32, ty: String| {
+            let slot = catch_types.entry(addr * 2).or_insert_with(|| ty.clone());
+            if *slot != ty {
+                *slot = THROWABLE.to_string();
+            }
+        };
+        if code.tries_size > 0 {
+            if let Some(pairs) = try_handler_pairs(self.dex.data.as_ref(), encoded.code_off, code)
+            {
+                let mut ranges = Vec::new();
+                let mut leaders = Vec::new();
+                for (try_item, handler) in pairs {
+                    let start = try_item.start_addr * 2;
+                    let end = (try_item.start_addr + try_item.insn_count as u32) * 2;
+                    let mut starts: Vec<u32> =
+                        handler.handlers.iter().map(|entry| entry.addr * 2).collect();
+                    for entry in &handler.handlers {
+                        let ty = match self.dex.get_type(entry.type_idx) {
+                            Ok(desc) => java::descriptor_to_java(&desc),
+                            Err(_) => THROWABLE.to_string(),
+                        };
+                        catch(entry.addr, ty);
+                    }
+                    if let Some(catch_all) = handler.catch_all_addr {
+                        starts.push(catch_all * 2);
+                        catch(catch_all, THROWABLE.to_string());
+                    }
+                    leaders.extend(starts.iter().copied());
+                    tries.push((start, end));
+                    ranges.push((start, end, starts));
+                }
+                cfg.split_at_offsets(&leaders);
+                for (start, end, starts) in ranges {
+                    exceptional_edges.extend(
+                        cfg.exceptional_edges_for_range(start, end, &starts)
+                            .into_iter()
+                            .map(|(from, to)| (from, to, start, end)),
+                    );
+                }
+            }
+        }
+        let registers_size = code.registers_size as u32;
+        let param_base = registers_size.saturating_sub(code.ins_size as u32);
+        let entry_regs: Vec<u32> = (param_base..registers_size).collect();
+        let webs = DefWebs::build(&cfg, instructions, &exceptional_edges, &entry_regs)
+            .with_tries(tries);
+        let local = self.build_local_types(instructions, &webs, code, encoded, catch_types);
+        let mut web_types = DetHashMap::default();
+        if let Some(local) = &local {
+            let debug = self.method_debug_types.borrow();
+            for (web, ty) in local.java_types() {
+                if !debug.as_ref().is_some_and(|d| d.contains_key(&web.0)) {
+                    web_types.insert(web, ty);
+                }
+            }
+        }
+        *self.method_webs.borrow_mut() = Some((code.insns_off, webs));
+        *self.method_local_types.borrow_mut() = local.map(|l| (code.insns_off, l));
+        *self.method_names.borrow_mut() = MethodNameState {
+            insns_off: code.insns_off,
+            web_types,
+            ..MethodNameState::default()
+        };
+    }
+
+    fn build_local_types(
+        &self,
+        instructions: &[Instruction],
+        webs: &DefWebs,
+        code: &CodeItem,
+        encoded: &EncodedMethod,
+        catch_types: DetHashMap<u32, String>,
+    ) -> Option<LocalTypes> {
+        let info = self.dex.get_method_info(encoded.method_idx).ok()?;
+        let is_static = (encoded.access_flags & 0x8) != 0;
+        let registers_size = code.registers_size as u32;
+        let frame = local_types::Frame {
+            this_class: (!is_static).then(|| java::descriptor_to_java(&info.class)),
+            params: info
+                .params
+                .iter()
+                .map(|p| java::descriptor_to_java(p))
+                .collect(),
+            ret: java::descriptor_to_java(&info.return_type),
+            param_base: registers_size.saturating_sub(code.ins_size as u32),
+            catch_types,
+        };
+        let env = local_types::DexTypeEnv::new(self.dex);
+        Some(LocalTypes::build(instructions, webs, &frame, &env))
+    }
+
+    /// Parameter names and `this` belong to their entry web from the start (R2), which
+    /// keeps that name at every site; the method-wide temp names of
+    /// `prepare_method_reg_types` are held for their register.
+    fn seed_name_owners(
+        &self,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+        class_name: Option<&str>,
+    ) {
+        let params = self.param_display_names_by_reg(encoded, code);
+        let entry_names = self.param_entry_names(encoded, code, class_name);
+        let webs_slot = self.method_webs.borrow();
+        let mut state = self.method_names.borrow_mut();
+        if let Some((_, webs)) = webs_slot.as_ref() {
+            let mut by_reg: Vec<(&u32, &String)> = params.iter().collect();
+            by_reg.sort();
+            for (reg, name) in by_reg {
+                let web = webs.web(*reg, ENTRY_DEF);
+                state.owners.insert(name.clone(), NameOwner::Web(web));
+                if let Some(entry) = entry_names.get(reg) {
+                    state.owners.insert(entry.clone(), NameOwner::Web(web));
+                    state.web_names.insert(web, entry.clone());
+                }
+            }
+        }
+        if let Some(names) = self.method_reg_names.borrow().as_ref() {
+            let mut by_reg: Vec<(&u32, &String)> = names.iter().collect();
+            by_reg.sort();
+            for (reg, name) in by_reg {
+                if is_counter_name(name) {
+                    state.owners.entry(name.clone()).or_insert(NameOwner::Reg(*reg));
+                }
+            }
+        }
+        if code.tries_size > 0 {
+            state
+                .owners
+                .entry(CATCH_VAR.to_string())
+                .or_insert(NameOwner::Catch);
+        }
+    }
+
+    /// Name of each parameter's entry web: its display name after user renames.
+    fn param_entry_names(
+        &self,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+        class_name: Option<&str>,
+    ) -> DetHashMap<u32, String> {
+        let mut by_var: DetHashMap<VarId, String> = self
+            .param_display_names_by_reg(encoded, code)
+            .into_iter()
+            .map(|(reg, name)| (VarId::new(reg, 0), name))
+            .collect();
+        self.apply_variable_renames_to_name_map(&mut by_var, class_name, encoded);
+        by_var.into_iter().map(|(vid, name)| (vid.reg, name)).collect()
+    }
+
+    /// Display name of each parameter register: debug name, else signature name.
+    fn param_display_names_by_reg(
+        &self,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+    ) -> DetHashMap<u32, String> {
+        let mut names = self.signature_param_names(encoded, code);
+        let Ok(info) = self.dex.get_method_info(encoded.method_idx) else {
+            return names;
+        };
+        let params: Vec<String> = info
+            .params
+            .iter()
+            .map(|p| java::descriptor_to_java(p))
+            .collect();
+        let is_static = (encoded.access_flags & 0x8) != 0;
+        let regs = param_registers(code, is_static, &params);
+        for (reg, debug) in regs
+            .into_iter()
+            .zip(self.debug_parameter_display_names(encoded, &params))
+        {
+            if let Some(name) = debug {
+                names.insert(reg, name);
+            }
+        }
+        names
+    }
+
+    fn declared_param_registers(&self, encoded: &EncodedMethod, code: &CodeItem) -> Vec<u32> {
+        let Ok(info) = self.dex.get_method_info(encoded.method_idx) else {
+            return Vec::new();
+        };
+        let params: Vec<String> = info
+            .params
+            .iter()
+            .map(|p| java::descriptor_to_java(p))
+            .collect();
+        param_registers(code, (encoded.access_flags & 0x8) != 0, &params)
+    }
+
+    /// Register that `instructions_to_ir` + `SsaRenamePass` give a new version for `ins`.
+    fn ir_def_reg(&self, ins: &Instruction) -> Option<u32> {
+        let m = ins.mnemonic();
+        if m.ends_with("-payload") || m.starts_with("invoke-") || m.starts_with("filled-new-array")
+        {
+            return None;
+        }
+        let ops = self.resolve_operands(ins.operands());
+        if m.starts_with("move-result") || m == "fill-array-data" {
+            return parse_one_reg(&ops);
+        }
+        if let Some((dst, _)) = parse_assign_rhs(m, &ops) {
+            return Some(dst);
+        }
+        // Raw `vA = …;` lines from `instruction_to_java` (cmp*, float/double 23x).
+        if m.starts_with("cmp") || m.ends_with("-float") || m.ends_with("-double") {
+            return parse_three_regs(&ops).map(|(dst, _, _)| dst);
+        }
+        None
+    }
+
+    fn version_defs<'w>(&self, webs: &'w DefWebs, seq: &[Instruction]) -> VersionDefs<'w> {
+        let mut defs_by_reg: DetHashMap<u32, Vec<u32>> = DetHashMap::default();
+        for ins in seq {
+            if let Some(reg) = self.ir_def_reg(ins) {
+                defs_by_reg.entry(reg).or_default().push(ins.offset);
+            }
+        }
+        let merged = seq
+            .windows(2)
+            .filter(|pair| pair[1].mnemonic().starts_with("move-result"))
+            .map(|pair| (pair[1].offset, pair[0].offset))
+            .collect();
+        VersionDefs {
+            webs,
+            offsets: seq.iter().map(|ins| ins.offset).collect(),
+            defs_by_reg,
+            merged,
+        }
+    }
+
+    /// One Java variable per def-use web (D1, D5): every definition and use of a web gets
+    /// the same name, a parameter register keeps the parameter's name only while it holds
+    /// the incoming value, and a synthetic temp name belongs to a single register.
+    fn apply_def_web_names(
+        &self,
+        name_map: &mut DetHashMap<VarId, String>,
+        type_map: &DetHashMap<VarId, String>,
+        seq: &[Instruction],
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+    ) {
+        let webs_slot = self.method_webs.borrow();
+        let Some((webs_off, webs)) = webs_slot.as_ref() else {
+            return;
+        };
+        if *webs_off != code.insns_off || self.method_names.borrow().insns_off != code.insns_off {
+            return;
+        }
+        let registers_size = code.registers_size as u32;
+        let param_base = registers_size.saturating_sub(code.ins_size as u32);
+        let param_names = self.param_display_names_by_reg(encoded, code);
+        let versions = self.version_defs(webs, seq);
+        // Names are claimed in bytecode order: definition address, then register.
+        let mut vids: Vec<(VarId, BTreeSet<u32>)> =
+            name_map.keys().map(|&vid| (vid, versions.defs(vid))).collect();
+        vids.sort_by_key(|(vid, defs)| {
+            (defs.first().copied().unwrap_or(ENTRY_DEF), vid.reg, vid.ver)
+        });
+        let mut orphans: Vec<VarId> = Vec::new();
+        for (vid, defs) in vids {
+            let reg = vid.reg;
+            let web_set: BTreeSet<DefKey> = defs.iter().map(|&d| webs.web(reg, d)).collect();
+            let Some(name) = name_map.get_mut(&vid) else {
+                continue;
+            };
+            let Some(&web) = web_set.iter().next() else {
+                orphans.push(vid);
+                continue;
+            };
+            if let Some(ty) = type_map.get(&vid) {
+                self.method_names
+                    .borrow_mut()
+                    .web_types
+                    .entry(web)
+                    .or_insert_with(|| ty.clone());
+            }
+            if (param_base..registers_size).contains(&reg) {
+                if defs.iter().any(|&d| webs.shares_entry(reg, d)) {
+                    if let Some(p) = param_names.get(&reg) {
+                        *name = p.clone();
+                    }
+                    continue;
+                }
+                if name.as_str() == "this"
+                    || param_names.values().any(|p| p.as_str() == name.as_str())
+                {
+                    let ty = type_map.get(&vid).map(|s| s.as_str());
+                    *name = self.web_local_name(web, reg, ty);
+                    continue;
+                }
+            }
+            // Several webs reach (no read to probe): reuse a name one of them already has,
+            // else the name goes to the first web only.
+            let known = web_set
+                .iter()
+                .find_map(|w| self.method_names.borrow().web_names.get(w).cloned());
+            *name = match known {
+                Some(n) => n,
+                None => self.web_name(web, name),
+            };
+        }
+        // Versions no web accounts for never take a name a web owns.
+        for vid in orphans {
+            let Some(name) = name_map.get_mut(&vid) else {
+                continue;
+            };
+            if name.as_str() != "this" && !param_names.values().any(|p| p == name.as_str()) {
+                *name = self.claim_temp_name(name, (vid.reg, NO_WEB));
+            }
+        }
+    }
+
+    /// Names of the registers an `if` reads, aligned with the body: the reaching web's
+    /// name, the parameter's name only while the register holds the incoming value.
+    fn apply_condition_web_names(
+        &self,
+        names: &mut DetHashMap<u32, String>,
+        branch_off: u32,
+        types: &DetHashMap<u32, String>,
+        encoded: &EncodedMethod,
+        code: &CodeItem,
+    ) {
+        let webs_slot = self.method_webs.borrow();
+        let Some((webs_off, webs)) = webs_slot.as_ref() else {
+            return;
+        };
+        if *webs_off != code.insns_off || self.method_names.borrow().insns_off != code.insns_off {
+            return;
+        }
+        let registers_size = code.registers_size as u32;
+        let param_base = registers_size.saturating_sub(code.ins_size as u32);
+        let param_names = self.param_display_names_by_reg(encoded, code);
+        for reg in self.regs_in_def_order(branch_off, webs.reads(branch_off).to_vec()) {
+            let defs = webs.reaching(branch_off, reg);
+            let Some(&def) = defs.iter().next() else {
+                continue;
+            };
+            let web = webs.web(reg, def);
+            if let Some(ty) = types.get(&reg) {
+                self.method_names
+                    .borrow_mut()
+                    .web_types
+                    .entry(web)
+                    .or_insert_with(|| ty.clone());
+            }
+            let is_param = (param_base..registers_size).contains(&reg);
+            if is_param && defs.iter().any(|&d| webs.shares_entry(reg, d)) {
+                if let Some(p) = param_names.get(&reg) {
+                    names.insert(reg, self.web_name(web, p));
+                }
+                continue;
+            }
+            let Some(name) = names.get(&reg).cloned() else {
+                continue;
+            };
+            let named = if is_param && (name == "this" || param_names.values().any(|p| *p == name))
+            {
+                self.web_local_name(web, reg, types.get(&reg).map(|s| s.as_str()))
+            } else {
+                self.web_name(web, &name)
+            };
+            names.insert(reg, named);
+        }
+    }
+
+    /// Name shared by every definition and use of `web`: the first one named wins. Every
+    /// name is claimed, synthetic or not: it belongs to one web. Copies of `this` keep `this`.
+    fn web_name(&self, web: DefKey, current: &str) -> String {
+        if let Some(name) = self.method_names.borrow().web_names.get(&web) {
+            return name.clone();
+        }
+        if self.is_exception_web(web) {
+            return self.method_names.borrow_mut().name_exception(web);
+        }
+        let name = if current != "this" {
+            self.claim_temp_name(current, web)
+        } else {
+            current.to_string()
+        };
+        self.method_names
+            .borrow_mut()
+            .web_names
+            .insert(web, name.clone());
+        name
+    }
+
+    /// Name for a web that reuses a parameter register (never the parameter's name).
+    fn web_local_name(&self, web: DefKey, reg: u32, ty: Option<&str>) -> String {
+        if let Some(name) = self.method_names.borrow().web_names.get(&web) {
+            return name.clone();
+        }
+        if self.is_exception_web(web) {
+            return self.method_names.borrow_mut().name_exception(web);
+        }
+        let prefix = match ty.map(type_infer::type_prefix) {
+            None | Some("v") => "local",
+            Some(p) => p,
+        };
+        let name = self.claim_temp_name(&format!("{}{}", prefix, reg), web);
+        self.method_names
+            .borrow_mut()
+            .web_names
+            .insert(web, name.clone());
+        name
+    }
+
+    /// Name of the web `reg` holds just before `off` (operands folded into a condition).
+    fn web_name_at(&self, off: u32, reg: u32, current: &str) -> String {
+        let web = {
+            let webs_slot = self.method_webs.borrow();
+            let Some((_, webs)) = webs_slot.as_ref() else {
+                return current.to_string();
+            };
+            let defs = webs.reaching(off, reg);
+            let Some(&def) = defs.iter().next() else {
+                return current.to_string();
+            };
+            webs.web(reg, def)
+        };
+        self.web_name(web, current)
+    }
+
+    /// `regs` read at `off`, in the order their names are claimed: address of the reaching
+    /// definition, then register.
+    fn regs_in_def_order(&self, off: u32, mut regs: Vec<u32>) -> Vec<u32> {
+        regs.sort_unstable();
+        regs.dedup();
+        if let Some((_, webs)) = self.method_webs.borrow().as_ref() {
+            regs.sort_by_key(|&reg| {
+                let def = webs.reaching(off, reg).first().copied().unwrap_or(ENTRY_DEF);
+                (def, reg)
+            });
+        }
+        regs
+    }
+
+    fn claim_temp_name(&self, name: &str, web: DefKey) -> String {
+        self.method_names.borrow_mut().claim(name, web)
+    }
+
+    fn is_exception_web(&self, web: DefKey) -> bool {
+        self.method_webs
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, webs)| webs.is_exception_web(web))
+    }
+
+    /// What the bytecode says about the body's names: parameters, the name of every web,
+    /// and among those the single-use constants that a text pass may inline.
+    fn simplify_webs(&self, encoded: &EncodedMethod, code: &CodeItem) -> simplify::WebNames {
+        let mut names = simplify::WebNames {
+            params: self
+                .param_display_names_by_reg(encoded, code)
+                .into_values()
+                .collect(),
+            ..Default::default()
+        };
+        let webs_slot = self.method_webs.borrow();
+        let Some((webs_off, webs)) = webs_slot.as_ref() else {
+            return names;
+        };
+        let state = self.method_names.borrow();
+        if *webs_off != code.insns_off || state.insns_off != code.insns_off {
+            return names;
+        }
+        let mut webs_by_name: DetHashMap<&str, Vec<DefKey>> = DetHashMap::default();
+        for (web, name) in &state.web_names {
+            webs_by_name.entry(name.as_str()).or_default().push(*web);
+        }
+        for (name, owners) in webs_by_name {
+            if let [web] = owners.as_slice() {
+                if webs.inlinable_const(*web) && !names.params.contains(name) {
+                    names.inlinable.insert(name.to_string());
+                }
+            }
+            let known: BTreeSet<&str> = owners
+                .iter()
+                .filter_map(|w| state.web_types.get(w).map(|t| t.as_str()))
+                .collect();
+            let ty = match known.len() {
+                1 => known.first().map(|t| shorten_type(t)),
+                0 if owners.iter().any(|w| webs.has_object_def(*w)) => Some("Object".to_string()),
+                _ => None,
+            };
+            if let Some(ty) = ty {
+                names.types.insert(name.to_string(), ty);
+            }
+            names.frozen.insert(name.to_string());
+        }
+        let by_reg = self.param_display_names_by_reg(encoded, code);
+        if let Ok(info) = self.dex.get_method_info(encoded.method_idx) {
+            let param_types: Vec<String> = info
+                .params
+                .iter()
+                .map(|p| java::descriptor_to_java(p))
+                .collect();
+            let is_static = (encoded.access_flags & 0x8) != 0;
+            let regs = param_registers(code, is_static, &param_types);
+            for (reg, ty) in regs.iter().zip(&param_types) {
+                if let Some(name) = by_reg.get(reg) {
+                    names.types.insert(name.clone(), shorten_type(ty));
+                }
+            }
+        }
+        names
+    }
+
+    /// A check-cast read once, by an instruction of this block, is written at that use:
+    /// the cast keeps its variable (same web), `p1 = (T) p1;` would only retype it.
+    /// A cast load (`LocalTypes::is_cast_load`) is written in its cast instead: `x = (T) load;`.
+    /// Versions follow `ir_def_reg`, as `SsaRenamePass` numbers them.
+    fn inline_single_use_casts(
+        &self,
+        stmts: Vec<IrStmt>,
+        seq: &[Instruction],
+        code: &CodeItem,
+    ) -> Vec<IrStmt> {
+        let mut casts: Vec<VarId> = Vec::new();
+        // (load, its cast, cast inlinable at its use, cast type)
+        let mut folds: Vec<(VarId, VarId, bool, String)> = Vec::new();
+        {
+            let webs_slot = self.method_webs.borrow();
+            let Some((webs_off, webs)) = webs_slot.as_ref() else {
+                return stmts;
+            };
+            if *webs_off != code.insns_off {
+                return stmts;
+            }
+            let local_slot = self.method_local_types.borrow();
+            let local = local_slot
+                .as_ref()
+                .filter(|(off, _)| *off == code.insns_off)
+                .map(|(_, local)| local);
+            let in_seq: DetHashSet<u32> = seq.iter().map(|ins| ins.offset as u32).collect();
+            let mut versions: DetHashMap<u32, u32> = DetHashMap::default();
+            for (i, ins) in seq.iter().enumerate() {
+                let Some(reg) = self.ir_def_reg(ins) else {
+                    continue;
+                };
+                let ver = versions.entry(reg).or_insert(0);
+                *ver += 1;
+                let off = ins.offset as u32;
+                if ins.mnemonic() != "check-cast" {
+                    continue;
+                }
+                let cast = VarId::new(reg, *ver);
+                let inlinable = webs.use_count(reg, off) == 1
+                    && webs.use_sites(reg, off).iter().all(|site| in_seq.contains(site));
+                let after_load = i.checked_sub(1).and_then(|j| seq.get(j)).is_some_and(|prev| {
+                    local.is_some_and(|l| l.is_cast_load(reg, prev.offset as u32))
+                });
+                let ty = after_load
+                    .then(|| {
+                        let ops = self.resolve_operands(ins.operands());
+                        ops.split(',').nth(1).map(|t| t.trim().to_string())
+                    })
+                    .flatten();
+                match ty {
+                    Some(ty) => folds.push((VarId::new(reg, *ver - 1), cast, inlinable, ty)),
+                    None if inlinable => casts.push(cast),
+                    None => {}
+                }
+            }
+        }
+        let mut stmts = stmts;
+        for (load, cast, inlinable, ty) in folds {
+            if !fold_load_into_cast(&mut stmts, load, &ty) && inlinable {
+                casts.push(cast);
+            }
+        }
+        for vid in casts {
+            let Some(at) = stmts
+                .iter()
+                .position(|s| matches!(s, IrStmt::Assign { dst, .. } if *dst == vid))
+            else {
+                continue;
+            };
+            let IrStmt::Assign {
+                rhs: IrExpr::Raw(cast),
+                ..
+            } = &stmts[at]
+            else {
+                continue;
+            };
+            let cast = cast.clone();
+            let var = format!("v{}_{}", vid.reg, vid.ver);
+            let mut replaced = false;
+            for stmt in stmts.iter_mut().skip(at + 1) {
+                if substitute_ir_var(stmt, vid, &var, &cast) {
+                    replaced = true;
+                    break;
+                }
+            }
+            if replaced {
+                stmts.remove(at);
+            }
+        }
+        stmts
     }
 
     /// Instruction list for a block (for method_used_regs or emit_block_instructions).
@@ -5129,26 +6384,37 @@ impl<'a> Decompiler<'a> {
 
     /// Treat incoming Dalvik parameter registers as already declared so a later
     /// SSA assign (`b = b + 1`) does not emit `int b = ...` after `if (b == 10)`.
+    /// Only the parameters' own names: a later local of the register is declared where
+    /// it is defined.
     fn seed_declared_from_params(
         &self,
-        declared: &mut HashSet<String>,
+        declared: &mut DetHashSet<String>,
         code: &CodeItem,
         encoded: &EncodedMethod,
     ) {
-        for n in self.signature_param_names(encoded, code).values() {
+        let params = self
+            .signature_param_names(encoded, code)
+            .into_values()
+            .chain(self.param_display_names_by_reg(encoded, code).into_values());
+        for n in params {
             if n != "this" {
-                declared.insert(n.clone());
+                declared.insert(n);
             }
         }
+        let webs_slot = self.method_webs.borrow();
+        let state = self.method_names.borrow();
+        let Some((webs_off, webs)) = webs_slot.as_ref() else {
+            return;
+        };
+        if *webs_off != code.insns_off || state.insns_off != code.insns_off {
+            return;
+        }
         let registers_size = code.registers_size as u32;
-        let ins_size = code.ins_size as u32;
-        let param_base = registers_size.saturating_sub(ins_size);
-        if let Some(names) = self.method_reg_names.borrow().as_ref() {
-            for reg in param_base..registers_size {
-                if let Some(n) = names.get(&reg) {
-                    if n != "this" {
-                        declared.insert(n.clone());
-                    }
+        let param_base = registers_size.saturating_sub(code.ins_size as u32);
+        for reg in param_base..registers_size {
+            if let Some(n) = state.web_names.get(&webs.web(reg, ENTRY_DEF)) {
+                if n != "this" {
+                    declared.insert(n.clone());
                 }
             }
         }
@@ -5190,9 +6456,9 @@ impl<'a> Decompiler<'a> {
         &self,
         encoded: &EncodedMethod,
         code: &CodeItem,
-    ) -> HashMap<u32, String> {
+    ) -> DetHashMap<u32, String> {
         let Ok(info) = self.dex.get_method_info(encoded.method_idx) else {
-            return HashMap::new();
+            return DetHashMap::default();
         };
         let is_static = (encoded.access_flags & 0x8) != 0;
         let param_types: Vec<String> = info
@@ -5212,7 +6478,7 @@ impl<'a> Decompiler<'a> {
     /// Temps (`v0`, `x0`, `s0`) are replaced; debug/user names (`email`) are kept.
     fn apply_signature_param_names(
         &self,
-        name_map: &mut HashMap<VarId, String>,
+        name_map: &mut DetHashMap<VarId, String>,
         encoded: &EncodedMethod,
         code: &CodeItem,
     ) {
@@ -5242,8 +6508,8 @@ impl<'a> Decompiler<'a> {
     /// so `email` does not overwrite the Activity/`this` receiver used by `findViewById`.
     fn apply_debug_names_to_name_map(
         &self,
-        name_map: &mut HashMap<VarId, String>,
-        type_map: &HashMap<VarId, String>,
+        name_map: &mut DetHashMap<VarId, String>,
+        type_map: &DetHashMap<VarId, String>,
         code: &CodeItem,
         encoded: &EncodedMethod,
     ) {
@@ -5253,27 +6519,26 @@ impl<'a> Decompiler<'a> {
         let Ok(dbg) = self.dex.debug_info_for_code(code) else {
             return;
         };
-        let registers_size = code.registers_size as u32;
-        let ins_size = code.ins_size as u32;
-        let is_static = (encoded.access_flags & 0x8) != 0;
-        let param_base = registers_size.saturating_sub(ins_size);
-        // Parameter names: skip `this` for instance methods.
-        let param_name_offset = if is_static { 0usize } else { 1usize };
+        // A parameter name belongs to the incoming value (version 0), not to a later
+        // reuse of its register; `long` / `double` parameters take two registers.
+        let param_regs = self.declared_param_registers(encoded, code);
         for (i, pname) in dbg.parameter_names.iter().enumerate() {
             let Some(name) = pname.as_ref() else { continue };
             if !is_java_ident(name) {
                 continue;
             }
-            let reg = param_base + param_name_offset as u32 + i as u32;
+            let Some(&reg) = param_regs.get(i) else {
+                continue;
+            };
             for (var, display) in name_map.iter_mut() {
-                if var.reg == reg && display.as_str() != "this" {
+                if var.reg == reg && var.ver == 0 && display.as_str() != "this" {
                     *display = name.clone();
                 }
             }
         }
 
-        let latest_ver_by_reg: HashMap<u32, u32> =
-            name_map.keys().fold(HashMap::new(), |mut m, v| {
+        let latest_ver_by_reg: DetHashMap<u32, u32> =
+            name_map.keys().fold(DetHashMap::default(), |mut m, v| {
                 m.entry(v.reg)
                     .and_modify(|ver| *ver = (*ver).max(v.ver))
                     .or_insert(v.ver);
@@ -5281,7 +6546,7 @@ impl<'a> Decompiler<'a> {
             });
 
         // Names already claimed (params / prior renames) so register-reuse locals do not collide.
-        let mut used_names: HashSet<String> = HashSet::new();
+        let mut used_names: DetHashSet<String> = DetHashSet::default();
         for display in name_map.values() {
             if display.as_str() != "this" && is_java_ident(display) && !is_temp_like_name(display)
             {
@@ -5362,7 +6627,7 @@ impl<'a> Decompiler<'a> {
     /// For constructors, also accepts UI keys that use the simple class name instead of `<init>`.
     fn apply_variable_renames_to_name_map(
         &self,
-        name_map: &mut HashMap<VarId, String>,
+        name_map: &mut DetHashMap<VarId, String>,
         class_name: Option<&str>,
         encoded: &EncodedMethod,
     ) {
@@ -5406,8 +6671,8 @@ impl<'a> Decompiler<'a> {
         code: &CodeItem,
         out: &mut String,
         indent: usize,
-        declared: &mut HashSet<String>,
-        global_used_regs: Option<&HashSet<u32>>,
+        declared: &mut DetHashSet<String>,
+        global_used_regs: Option<&DetHashSet<u32>>,
         skip_last_instruction: bool,
         emit_range: Option<(u32, u32)>,
         class_name: Option<&str>,
@@ -5436,7 +6701,8 @@ impl<'a> Decompiler<'a> {
         } else {
             self.default_pass_runner().run(stmts)
         };
-        let mut type_map = self.infer_types_for(encoded, code, &stmts);
+        let stmts = self.inline_single_use_casts(stmts, &seq, code);
+        let mut type_map = self.infer_types_for(encoded, code, &stmts, Some(seq.as_slice()));
         if let Some(reg_types) = self.method_reg_types.borrow().as_ref() {
             let debug_types = self.method_debug_types.borrow();
             self.enrich_types_for(
@@ -5448,7 +6714,7 @@ impl<'a> Decompiler<'a> {
         } else if let Some(debug_types) = self.method_debug_types.borrow().as_ref() {
             self.enrich_types_for(
                 &mut type_map,
-                &HashMap::new(),
+                &DetHashMap::default(),
                 Some(debug_types),
                 &stmts,
             );
@@ -5512,6 +6778,7 @@ impl<'a> Decompiler<'a> {
             }
         }
         self.apply_signature_param_names(&mut name_map, encoded, code);
+        self.apply_def_web_names(&mut name_map, &type_map, &seq, encoded, code);
         // User renames must win over method-wide / debug names.
         self.apply_variable_renames_to_name_map(&mut name_map, class_name, encoded);
         for line in self.codegen_ir_lines(&stmts, Some(&type_map), Some(&name_map), declared) {
@@ -5519,6 +6786,9 @@ impl<'a> Decompiler<'a> {
                 writeln!(out, "{}{}", ind, line)
                     .map_err(|_| DexDecompilerError::Decompilation("write".into()))?;
             }
+        }
+        if self.explicit_jumps.get() {
+            return Ok(false);
         }
         match &block.end {
             BlockEnd::Goto(t) if break_target == Some(*t) => {
@@ -5538,9 +6808,9 @@ impl<'a> Decompiler<'a> {
     fn codegen_ir_lines(
         &self,
         stmts: &[IrStmt],
-        type_map: Option<&HashMap<VarId, String>>,
-        name_map: Option<&HashMap<VarId, String>>,
-        declared: &mut HashSet<String>,
+        type_map: Option<&DetHashMap<VarId, String>>,
+        name_map: Option<&DetHashMap<VarId, String>>,
+        declared: &mut DetHashSet<String>,
     ) -> Vec<String> {
         stmts
             .iter()
@@ -5551,9 +6821,9 @@ impl<'a> Decompiler<'a> {
     fn codegen_stmt_line(
         &self,
         stmt: &IrStmt,
-        type_map: Option<&HashMap<VarId, String>>,
-        name_map: Option<&HashMap<VarId, String>>,
-        declared: &mut HashSet<String>,
+        type_map: Option<&DetHashMap<VarId, String>>,
+        name_map: Option<&DetHashMap<VarId, String>>,
+        declared: &mut DetHashSet<String>,
     ) -> String {
         let line = match (stmt, type_map) {
             (IrStmt::Assign { dst, rhs, comment }, Some(types)) if types.get(dst).is_some() => {
@@ -5581,6 +6851,9 @@ impl<'a> Decompiler<'a> {
                 }
             }
         };
+        if line.contains(REGISTER_SHIELD) {
+            return shorten_java_names(&line.replace(REGISTER_SHIELD, ""));
+        }
         shorten_java_names(&line)
     }
 
@@ -5594,10 +6867,15 @@ impl<'a> Decompiler<'a> {
         bits_str: &str,
         instructions: &[Instruction],
         idx: usize,
+        base_off: usize,
     ) -> String {
-        let java_ty = self
-            .wide_const_java_type(mnemonic, dst_reg, bits_str, instructions, idx)
-            .unwrap_or_else(|| "long".to_string());
+        let local = self.local_const_type(base_off, dst_reg, instructions, idx);
+        let java_ty = match local.as_deref() {
+            Some(ty @ ("double" | "long")) => ty.to_string(),
+            _ => self
+                .wide_const_java_type(mnemonic, dst_reg, bits_str, instructions, idx)
+                .unwrap_or_else(|| "long".to_string()),
+        };
         format_java_wide_literal(bits_str, &java_ty)
     }
 
@@ -5607,7 +6885,23 @@ impl<'a> Decompiler<'a> {
         bits_str: &str,
         instructions: &[Instruction],
         idx: usize,
+        base_off: usize,
     ) -> String {
+        if let Some(ins) = instructions.get(idx) {
+            if let Some(literal) = self.int_literal_at(base_off, dst_reg, ins.offset, bits_str) {
+                return literal;
+            }
+        }
+        let local = self.local_const_type(base_off, dst_reg, instructions, idx);
+        match local.as_deref() {
+            Some("float") => {
+                if let Some(bits) = parse_const_bits_u32(bits_str) {
+                    return format_java_float(f32::from_bits(bits));
+                }
+            }
+            Some("int" | "short" | "byte" | "char" | "boolean") => return bits_str.to_string(),
+            _ => {}
+        }
         let as_float = self.const_32_used_as_float(dst_reg, instructions, idx)
             || self.debug_type_for_reg(dst_reg).as_deref() == Some("float");
         if as_float {
@@ -5839,6 +7133,11 @@ impl<'a> Decompiler<'a> {
                     || m.starts_with("invoke-direct")
                     || is_super;
                 if let Some((target, args, param_types)) = parse_invoke_call_parts(&ops_resolved) {
+                    if let Some(ret) = self.invoke_return_type(ops) {
+                        self.call_return_types
+                            .borrow_mut()
+                            .insert(offset as u32, ret);
+                    }
                     let (target, args) = if is_super {
                         to_super_style(&target, &args)
                     } else if is_instance {
@@ -5951,9 +7250,9 @@ impl<'a> Decompiler<'a> {
             if let Some((dst_reg, rhs_str)) = parse_assign_rhs(m, &ops_resolved) {
                 flush_pending_invoke(&mut out, &mut pending_invoke);
                 let rhs_str = if m.starts_with("const-wide") {
-                    self.format_const_wide_rhs(m, dst_reg, &rhs_str, instructions, idx)
+                    self.format_const_wide_rhs(m, dst_reg, &rhs_str, instructions, idx, base_off)
                 } else if matches!(m, "const" | "const/high16" | "const/16" | "const/4") {
-                    self.format_const_32_rhs(dst_reg, &rhs_str, instructions, idx)
+                    self.format_const_32_rhs(dst_reg, &rhs_str, instructions, idx, base_off)
                 } else {
                     rhs_str
                 };
@@ -6284,7 +7583,7 @@ fn replace_capture_in_body(body: &str, field_name: &str, arg: &str) -> String {
 
 /// After capture replacement: find "var = arg;" lines and replace whole-word "var" with "arg" in body, then remove those assignment lines.
 fn replace_capture_assignees_in_body(body: &str, val_replacements: &[(String, String)]) -> String {
-    let args: std::collections::HashSet<&str> =
+    let args: DetHashSet<&str> =
         val_replacements.iter().map(|(_, a)| a.as_str()).collect();
     let mut assignees: Vec<(String, String)> = Vec::new();
     for line in body.lines() {
@@ -6470,7 +7769,7 @@ fn to_super_style(target: &str, args: &str) -> (String, String) {
 
 fn find_first_comma(s: &str) -> Option<usize> {
     let mut depth = 0u32;
-    for (i, c) in s.chars().enumerate() {
+    for (i, c) in s.char_indices() {
         match c {
             '(' => depth += 1,
             ')' => depth = depth.saturating_sub(1),
@@ -6493,7 +7792,7 @@ fn parse_invoke_call_parts(ops_resolved: &str) -> Option<(String, String, Vec<St
     // Find last comma at depth 0 to split args from method ref.
     let mut depth = 0u32;
     let mut last_comma_at = None;
-    for (i, c) in inner.chars().enumerate() {
+    for (i, c) in inner.char_indices() {
         match c {
             '(' => depth = depth.saturating_add(1),
             ')' => depth = depth.saturating_sub(1),
@@ -6632,7 +7931,7 @@ fn drop_wide_high_half_args(args: &str, param_types: &[String]) -> String {
 fn format_compound_line(
     compound: &str,
     var: &str,
-    name_map: Option<&HashMap<VarId, String>>,
+    name_map: Option<&DetHashMap<VarId, String>>,
 ) -> String {
     let compound = if let Some(nm) = name_map {
         ir::substitute_names_in_text_pub(compound, nm)
@@ -6657,7 +7956,7 @@ fn format_compound_line(
 }
 
 /// Handle compound assign markers in raw/untyped lines.
-fn resolve_compound_in_line(line: &str, name_map: Option<&HashMap<VarId, String>>) -> String {
+fn resolve_compound_in_line(line: &str, name_map: Option<&DetHashMap<VarId, String>>) -> String {
     if let Some(eq_pos) = line.find(" = __compound_") {
         let var = line[..eq_pos].trim();
         let after = line[eq_pos + " = __compound_".len()..]
@@ -6770,8 +8069,8 @@ struct CtorFieldInit {
 fn hoist_common_ctor_field_inits(
     methods: &mut [String],
     simple_class: &str,
-    instance_fields: &HashSet<String>,
-) -> HashMap<String, String> {
+    instance_fields: &DetHashSet<String>,
+) -> DetHashMap<String, String> {
     struct Ctor {
         method_idx: usize,
         steps: Vec<CtorFieldInit>,
@@ -6787,7 +8086,7 @@ fn hoist_common_ctor_field_inits(
         });
     }
     if ctors.len() < 2 {
-        return HashMap::new();
+        return DetHashMap::default();
     }
     let mut n = ctors.iter().map(|c| c.steps.len()).min().unwrap_or(0);
     for i in 0..n {
@@ -6802,9 +8101,9 @@ fn hoist_common_ctor_field_inits(
         }
     }
     if n == 0 {
-        return HashMap::new();
+        return DetHashMap::default();
     }
-    let mut inits = HashMap::new();
+    let mut inits = DetHashMap::default();
     for step in &ctors[0].steps[..n] {
         inits.insert(step.field.clone(), step.expr.clone());
     }
@@ -6946,7 +8245,7 @@ fn constructor_delegates_to_this(java: &str) -> bool {
     })
 }
 
-fn leading_field_inits(java: &str, fields: &HashSet<String>) -> Vec<CtorFieldInit> {
+fn leading_field_inits(java: &str, fields: &DetHashSet<String>) -> Vec<CtorFieldInit> {
     let lines: Vec<&str> = java.lines().collect();
     let mut i = 1usize;
     let mut steps = Vec::new();
@@ -7090,7 +8389,7 @@ fn insert_used_short_imports(
     if used.is_empty() {
         return source.to_string();
     }
-    let mut by_simple: HashMap<String, Vec<String>> = HashMap::new();
+    let mut by_simple: DetHashMap<String, Vec<String>> = DetHashMap::default();
     for idx in 0..dex.header.type_ids_size {
         let Ok(desc) = dex.get_type(idx) else {
             continue;
@@ -7135,9 +8434,9 @@ fn insert_used_short_imports(
     splice_imports(source, &extra)
 }
 
-fn uppercase_idents(src: &str) -> HashSet<String> {
+fn uppercase_idents(src: &str) -> DetHashSet<String> {
     let bytes = src.as_bytes();
-    let mut out = HashSet::new();
+    let mut out = DetHashSet::default();
     let mut i = 0usize;
     let mut in_str = false;
     let mut escape = false;
@@ -7198,7 +8497,7 @@ fn splice_imports(source: &str, extra: &[String]) -> String {
                     || t.contains(" enum "))
         })
         .unwrap_or(0);
-    let mut imports: HashSet<String> = HashSet::new();
+    let mut imports: DetHashSet<String> = DetHashSet::default();
     for line in &lines[..class_at] {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("import ") {
@@ -7249,9 +8548,9 @@ fn collect_class_imports(
     class_name: &str,
     package: &str,
 ) -> Result<Vec<String>> {
-    let mut fqns: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut fqns: DetHashSet<String> = DetHashSet::default();
 
-    let add_type = |fqns: &mut std::collections::HashSet<String>, ty: &str| {
+    let add_type = |fqns: &mut DetHashSet<String>, ty: &str| {
         let base = ty.trim_end_matches(']').trim_end_matches('[').trim();
         if base.is_empty() || PRIMITIVE_OR_VOID.contains(&base) {
             return;
@@ -7670,7 +8969,11 @@ fn is_branch_offset(token: &str) -> bool {
 
 /// Replace raw register references (vN) in a condition string with display names.
 /// Word-boundary aware: `v1` won't match inside `v10`.
-fn replace_register_names(condition: &str, reg_to_name: &HashMap<u32, String>) -> String {
+fn replace_register_names(condition: &str, reg_to_name: &DetHashMap<u32, String>) -> String {
+    ir::map_outside_literals(condition, |code| replace_register_names_in_code(code, reg_to_name))
+}
+
+fn replace_register_names_in_code(condition: &str, reg_to_name: &DetHashMap<u32, String>) -> String {
     let bytes = condition.as_bytes();
     let mut result = String::with_capacity(condition.len());
     let mut i = 0;
@@ -7698,8 +9001,13 @@ fn replace_register_names(condition: &str, reg_to_name: &HashMap<u32, String>) -
                 }
             }
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        let ch_len = condition[i..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        result.push_str(&condition[i..i + ch_len]);
+        i += ch_len;
     }
     result
 }
@@ -7708,8 +9016,8 @@ fn replace_register_names(condition: &str, reg_to_name: &HashMap<u32, String>) -
 /// Turn `obj == 0` / `obj != 0` into `obj == null` / `obj != null` for reference types.
 fn polish_boolean_condition(
     condition: &str,
-    local_names: &HashMap<u32, String>,
-    local_types: &HashMap<u32, String>,
+    local_names: &DetHashMap<u32, String>,
+    local_types: &DetHashMap<u32, String>,
 ) -> String {
     let cond = condition.trim();
     let (name, is_eq) = if let Some(n) = cond.strip_suffix(" == 0") {
@@ -7722,32 +9030,39 @@ fn polish_boolean_condition(
     if !is_java_ident(name) {
         return condition.to_string();
     }
-    let ty = local_names.iter().find_map(|(reg, n)| {
-        (n == name)
-            .then(|| local_types.get(reg).map(|t| t.as_str()))
-            .flatten()
-    });
-    let is_bool = ty == Some("boolean") || looks_like_boolean_temp(name);
-    if is_bool {
-        return if is_eq {
+    // Several registers with this name: the smallest typed one.
+    let ty = local_names
+        .iter()
+        .filter(|(_, n)| n.as_str() == name)
+        .filter_map(|(reg, _)| local_types.get(reg).map(|t| (*reg, t.as_str())))
+        .min_by_key(|&(reg, _)| reg)
+        .map(|(_, t)| t);
+    let ty = if looks_like_boolean_temp(name) {
+        Some("boolean")
+    } else {
+        ty.or((!looks_like_primitive_temp(name)).then_some("Object"))
+    };
+    ty.and_then(|t| typed_zero_test(name, is_eq, t))
+        .unwrap_or_else(|| condition.to_string())
+}
+
+/// `name == 0` / `name != 0` read with the type of `name`: `!name` / `name` for a boolean,
+/// `== null` / `!= null` for a reference; `None` for another primitive.
+pub(crate) fn typed_zero_test(name: &str, is_eq: bool, ty: &str) -> Option<String> {
+    if ty.trim() == "boolean" {
+        return Some(if is_eq {
             format!("!{}", name)
         } else {
             name.to_string()
-        };
+        });
     }
-    let is_primitive_temp = looks_like_primitive_temp(name);
-    let is_ref = match ty {
-        Some(t) => is_reference_java_type(t),
-        None => !is_primitive_temp,
-    };
-    if is_ref {
-        return if is_eq {
+    is_reference_java_type(ty).then(|| {
+        if is_eq {
             format!("{} == null", name)
         } else {
             format!("{} != null", name)
-        };
-    }
-    condition.to_string()
+        }
+    })
 }
 
 fn looks_like_boolean_temp(name: &str) -> bool {
@@ -8216,10 +9531,153 @@ fn try_lambda_expression_body(body: &str) -> Option<String> {
     None
 }
 
+/// Replaces the read of `vid` (`var` in IR text) in `stmt` by `expr`, parenthesized as a
+/// receiver or array (`((T) x).f()`). Whether a read was replaced.
+fn substitute_ir_var(stmt: &mut IrStmt, vid: VarId, var: &str, expr: &str) -> bool {
+    fn in_expr(e: &mut IrExpr, vid: VarId, var: &str, expr: &str) -> bool {
+        if matches!(e, IrExpr::Var(v) if *v == vid) {
+            *e = IrExpr::Raw(expr.to_string());
+            return true;
+        }
+        match e {
+            IrExpr::Call { target, args } => in_text(target, var, expr) | in_text(args, var, expr),
+            IrExpr::Raw(s) => in_text(s, var, expr),
+            IrExpr::Var(_) | IrExpr::PendingResult => false,
+        }
+    }
+    fn in_text(s: &mut String, var: &str, expr: &str) -> bool {
+        let out = ir::map_outside_literals(s.as_str(), |code| {
+            let bytes = code.as_bytes();
+            let mut out = String::with_capacity(code.len());
+            let mut last = 0;
+            for (at, _) in code.match_indices(var) {
+                let end = at + var.len();
+                let before_ok =
+                    at == 0 || !(is_ident_char(bytes[at - 1]) || bytes[at - 1] == b'.');
+                let after = bytes.get(end).copied();
+                if !before_ok || after.is_some_and(is_ident_char) {
+                    continue;
+                }
+                out.push_str(&code[last..at]);
+                if matches!(after, Some(b'.') | Some(b'[')) {
+                    out.push_str(&format!("({expr})"));
+                } else {
+                    out.push_str(expr);
+                }
+                last = end;
+            }
+            out.push_str(&code[last..]);
+            out
+        });
+        let changed = out != *s;
+        *s = out;
+        changed
+    }
+    match stmt {
+        IrStmt::Assign { rhs, .. } => in_expr(rhs, vid, var, expr),
+        IrStmt::Expr { expr: e, .. } => in_expr(e, vid, var, expr),
+        IrStmt::Return { value: Some(e), .. } => in_expr(e, vid, var, expr),
+        IrStmt::Raw(s) => in_text(s, var, expr),
+        IrStmt::Return { value: None, .. } | IrStmt::Phi { .. } => false,
+    }
+}
+
+/// Writes the value `load` assigns into the operand of the check-cast `(ty) operand` right
+/// after it, and drops the assignment; false when the cast is not in that form.
+fn fold_load_into_cast(stmts: &mut Vec<IrStmt>, load: VarId, ty: &str) -> bool {
+    let Some(at) = stmts
+        .iter()
+        .position(|s| matches!(s, IrStmt::Assign { dst, .. } if *dst == load))
+    else {
+        return false;
+    };
+    let IrStmt::Assign { rhs, .. } = &stmts[at] else {
+        return false;
+    };
+    let value = match rhs {
+        IrExpr::PendingResult => return false,
+        IrExpr::Call { .. } => rhs.to_java(),
+        _ => {
+            let text = rhs.to_java();
+            if text.contains(' ') {
+                format!("({text})")
+            } else {
+                text
+            }
+        }
+    };
+    let (Some(IrStmt::Assign {
+        rhs: IrExpr::Raw(cast),
+        ..
+    })
+    | Some(IrStmt::Return {
+        value: Some(IrExpr::Raw(cast)),
+        ..
+    })) = stmts.get_mut(at + 1)
+    else {
+        return false;
+    };
+    let Some(operand) = cast_operand(cast.as_str()) else {
+        return false;
+    };
+    let mut operand = IrStmt::Raw(operand.to_string());
+    let var = format!("v{}_{}", load.reg, load.ver);
+    if !substitute_ir_var(&mut operand, load, &var, &value) {
+        return false;
+    }
+    let IrStmt::Raw(operand) = operand else {
+        return false;
+    };
+    // SSA renaming already rewrote a package named like a register (`v0.f` → `v0_1.f`).
+    *cast = format!("({}) {operand}", shield_registers(ty));
+    stmts.remove(at);
+    true
+}
+
+/// Operand of a check-cast text `(<Type>) <operand>`: what follows the parenthesis closing
+/// the first one.
+fn cast_operand(text: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (at, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return text[at + 1..].strip_prefix(' ').filter(|op| !op.is_empty());
+                }
+            }
+            _ if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Put after the `v` of `v<digit>` in a type written into IR text, so that no pass reads
+/// it as a register; `codegen_stmt_line` removes it.
+const REGISTER_SHIELD: char = '\u{FDD1}';
+
+fn shield_registers(ty: &str) -> String {
+    let mut out = String::with_capacity(ty.len());
+    let mut chars = ty.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == 'v' && chars.peek().is_some_and(char::is_ascii_digit) {
+            out.push(REGISTER_SHIELD);
+        }
+    }
+    out
+}
+
 fn replace_ident_in_body(body: &str, from: &str, to: &str) -> String {
     if from == to || from.is_empty() {
         return body.to_string();
     }
+    ir::map_outside_literals(body, |code| replace_ident_in_code(code, from, to))
+}
+
+fn replace_ident_in_code(body: &str, from: &str, to: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let bytes = body.as_bytes();
     let mut i = 0;
@@ -8234,8 +9692,9 @@ fn replace_ident_in_body(body: &str, from: &str, to: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = body[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -8248,8 +9707,8 @@ fn is_ident_char(b: u8) -> bool {
 /// Registers that only ever hold `this` (the incoming `p0` plus `move-object` copies
 /// that are never overwritten). Loop blocks often don't see the prologue move, so
 /// without this they name `this` as `local0` and later passes turn it into `0`.
-fn registers_holding_this(instructions: &[Instruction], this_reg: u32) -> HashSet<u32> {
-    let mut holding: HashSet<u32> = HashSet::new();
+fn registers_holding_this(instructions: &[Instruction], this_reg: u32) -> DetHashSet<u32> {
+    let mut holding: DetHashSet<u32> = DetHashSet::default();
     holding.insert(this_reg);
     for ins in instructions {
         let m = ins.mnemonic();
@@ -8302,6 +9761,21 @@ fn instruction_writes_register(ins: &Instruction) -> Option<u32> {
         return None;
     }
     parse_one_reg(ins.operands())
+}
+
+/// Type of a call result: the callee's declared return type, except that an inferred
+/// reference type beats an erased `Object` return. A primitive never does (D2).
+fn call_result_type(declared: &str, inferred: Option<&str>) -> String {
+    match inferred {
+        Some(t) if declared == "java.lang.Object" && !is_primitive_java_type(t) => t.to_string(),
+        _ => declared.to_string(),
+    }
+}
+
+/// Instruction offset of an IR comment `// [idx] 00ab (…): …` (the first one when merged).
+fn comment_insn_offset(comment: &str) -> Option<u32> {
+    let hex = comment.split_once("] ")?.1.split_whitespace().next()?;
+    u32::from_str_radix(hex, 16).ok()
 }
 
 pub(crate) fn escape_java_string(s: &str) -> String {
@@ -9639,8 +11113,8 @@ mod tests {
 
     #[test]
     fn polish_boolean_condition_z_temp() {
-        let names = HashMap::new();
-        let types = HashMap::new();
+        let names = DetHashMap::default();
+        let types = DetHashMap::default();
         assert_eq!(polish_boolean_condition("z0 == 0", &names, &types), "!z0");
         assert_eq!(polish_boolean_condition("z0 != 0", &names, &types), "z0");
         // Non-boolean temps stay as comparisons
@@ -9656,9 +11130,9 @@ mod tests {
 
     #[test]
     fn polish_boolean_condition_typed_local() {
-        let mut names = HashMap::new();
+        let mut names = DetHashMap::default();
         names.insert(0u32, "loggedIn".into());
-        let mut types = HashMap::new();
+        let mut types = DetHashMap::default();
         types.insert(0u32, "boolean".into());
         assert_eq!(
             polish_boolean_condition("loggedIn == 0", &names, &types),
@@ -9790,7 +11264,7 @@ mod tests {
     #[test]
     fn debug_param_names_prefer_table_then_start_local() {
         let types = vec!["int".into(), "java.lang.String[]".into(), "int[]".into()];
-        let mut locals = HashMap::new();
+        let mut locals = DetHashMap::default();
         // instance: slot 0 = this, 1 = requestCode, 2 = permissions, 3 = grantResults
         locals.insert(4, "grantResults".to_string());
         let unnamed = vec![None, None, None];
@@ -9804,7 +11278,7 @@ mod tests {
             Some("permissions".into()),
             Some("grantResults".into()),
         ];
-        let names = debug_param_names_from_tables(&table, &HashMap::new(), 1, false, &types);
+        let names = debug_param_names_from_tables(&table, &DetHashMap::default(), 1, false, &types);
         assert_eq!(
             names,
             vec![
@@ -9823,7 +11297,7 @@ mod tests {
     #[test]
     fn debug_param_names_skip_this_and_wide_slots() {
         let types = vec!["long".into(), "java.lang.String".into()];
-        let mut locals = HashMap::new();
+        let mut locals = DetHashMap::default();
         locals.insert(0, "this".to_string());
         locals.insert(1, "count".to_string());
         locals.insert(3, "name".to_string());
@@ -9838,7 +11312,7 @@ mod tests {
         loop_header: bool,
         instructions: Vec<Instruction>,
     ) -> MethodCfg {
-        let mut loop_headers = HashSet::new();
+        let mut loop_headers = std::collections::HashSet::new();
         if loop_header {
             loop_headers.insert(0);
         }
@@ -9853,12 +11327,12 @@ mod tests {
                 },
                 instruction_offsets: offsets,
             }],
-            block_by_start: HashMap::new(),
+            block_by_start: std::collections::HashMap::new(),
             loop_headers,
             entry: 0,
-            folded_const_offsets: HashSet::new(),
+            folded_const_offsets: std::collections::HashSet::new(),
         };
-        Decompiler::fold_constants_into_conditions(&mut cfg, &instructions, None);
+        Decompiler::fold_constants_into_conditions(&mut cfg, &instructions, None, None);
         cfg
     }
 
@@ -9961,4 +11435,1017 @@ mod tests {
         );
     }
 
+    /// D1: `move-result v0` kills `const/4 v0, 0` before `if-eqz v0`: nothing to fold.
+    #[test]
+    fn fold_skips_const_overwritten_by_move_result() {
+        let ins = vec![
+            Instruction::new(0, 2, 0x12, "const/4", "v0, 0".into()),
+            Instruction::new(2, 6, 0x6e, "invoke-virtual", "v1, method@0".into()),
+            Instruction::new(8, 2, 0x0a, "move-result", "v0".into()),
+            Instruction::new(10, 4, 0x38, "if-eqz", "v0, +008h".into()),
+        ];
+        let cfg = fold_cfg(vec![0, 2, 8, 10], "v0 == 0", false, ins);
+        assert_eq!(cond_of(&cfg), "v0 == 0");
+        assert!(cfg.folded_const_offsets.is_empty());
+    }
+
+    /// D6: the const also feeds `add-int/lit8`: substituted in the test, but still emitted.
+    #[test]
+    fn fold_keeps_const_with_another_use() {
+        let ins = vec![
+            Instruction::new(0, 2, 0x12, "const/4", "v0, 5".into()),
+            Instruction::new(2, 4, 0xd8, "add-int/lit8", "v1, v0, 1".into()),
+            Instruction::new(6, 4, 0x38, "if-eqz", "v0, +008h".into()),
+        ];
+        let cfg = fold_cfg(vec![0, 2, 6], "v0 == 0", false, ins);
+        assert_eq!(cond_of(&cfg), "5 == 0");
+        assert!(cfg.folded_const_offsets.is_empty());
+    }
+
+    #[test]
+    fn counter_names_are_synthetic_temps_only() {
+        assert!(is_counter_name("s0"));
+        assert!(is_counter_name("obj12"));
+        assert!(is_counter_name("arr1"));
+        assert!(!is_counter_name("i"));
+        assert!(!is_counter_name("length_1"));
+        assert!(!is_counter_name("email"));
+        assert!(!is_counter_name("s0_r3"));
+    }
+
+    /// B1: a primitive inferred from another definition never beats the declared `Object`.
+    #[test]
+    fn call_result_type_declared_object_beats_inferred_primitive() {
+        assert_eq!(call_result_type("java.lang.Object", Some("int")), "java.lang.Object");
+        assert_eq!(
+            call_result_type("java.lang.Object", Some("android.os.PowerManager")),
+            "android.os.PowerManager"
+        );
+        assert_eq!(call_result_type("java.lang.Object", None), "java.lang.Object");
+        assert_eq!(
+            call_result_type("android.content.SharedPreferences", Some("java.lang.String")),
+            "android.content.SharedPreferences"
+        );
+    }
+
+    /// B2: parameter v1 is reassigned on one path only; at the join it may still hold the
+    /// incoming value, so `const/4 v1, 0` must not be folded into `if-eqz v1`.
+    #[test]
+    fn fold_skips_param_reassigned_on_one_path() {
+        let bytecode = [
+            0x38, 0x00, 0x03, 0x00, // 00: if-eqz v0, +3 -> 06
+            0x12, 0x01, // 04: const/4 v1, 0
+            0x38, 0x01, 0x03, 0x00, // 06: if-eqz v1, +3 -> 0c
+            0x0e, 0x00, // 0a: return-void
+            0x0e, 0x00, // 0c: return-void
+        ];
+        let instructions = decode_all(&bytecode, 0).unwrap();
+        let condition_for = |ins: &Instruction| format_condition(ins.mnemonic(), ins.operands());
+        let mut cfg = MethodCfg::build(&instructions, &bytecode, 0, &condition_for);
+        let webs = DefWebs::build(&cfg, &instructions, &[], &[1]);
+        Decompiler::fold_constants_into_conditions(&mut cfg, &instructions, None, Some(&webs));
+        let branch = cfg.block_id_at_offset(6).expect("block at 06");
+        match &cfg.blocks[branch].end {
+            BlockEnd::Conditional { condition, .. } => {
+                assert!(condition.contains("v1"), "{condition}")
+            }
+            other => panic!("expected conditional, got {other:?}"),
+        }
+        assert!(!cfg.folded_const_offsets.contains(&4));
+    }
+
+    /// R1: a register defined twice by two independent webs gets two names.
+    #[test]
+    fn two_webs_of_one_register_get_distinct_names() {
+        let bytecode = [
+            0x12, 0x00, // 00: const/4 v0, 0
+            0x6e, 0x10, 0x00, 0x00, 0x00, 0x00, // 02: invoke-virtual {v0}
+            0x12, 0x10, // 08: const/4 v0, 1
+            0x6e, 0x10, 0x00, 0x00, 0x00, 0x00, // 0a: invoke-virtual {v0}
+            0x0e, 0x00, // 10: return-void
+        ];
+        let instructions = decode_all(&bytecode, 0).unwrap();
+        let condition_for = |ins: &Instruction| format_condition(ins.mnemonic(), ins.operands());
+        let cfg = MethodCfg::build(&instructions, &bytecode, 0, &condition_for);
+        let webs = DefWebs::build(&cfg, &instructions, &[], &[]);
+        let (first, second) = (webs.web(0, 0), webs.web(0, 8));
+        assert_ne!(first, second);
+        let mut state = MethodNameState::default();
+        state.owners.insert("local6".into(), NameOwner::Reg(0));
+        let a = state.claim("local6", first);
+        let b = state.claim("local6", second);
+        assert_eq!(a, "local6");
+        assert_ne!(a, b);
+        assert_eq!(state.claim("local6", first), a);
+        assert_eq!(state.claim("local6", second), b);
+    }
+
+    /// R2: a temp that would take a parameter's name is renamed; the parameter keeps it.
+    #[test]
+    fn temp_never_takes_a_parameter_name() {
+        let entry: DefKey = (3, ENTRY_DEF);
+        let mut state = MethodNameState::default();
+        state.owners.insert("p0".into(), NameOwner::Web(entry));
+        let temp = state.claim("p0", (1, 4));
+        assert_ne!(temp, "p0");
+        let reuse = state.claim("p0", (3, 6));
+        assert_ne!(reuse, "p0");
+        assert_ne!(reuse, temp);
+        assert_eq!(state.claim("p0", entry), "p0");
+    }
+
+    /// S3: every move-exception web takes the name of the emitted catch clause; any other
+    /// web asking for it gets its own name.
+    #[test]
+    fn exception_web_takes_the_catch_clause_name() {
+        let mut state = MethodNameState::default();
+        state.owners.insert(CATCH_VAR.into(), NameOwner::Catch);
+        assert_eq!(state.name_exception((1, 2)), CATCH_VAR);
+        assert_eq!(state.name_exception((3, 8)), CATCH_VAR);
+        assert_eq!(state.web_names.get(&(1, 2)).map(String::as_str), Some(CATCH_VAR));
+        assert_ne!(state.claim(CATCH_VAR, (0, 4)), CATCH_VAR);
+    }
+
+    /// T3 (001173 a()): three constants loaded in turn into v1, each read once, the first
+    /// one inside a try whose handler reads v1: three webs, three names.
+    #[test]
+    fn three_consts_on_one_register_get_three_names() {
+        let bytecode = [
+            0x1a, 0x01, 0x00, 0x00, // 00: const-string v1, string@0
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 04: invoke-virtual {v1}
+            0x1a, 0x01, 0x01, 0x00, // 0a: const-string v1, string@1
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 0e: invoke-virtual {v1}
+            0x12, 0x01, // 14: const/4 v1, 0
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 16: invoke-virtual {v1}
+            0x0e, 0x00, // 1c: return-void
+            0x0d, 0x00, // 1e: move-exception v0
+            0x6e, 0x10, 0x00, 0x00, 0x01, 0x00, // 20: invoke-virtual {v1}
+            0x0e, 0x00, // 26: return-void
+        ];
+        let instructions = decode_all(&bytecode, 0).unwrap();
+        let condition_for = |ins: &Instruction| format_condition(ins.mnemonic(), ins.operands());
+        let mut cfg = MethodCfg::build(&instructions, &bytecode, 0, &condition_for);
+        cfg.split_at_offsets(&[0x1e]);
+        let edges: Vec<def_webs::ExcEdge> = cfg
+            .exceptional_edges_for_range(0, 0x0a, &[0x1e])
+            .into_iter()
+            .map(|(from, to)| (from, to, 0, 0x0a))
+            .collect();
+        let webs = DefWebs::build(&cfg, &instructions, &edges, &[]);
+        let mut state = MethodNameState::default();
+        state.owners.insert("s1".into(), NameOwner::Reg(1));
+        let names: BTreeSet<String> = [0x00, 0x0a, 0x14]
+            .iter()
+            .map(|&def| state.claim("s1", webs.web(1, def)))
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+    }
+
+    /// `D0.T.c(Object, Object)`: the call result is cast again in its register, and the
+    /// second parameter's register is reused for `S1.e.c`, passed to `f` and returned.
+    #[test]
+    fn recast_call_result_and_reused_parameter_register_stay_declared() {
+        const OBJECT: &str = "Ljava/lang/Object;";
+        const A: &str = "(LW1/d;Ljava/lang/Object;)LW1/d;";
+        const F: &str = "(Ljava/lang/Object;)Ljava/lang/Object;";
+        const C: &str = "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;";
+        let mut builder = dex_parser::DexBuilder::new();
+        for ty in [OBJECT, "LD0/T;", "Lm2/s;", "LW1/d;"] {
+            builder.intern_type(ty);
+        }
+        builder.intern_field_ref("LS1/e;", "c", "LS1/e;");
+        builder.intern_method_ref("LD0/T;", "a", A);
+        builder.intern_method_ref("LD0/T;", "f", F);
+        builder.intern_method_ref("LD0/T;", "c", C);
+        let pools = builder.pool_maps();
+        let le = |idx: u32| u16::try_from(idx).expect("16-bit index").to_le_bytes();
+        let ty = |d: &str| le(pools.ty(d).expect("type"));
+        let (m2, w1, t) = (ty("Lm2/s;"), ty("LW1/d;"), ty("LD0/T;"));
+        let field = le(pools.field("LS1/e;", "c", "LS1/e;").expect("field"));
+        let a = le(pools.method("LD0/T;", "a", A).expect("method a"));
+        let f = le(pools.method("LD0/T;", "f", F).expect("method f"));
+        let insns = vec![
+            0x1f, 0x01, m2[0], m2[1], // 00: check-cast v1, m2.s
+            0x1f, 0x02, w1[0], w1[1], // 04: check-cast v2, W1.d
+            0x6e, 0x30, a[0], a[1], 0x20, 0x01, // 08: invoke-virtual {v0, v2, v1}, T.a
+            0x0c, 0x01, // 0e: move-result-object v1
+            0x1f, 0x01, t[0], t[1], // 10: check-cast v1, D0.T
+            0x62, 0x02, field[0], field[1], // 14: sget-object v2, S1.e.c
+            0x6e, 0x20, f[0], f[1], 0x21, 0x00, // 18: invoke-virtual {v1, v2}, T.f
+            0x11, 0x02, // 1e: return-object v2
+        ];
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "LD0/T;".into(),
+            access_flags: 1,
+            superclass: Some(OBJECT.into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![],
+            direct_methods: vec![],
+            virtual_methods: vec![dex_parser::BuiltMethod {
+                class: "LD0/T;".into(),
+                name: "c".into(),
+                proto: C.into(),
+                access_flags: 1,
+                direct: false,
+                code: Some(dex_parser::BuiltCode {
+                    registers_size: 3,
+                    ins_size: 3,
+                    outs_size: 3,
+                    insns,
+                    ..Default::default()
+                }),
+            }],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        let java = Decompiler::new(&dex).decompile().expect("decompile");
+        let lines: Vec<&str> = java.lines().map(str::trim).collect();
+
+        let read = lines
+            .iter()
+            .find(|l| l.ends_with("e.c;"))
+            .unwrap_or_else(|| panic!("no read of S1.e.c:\n{java}"));
+        let (lhs, _) = read.split_once(" = ").expect("assignment");
+        let &[_, var] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {read}\n{java}");
+        };
+        let passed = format!(".f({var});");
+        assert!(lines.iter().any(|l| l.ends_with(&passed)), "{java}");
+        assert!(lines.contains(&format!("return {var};").as_str()), "{java}");
+
+        let call = lines
+            .iter()
+            .find(|l| l.contains("this.a("))
+            .unwrap_or_else(|| panic!("no call to a:\n{java}"));
+        let (lhs, rhs) = call.split_once(" = ").expect("assignment");
+        let &[ty, _] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {call}\n{java}");
+        };
+        // Declared at the type of its cast only with the cast in the assignment.
+        assert_eq!(ty, "D0.T", "{java}");
+        assert!(rhs.starts_with("(D0.T) this.a("), "{java}");
+    }
+
+    /// `f.f.invalidateDrawable(Drawable)`: `this.d` read into v0 and cast right after: the
+    /// read is declared at the cast type, cast in its assignment.
+    #[test]
+    fn field_read_cast_right_after_is_declared_at_the_cast_type() {
+        const DRAWABLE: &str = "Landroid/graphics/drawable/Drawable;";
+        const INVALIDATE: &str = "(Landroid/graphics/drawable/Drawable;)V";
+        let mut builder = dex_parser::DexBuilder::new();
+        for ty in ["Ljava/lang/Object;", "Lf/f;", "Ln0/e;"] {
+            builder.intern_type(ty);
+        }
+        builder.intern_field_ref("Lf/f;", "d", DRAWABLE);
+        builder.intern_method_ref("Ln0/e;", "invalidateSelf", "()V");
+        builder.intern_method_ref("Lf/f;", "invalidateDrawable", INVALIDATE);
+        let pools = builder.pool_maps();
+        let le = |idx: u32| u16::try_from(idx).expect("16-bit index").to_le_bytes();
+        let field = le(pools.field("Lf/f;", "d", DRAWABLE).expect("field"));
+        let cast = le(pools.ty("Ln0/e;").expect("type"));
+        let call = le(pools.method("Ln0/e;", "invalidateSelf", "()V").expect("call"));
+        let insns = vec![
+            0x54, 0x10, field[0], field[1], // 00: iget-object v0, v1, f.d
+            0x1f, 0x00, cast[0], cast[1], // 04: check-cast v0, n0.e
+            0x6e, 0x10, call[0], call[1], 0x00, 0x00, // 08: invoke-virtual {v0}, invalidateSelf
+            0x0e, 0x00, // 0e: return-void
+        ];
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "Lf/f;".into(),
+            access_flags: 1,
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![dex_parser::BuiltField {
+                class: "Lf/f;".into(),
+                name: "d".into(),
+                typ: DRAWABLE.into(),
+                access_flags: 0,
+                static_field: false,
+                static_value: None,
+            }],
+            direct_methods: vec![],
+            virtual_methods: vec![dex_parser::BuiltMethod {
+                class: "Lf/f;".into(),
+                name: "invalidateDrawable".into(),
+                proto: INVALIDATE.into(),
+                access_flags: 1,
+                direct: false,
+                code: Some(dex_parser::BuiltCode {
+                    registers_size: 3,
+                    ins_size: 2,
+                    outs_size: 1,
+                    insns,
+                    ..Default::default()
+                }),
+            }],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        let java = Decompiler::new(&dex).decompile().expect("decompile");
+        let lines: Vec<&str> = java.lines().map(str::trim).collect();
+
+        let read = lines
+            .iter()
+            .find(|l| l.ends_with("this.d;"))
+            .unwrap_or_else(|| panic!("no read of this.d:\n{java}"));
+        let (lhs, rhs) = read.split_once(" = ").expect("assignment");
+        let &[ty, var] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {read}\n{java}");
+        };
+        assert_eq!(ty, "n0.e", "{java}");
+        assert_eq!(rhs, "(n0.e) this.d;", "{java}");
+        let call = format!("{var}.invalidateSelf();");
+        assert!(lines.contains(&call.as_str()), "{java}");
+        assert!(!java.contains(&format!("(n0.e) {var}")), "{java}");
+    }
+
+    /// Static `M.f0.e(View)`: `instance-of` on the parameter, whose register another branch
+    /// reuses for an `Object` field cast to `View`.
+    #[test]
+    fn instance_of_on_a_reused_parameter_register_names_the_parameter() {
+        const OBJECT: &str = "Ljava/lang/Object;";
+        const VIEW: &str = "Landroid/view/View;";
+        const GROUP: &str = "Landroid/view/ViewGroup;";
+        let mut builder = dex_parser::DexBuilder::new();
+        for ty in [OBJECT, "LM/f0;", VIEW, GROUP] {
+            builder.intern_type(ty);
+        }
+        builder.intern_field_ref("LM/f0;", "g", OBJECT);
+        builder.intern_method_ref(VIEW, "invalidate", "()V");
+        builder.intern_method_ref("LM/f0;", "e", "(Landroid/view/View;)V");
+        let pools = builder.pool_maps();
+        let le = |idx: u32| u16::try_from(idx).expect("16-bit index").to_le_bytes();
+        let group = le(pools.ty(GROUP).expect("type"));
+        let view = le(pools.ty(VIEW).expect("type"));
+        let field = le(pools.field("LM/f0;", "g", OBJECT).expect("field"));
+        let call = le(pools.method(VIEW, "invalidate", "()V").expect("method"));
+        let insns = vec![
+            0x20, 0x10, group[0], group[1], // 00: instance-of v0, v1, ViewGroup
+            0x38, 0x00, 0x06, 0x00, // 04: if-eqz v0, +6 -> 10
+            0x6e, 0x10, call[0], call[1], 0x01, 0x00, // 08: invoke-virtual {v1}, invalidate
+            0x0e, 0x00, // 0e: return-void
+            0x62, 0x01, field[0], field[1], // 10: sget-object v1, M.f0.g
+            0x1f, 0x01, view[0], view[1], // 14: check-cast v1, View
+            0x6e, 0x10, call[0], call[1], 0x01, 0x00, // 18: invoke-virtual {v1}, invalidate
+            0x0e, 0x00, // 1e: return-void
+        ];
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "LM/f0;".into(),
+            access_flags: 1,
+            superclass: Some(OBJECT.into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![],
+            direct_methods: vec![dex_parser::BuiltMethod {
+                class: "LM/f0;".into(),
+                name: "e".into(),
+                proto: "(Landroid/view/View;)V".into(),
+                access_flags: 0x9,
+                direct: true,
+                code: Some(dex_parser::BuiltCode {
+                    registers_size: 2,
+                    ins_size: 1,
+                    outs_size: 1,
+                    insns,
+                    ..Default::default()
+                }),
+            }],
+            virtual_methods: vec![],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        let java = Decompiler::new(&dex).decompile().expect("decompile");
+
+        let test = java
+            .lines()
+            .find(|l| l.contains(" instanceof "))
+            .unwrap_or_else(|| panic!("no instanceof:\n{java}"));
+        assert!(test.contains("(view instanceof "), "{java}");
+    }
+
+    const ITERATOR: &str = "Ljava/util/Iterator;";
+    const NEXT: &str = "()Ljava/lang/Object;";
+
+    /// Decompiles `k.K.m<proto>` (a virtual method unless `access_flags` has `static`),
+    /// with `Iterator.next`, `p.Foo.bar()`, `k.K.k(Object)`, the `Object` fields `k.K.o`,
+    /// `k.S.a`, `k.S.b` and the types `p.Foo`, `p.A`, `p.B`, `v0.f` interned for `body`.
+    fn decompile_cast_method(
+        proto: &str,
+        access_flags: u32,
+        registers: u16,
+        ins: u16,
+        body: impl FnOnce(&dex_parser::PoolMaps) -> Vec<u8>,
+    ) -> String {
+        const OBJECT: &str = "Ljava/lang/Object;";
+        let mut builder = dex_parser::DexBuilder::new();
+        for ty in [OBJECT, "Lk/K;", "Lp/Foo;", "Lp/A;", "Lp/B;", "Lv0/f;", ITERATOR] {
+            builder.intern_type(ty);
+        }
+        builder.intern_method_ref(ITERATOR, "next", NEXT);
+        builder.intern_method_ref("Lp/Foo;", "bar", "()V");
+        builder.intern_method_ref("Lk/K;", "k", "(Ljava/lang/Object;)V");
+        builder.intern_method_ref("Lk/K;", "m", proto);
+        builder.intern_field_ref("Lk/K;", "o", OBJECT);
+        builder.intern_field_ref("Lk/S;", "a", OBJECT);
+        builder.intern_field_ref("Lk/S;", "b", OBJECT);
+        let insns = body(&builder.pool_maps());
+        let is_static = access_flags & 0x8 != 0;
+        let method = dex_parser::BuiltMethod {
+            class: "Lk/K;".into(),
+            name: "m".into(),
+            proto: proto.into(),
+            access_flags,
+            direct: is_static,
+            code: Some(dex_parser::BuiltCode {
+                registers_size: registers,
+                ins_size: ins,
+                outs_size: registers,
+                insns,
+                ..Default::default()
+            }),
+        };
+        let (direct_methods, virtual_methods) = if is_static {
+            (vec![method], vec![])
+        } else {
+            (vec![], vec![method])
+        };
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "Lk/K;".into(),
+            access_flags: 1,
+            superclass: Some(OBJECT.into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![dex_parser::BuiltField {
+                class: "Lk/K;".into(),
+                name: "o".into(),
+                typ: OBJECT.into(),
+                access_flags: 0,
+                static_field: false,
+                static_value: None,
+            }],
+            direct_methods,
+            virtual_methods,
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        Decompiler::new(&dex).decompile().expect("decompile")
+    }
+
+    fn le16(idx: dex_parser::Result<u32>) -> [u8; 2] {
+        u16::try_from(idx.expect("pool index"))
+            .expect("16-bit index")
+            .to_le_bytes()
+    }
+
+    /// The line ending in `load` reads `p.Foo var = (p.Foo) …load`, and `var.bar()` is
+    /// called without a cast.
+    fn assert_foo_cast_at_assignment(java: &str, load: &str) {
+        let lines: Vec<&str> = java.lines().map(str::trim).collect();
+        let line = lines
+            .iter()
+            .find(|l| l.ends_with(load))
+            .unwrap_or_else(|| panic!("no {load}:\n{java}"));
+        let (lhs, rhs) = line.split_once(" = ").expect("assignment");
+        let &[ty, var] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {line}\n{java}");
+        };
+        assert_eq!(ty, "p.Foo", "{java}");
+        assert!(rhs.starts_with("(p.Foo) "), "{java}");
+        let call = format!("{var}.bar();");
+        assert!(lines.contains(&call.as_str()), "{java}");
+        assert!(!java.contains(&format!("(p.Foo) {var}")), "{java}");
+    }
+
+    /// `Foo f = (Foo) it.next();`: the erased call result takes the type of the check-cast
+    /// right after it, the cast in its assignment.
+    #[test]
+    fn erased_call_result_is_declared_at_its_cast_type() {
+        let java = decompile_cast_method("(Ljava/util/Iterator;)V", 0x9, 2, 1, |pools| {
+            let next = le16(pools.method(ITERATOR, "next", NEXT));
+            let foo = le16(pools.ty("Lp/Foo;"));
+            let bar = le16(pools.method("Lp/Foo;", "bar", "()V"));
+            vec![
+                0x72, 0x10, next[0], next[1], 0x01, 0x00, // 00: invoke-interface {v1}, next
+                0x0c, 0x00, // 06: move-result-object v0
+                0x1f, 0x00, foo[0], foo[1], // 08: check-cast v0, p.Foo
+                0x6e, 0x10, bar[0], bar[1], 0x00, 0x00, // 0c: invoke-virtual {v0}, bar
+                0x0e, 0x00, // 12: return-void
+            ]
+        });
+        assert_foo_cast_at_assignment(&java, ".next();");
+    }
+
+    /// Obfuscated package named like the register cast: `v0` keeps its name in the cast,
+    /// only the operand takes the call.
+    #[test]
+    fn cast_to_a_package_named_like_its_register_keeps_the_type() {
+        let java = decompile_cast_method("(Ljava/util/Iterator;)V", 0x9, 2, 1, |pools| {
+            let next = le16(pools.method(ITERATOR, "next", NEXT));
+            let f = le16(pools.ty("Lv0/f;"));
+            let k = le16(pools.method("Lk/K;", "k", "(Ljava/lang/Object;)V"));
+            vec![
+                0x72, 0x10, next[0], next[1], 0x01, 0x00, // 00: invoke-interface {v1}, next
+                0x0c, 0x00, // 06: move-result-object v0
+                0x1f, 0x00, f[0], f[1], // 08: check-cast v0, v0.f
+                0x71, 0x10, k[0], k[1], 0x00, 0x00, // 0c: invoke-static {v0}, k.K.k
+                0x0e, 0x00, // 12: return-void
+            ]
+        });
+        let line = java
+            .lines()
+            .map(str::trim)
+            .find(|l| l.ends_with(".next();"))
+            .unwrap_or_else(|| panic!("no call to next:\n{java}"));
+        let (lhs, rhs) = line.split_once(" = ").expect("assignment");
+        let &[ty, _] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {line}\n{java}");
+        };
+        assert_eq!(ty, "v0.f", "{java}");
+        assert!(rhs.starts_with("(v0.f) "), "{java}");
+        assert!(!java.contains("(("), "{java}");
+        assert!(!java.contains(".next()).f"), "{java}");
+    }
+
+    /// `Foo f = (Foo) this.o;` for a field typed `Object`.
+    #[test]
+    fn object_field_read_is_declared_at_its_cast_type() {
+        let java = decompile_cast_method("()V", 0x1, 2, 1, |pools| {
+            let field = le16(pools.field("Lk/K;", "o", "Ljava/lang/Object;"));
+            let foo = le16(pools.ty("Lp/Foo;"));
+            let bar = le16(pools.method("Lp/Foo;", "bar", "()V"));
+            vec![
+                0x54, 0x10, field[0], field[1], // 00: iget-object v0, v1, k.K.o
+                0x1f, 0x00, foo[0], foo[1], // 04: check-cast v0, p.Foo
+                0x6e, 0x10, bar[0], bar[1], 0x00, 0x00, // 08: invoke-virtual {v0}, bar
+                0x0e, 0x00, // 0e: return-void
+            ]
+        });
+        assert_foo_cast_at_assignment(&java, "this.o;");
+    }
+
+    /// `Object o = it.next(); if (o instanceof Foo) ((Foo) o).bar();`: the cast does not
+    /// follow the call, `o` stays an `Object` cast where it is used.
+    #[test]
+    fn value_tested_by_instanceof_before_its_cast_stays_an_object() {
+        let java = decompile_cast_method("(Ljava/util/Iterator;)V", 0x9, 3, 1, |pools| {
+            let next = le16(pools.method(ITERATOR, "next", NEXT));
+            let foo = le16(pools.ty("Lp/Foo;"));
+            let bar = le16(pools.method("Lp/Foo;", "bar", "()V"));
+            vec![
+                0x72, 0x10, next[0], next[1], 0x02, 0x00, // 00: invoke-interface {v2}, next
+                0x0c, 0x00, // 06: move-result-object v0
+                0x20, 0x01, foo[0], foo[1], // 08: instance-of v1, v0, p.Foo
+                0x38, 0x01, 0x07, 0x00, // 0c: if-eqz v1, +7 -> 1a
+                0x1f, 0x00, foo[0], foo[1], // 10: check-cast v0, p.Foo
+                0x6e, 0x10, bar[0], bar[1], 0x00, 0x00, // 14: invoke-virtual {v0}, bar
+                0x0e, 0x00, // 1a: return-void
+            ]
+        });
+        let lines: Vec<&str> = java.lines().map(str::trim).collect();
+        let line = lines
+            .iter()
+            .find(|l| l.ends_with(".next();"))
+            .unwrap_or_else(|| panic!("no call to next:\n{java}"));
+        let (lhs, rhs) = line.split_once(" = ").expect("assignment");
+        let &[ty, var] = lhs.split_whitespace().collect::<Vec<_>>().as_slice() else {
+            panic!("undeclared: {line}\n{java}");
+        };
+        assert_eq!(ty, "Object", "{java}");
+        assert!(!rhs.contains("(p.Foo)"), "{java}");
+        assert!(java.contains(&format!("(p.Foo) {var}")), "{java}");
+    }
+
+    /// One variable loaded on two paths, cast to `p.A` on one and `p.B` on the other: no
+    /// single cast type, each cast stays apart from its load.
+    #[test]
+    fn loads_cast_to_two_types_keep_their_casts_apart() {
+        let java = decompile_cast_method("(I)V", 0x9, 2, 1, |pools| {
+            let a = le16(pools.field("Lk/S;", "a", "Ljava/lang/Object;"));
+            let b = le16(pools.field("Lk/S;", "b", "Ljava/lang/Object;"));
+            let ta = le16(pools.ty("Lp/A;"));
+            let tb = le16(pools.ty("Lp/B;"));
+            let k = le16(pools.method("Lk/K;", "k", "(Ljava/lang/Object;)V"));
+            vec![
+                0x38, 0x01, 0x07, 0x00, // 00: if-eqz v1, +7 -> 0e
+                0x62, 0x00, a[0], a[1], // 04: sget-object v0, k.S.a
+                0x1f, 0x00, ta[0], ta[1], // 08: check-cast v0, p.A
+                0x28, 0x05, // 0c: goto +5 -> 16
+                0x62, 0x00, b[0], b[1], // 0e: sget-object v0, k.S.b
+                0x1f, 0x00, tb[0], tb[1], // 12: check-cast v0, p.B
+                0x71, 0x10, k[0], k[1], 0x00, 0x00, // 16: invoke-static {v0}, k.K.k
+                0x0e, 0x00, // 1c: return-void
+            ]
+        });
+        let lines: Vec<&str> = java.lines().map(str::trim).collect();
+        for (ty, field) in [("p.A", "S.a"), ("p.B", "S.b")] {
+            let cast = format!("({ty}) ");
+            let line = lines
+                .iter()
+                .find(|l| l.contains(&cast))
+                .unwrap_or_else(|| panic!("no cast to {ty}:\n{java}"));
+            assert!(!line.contains(field), "{java}");
+            let declared = format!("{ty} ");
+            assert!(
+                !lines.iter().any(|l| l.starts_with(&declared) && l.contains(field)),
+                "{java}"
+            );
+        }
+    }
+
+    /// Decompiles static `k.K.m()V`, whose body `body` builds from the index of the
+    /// static method `k.K.<callee><proto>` it calls.
+    fn decompile_static_call(
+        callee: &str,
+        proto: &str,
+        registers: u16,
+        body: impl FnOnce([u8; 2]) -> Vec<u8>,
+    ) -> String {
+        let mut builder = dex_parser::DexBuilder::new();
+        builder.intern_type("Ljava/lang/Object;");
+        builder.intern_method_ref("Lk/K;", callee, proto);
+        builder.intern_method_ref("Lk/K;", "m", "()V");
+        let pools = builder.pool_maps();
+        let call = pools.method("Lk/K;", callee, proto).expect("callee");
+        let insns = body(u16::try_from(call).expect("16-bit index").to_le_bytes());
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "Lk/K;".into(),
+            access_flags: 1,
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![],
+            direct_methods: vec![dex_parser::BuiltMethod {
+                class: "Lk/K;".into(),
+                name: "m".into(),
+                proto: "()V".into(),
+                access_flags: 0x9,
+                direct: true,
+                code: Some(dex_parser::BuiltCode {
+                    registers_size: registers,
+                    ins_size: 0,
+                    outs_size: registers,
+                    insns,
+                    ..Default::default()
+                }),
+            }],
+            virtual_methods: vec![],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        Decompiler::new(&dex).decompile().expect("decompile")
+    }
+
+    #[test]
+    fn high16_constant_passed_as_float_is_a_float_literal() {
+        let java = decompile_static_call("f", "(F)V", 1, |call| {
+            vec![
+                0x15, 0x00, 0x80, 0x3f, // 00: const/high16 v0, 0x3f80
+                0x71, 0x10, call[0], call[1], 0x00, 0x00, // 04: invoke-static {v0}, f(F)V
+                0x0e, 0x00, // 0a: return-void
+            ]
+        });
+        assert!(java.contains("1.0f"), "{java}");
+        assert!(!java.contains("1065353216"), "{java}");
+    }
+
+    #[test]
+    fn wide_high16_constant_passed_as_double_is_a_double_literal() {
+        let java = decompile_static_call("d", "(D)V", 2, |call| {
+            vec![
+                0x19, 0x00, 0x14, 0x40, // 00: const-wide/high16 v0, 0x4014
+                0x71, 0x20, call[0], call[1], 0x10, 0x00, // 04: invoke-static {v0, v1}, d(D)V
+                0x0e, 0x00, // 0a: return-void
+            ]
+        });
+        assert!(java.contains("5.0"), "{java}");
+        assert!(!java.contains("4617315517961601024"), "{java}");
+        assert!(!java.contains("0x4014"), "{java}");
+    }
+
+    #[test]
+    fn small_constant_passed_as_int_stays_an_int() {
+        let java = decompile_static_call("i", "(I)V", 1, |call| {
+            vec![
+                0x12, 0x10, // 00: const/4 v0, 1
+                0x71, 0x10, call[0], call[1], 0x00, 0x00, // 02: invoke-static {v0}, i(I)V
+                0x0e, 0x00, // 08: return-void
+            ]
+        });
+        let one = java
+            .lines()
+            .any(|l| l.contains("(1)") || l.trim_end().ends_with(" = 1;"));
+        assert!(one, "{java}");
+        assert!(!java.contains("1.0"), "{java}");
+    }
+
+    #[test]
+    fn text_rewrites_keep_non_ascii() {
+        let mut names = DetHashMap::default();
+        names.insert(0u32, "count".to_string());
+        assert_eq!(
+            replace_register_names("v0.equals(\"┌─┐ 友盟\")", &names),
+            "count.equals(\"┌─┐ 友盟\")"
+        );
+        assert_eq!(
+            replace_ident_in_body("return p0 + \"╚═╝ 日志\";", "p0", "it"),
+            "return it + \"╚═╝ 日志\";"
+        );
+    }
+
+    #[test]
+    fn invoke_split_non_ascii_before_comma() {
+        assert_eq!(
+            to_receiver_style("pkg.Clz.m", "café, v1"),
+            ("café.m".to_string(), "v1".to_string())
+        );
+        assert_eq!(
+            to_super_style("pkg.Clz.m", "this问, v1"),
+            ("super.m".to_string(), "v1".to_string())
+        );
+        let (name, args, _) =
+            parse_invoke_call_parts("café, v1, pkg.Clz.m(java.lang.String, int)").unwrap();
+        assert_eq!(name, "pkg.Clz.m");
+        assert_eq!(args, "café, v1");
+    }
+
+    #[test]
+    fn replace_register_names_skips_literals() {
+        let names = DetHashMap::from_iter([(1, "this".to_string())]);
+        let out = replace_register_names(r#"v1.equals("ota/api/conf/v1")"#, &names);
+        assert_eq!(out, r#"this.equals("ota/api/conf/v1")"#);
+    }
+
+    #[test]
+    fn replace_register_names_skips_a_literal_with_an_escaped_quote() {
+        let names = DetHashMap::from_iter([(1, "this".to_string())]);
+        let out = replace_register_names(r#"v1.equals("a\"v1\"b")"#, &names);
+        assert_eq!(out, r#"this.equals("a\"v1\"b")"#);
+    }
+
+    #[test]
+    fn replace_ident_in_body_skips_literals() {
+        let body = "    return p0 + \"p0\" + 'p';\n";
+        let out = replace_ident_in_body(body, "p0", "context");
+        assert_eq!(out, "    return context + \"p0\" + 'p';\n");
+    }
+
+    #[test]
+    fn replace_ident_in_body_skips_a_literal_with_an_escaped_quote() {
+        let out = replace_ident_in_body(r#"f("a\"p0\"b", p0);"#, "p0", "context");
+        assert_eq!(out, r#"f("a\"p0\"b", context);"#);
+    }
+
+    const STRUCTURER_VAR: &str = "DEX_DECOMPILER_STRUCTURER";
+    /// Serializes the tests that set `DEX_DECOMPILER_STRUCTURER`.
+    static STRUCTURER_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets the structurer variable while alive, then restores it.
+    struct StructurerEnv {
+        saved: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl StructurerEnv {
+        fn set(value: Option<&str>) -> Self {
+            let lock = STRUCTURER_ENV.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = std::env::var_os(STRUCTURER_VAR);
+            match value {
+                Some(v) => std::env::set_var(STRUCTURER_VAR, v),
+                None => std::env::remove_var(STRUCTURER_VAR),
+            }
+            Self { saved, _lock: lock }
+        }
+    }
+
+    impl Drop for StructurerEnv {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(STRUCTURER_VAR, v),
+                None => std::env::remove_var(STRUCTURER_VAR),
+            }
+        }
+    }
+
+    /// `static int sum(int n) { int s = 0; for (int i = 0; i < n; i++) s += i; return s; }`
+    const SUM_LOOP_INSNS: [u8; 18] = [
+        0x12, 0x00, // 00: const/4 v0, 0
+        0x12, 0x01, // 01: const/4 v1, 0
+        0x35, 0x21, 0x06, 0x00, // 02: if-ge v1, v2, +6 -> 08
+        0xb0, 0x10, // 04: add-int/2addr v0, v1
+        0xd8, 0x01, 0x01, 0x01, // 05: add-int/lit8 v1, v1, 1
+        0x28, 0xfb, // 07: goto -5 -> 02
+        0x0f, 0x00, // 08: return v0
+    ];
+
+    fn sum_loop_class_java() -> String {
+        let mut builder = dex_parser::DexBuilder::new();
+        builder.add_class(dex_parser::BuiltClass {
+            descriptor: "LS/Sum;".into(),
+            access_flags: 1,
+            superclass: Some("Ljava/lang/Object;".into()),
+            interfaces: vec![],
+            source_file: None,
+            static_fields: vec![],
+            instance_fields: vec![],
+            direct_methods: vec![dex_parser::BuiltMethod {
+                class: "LS/Sum;".into(),
+                name: "sum".into(),
+                proto: "(I)I".into(),
+                access_flags: 0x9,
+                direct: true,
+                code: Some(dex_parser::BuiltCode {
+                    registers_size: 3,
+                    ins_size: 1,
+                    outs_size: 0,
+                    insns: SUM_LOOP_INSNS.to_vec(),
+                    ..Default::default()
+                }),
+            }],
+            virtual_methods: vec![],
+            annotations: Default::default(),
+        });
+        let bytes = builder.finish().expect("dex");
+        let dex = DexFile::parse(&bytes).expect("parse");
+        Decompiler::new(&dex).decompile().expect("decompile")
+    }
+
+    const JAVA_WORDS: &[&str] = &[
+        "int", "while", "for", "do", "if", "else", "return", "break", "continue", "true", "false",
+    ];
+
+    fn idents(s: &str) -> Vec<&str> {
+        s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .filter(|w| {
+                w.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            })
+            .collect()
+    }
+
+    /// Signature line and trimmed statements of method `name`.
+    fn method_statements<'a>(java: &'a str, name: &str) -> (&'a str, Vec<&'a str>) {
+        let lines: Vec<&str> = java.lines().collect();
+        let call = format!(" {name}(");
+        let start = lines
+            .iter()
+            .position(|l| l.contains(&call) && l.trim_end().ends_with('{'))
+            .unwrap_or_else(|| panic!("no method {name}:\n{java}"));
+        let mut depth = 0i32;
+        let mut body = Vec::new();
+        for (k, l) in lines[start..].iter().enumerate() {
+            let t = l.trim();
+            if k > 0 && depth == 1 && t == "}" {
+                break;
+            }
+            if k > 0 && !t.is_empty() {
+                body.push(t);
+            }
+            depth += t.matches('{').count() as i32 - t.matches('}').count() as i32;
+        }
+        (lines[start].trim(), body)
+    }
+
+    /// Statement without a leading `label: `.
+    fn unlabeled(t: &str) -> &str {
+        match t.split_once(": ") {
+            Some((label, rest)) if idents(label) == [label] => rest,
+            _ => t,
+        }
+    }
+
+    fn is_loop_statement(t: &str) -> bool {
+        let t = unlabeled(t);
+        t.starts_with("while (") || t.starts_with("for (") || t.starts_with("do {")
+    }
+
+    /// `stmt` gives `v` a value that does not depend on `v` (a for loop by its init).
+    fn defines(stmt: &str, v: &str) -> bool {
+        let init = stmt
+            .strip_prefix("for (")
+            .and_then(|r| r.split(';').next())
+            .unwrap_or(stmt);
+        let init = init.strip_prefix("int ").unwrap_or(init);
+        init.split_once(" = ")
+            .is_some_and(|(lhs, rhs)| lhs.trim() == v && !idents(rhs).contains(&v))
+    }
+
+    /// In statement order, each name first appears where it receives a value.
+    fn assert_defined_before_use(body: &[&str], param: &str, java: &str) {
+        let labels: Vec<&str> = body
+            .iter()
+            .filter_map(|t| t.split_once(": ").map(|(l, _)| l))
+            .filter(|l| idents(l) == [*l])
+            .collect();
+        let mut defined: Vec<&str> = vec![param];
+        for &t in body {
+            let code = t.split("//").next().unwrap_or(t);
+            for v in idents(code) {
+                if JAVA_WORDS.contains(&v) || labels.contains(&v) || defined.contains(&v) {
+                    continue;
+                }
+                assert!(defines(code, v), "`{v}` used before it has a value:\n{java}");
+                defined.push(v);
+            }
+        }
+    }
+
+    #[test]
+    fn dominator_structurer_sum_loop_initializes_before_the_loop() {
+        let java = {
+            let _env = StructurerEnv::set(None);
+            sum_loop_class_java()
+        };
+        let (signature, body) = method_statements(&java, "sum");
+        let param = signature
+            .split_once("sum(")
+            .and_then(|(_, r)| r.split_once(')'))
+            .and_then(|(p, _)| p.split_whitespace().last())
+            .unwrap_or_else(|| panic!("no parameter:\n{java}"));
+        let loop_at = body
+            .iter()
+            .position(|t| is_loop_statement(t))
+            .unwrap_or_else(|| panic!("no loop:\n{java}"));
+        assert!(!java.contains("goto"), "{java}");
+
+        let sum = body
+            .iter()
+            .find_map(|t| t.strip_prefix("return ").and_then(|r| r.strip_suffix(';')))
+            .unwrap_or_else(|| panic!("no return:\n{java}"));
+        assert!(
+            body[..loop_at].iter().any(|t| defines(t, sum)),
+            "`{sum}` is not initialized before the loop:\n{java}"
+        );
+
+        let head = unlabeled(body[loop_at]);
+        let condition = if let Some(r) = head.strip_prefix("for (") {
+            r.split(';').nth(1).unwrap_or("")
+        } else if let Some(r) = head.strip_prefix("while (") {
+            r.rsplit_once(')').map_or(r, |(c, _)| c)
+        } else {
+            body.iter()
+                .find_map(|t| t.strip_prefix("} while ("))
+                .and_then(|r| r.rsplit_once(')'))
+                .map_or("", |(c, _)| c)
+        };
+        let counters: Vec<&str> = idents(condition)
+            .into_iter()
+            .filter(|v| *v != param && !JAVA_WORDS.contains(v))
+            .collect();
+        assert!(!counters.is_empty(), "no loop counter in `{condition}`:\n{java}");
+        for v in counters {
+            assert!(
+                body[..=loop_at].iter().any(|t| defines(t, v)),
+                "`{v}` is not initialized before the loop:\n{java}"
+            );
+        }
+        assert_defined_before_use(&body, param, &java);
+    }
+
+    /// With the variable, the whole-method path is the one before the dominator structurer:
+    /// same region tree as `build_regions`, emitted with implicit jumps (the flag stays off,
+    /// so the emitter takes its previous branches).
+    #[test]
+    fn legacy_structurer_env_keeps_the_previous_whole_method_path() {
+        let insns = decode_all(&SUM_LOOP_INSNS, 0).unwrap();
+        let cfg = MethodCfg::build(&insns, &SUM_LOOP_INSNS, 0, &|_| "cond".into());
+        let previous = region::format_region_debug(
+            &build_regions(&cfg, cfg.entry).expect("regions"),
+            &cfg,
+        );
+
+        let (legacy_java, legacy_root, legacy_again) = {
+            let _env = StructurerEnv::set(Some("legacy"));
+            (
+                sum_loop_class_java(),
+                whole_method_root(&cfg, true),
+                sum_loop_class_java(),
+            )
+        };
+        let (root, explicit) = legacy_root.expect("root");
+        assert!(!explicit);
+        assert_eq!(region::format_region_debug(&root, &cfg), previous);
+        assert_eq!(legacy_java, legacy_again);
+        assert!(!legacy_java.contains("L0"), "{legacy_java}");
+
+        let new_root = {
+            let _env = StructurerEnv::set(None);
+            whole_method_root(&cfg, true)
+        };
+        let (new_root, explicit) = new_root.expect("root");
+        assert!(explicit, "the dominator structurer handles this body");
+        assert_ne!(region::format_region_debug(&new_root, &cfg), previous);
+    }
 }

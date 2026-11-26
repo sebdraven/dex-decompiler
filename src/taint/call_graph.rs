@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::decompile::value_flow::ValueFlowAnalysisOwned;
-use crate::detectors::is_library_class;
+use crate::detectors::{invokes_by_offset, is_library_class};
 use crate::error::Result;
 
 use super::index::{MethodId, MethodIndex};
@@ -42,7 +42,8 @@ impl CallGraph {
             let Some(owned) = vf_cache.get(&mref.id) else {
                 continue;
             };
-            for (&invoke_offset, method_ref) in &owned.invoke_method_map {
+            let invokes = invokes_by_offset(owned);
+            for &(invoke_offset, method_ref) in &invokes {
                 let callees = index.resolve_callees(method_ref);
                 if callees.is_empty() {
                     continue;
@@ -69,7 +70,7 @@ impl CallGraph {
             }
             // Callback shims: resolve concrete listener/runnable allocations only.
             let analysis = owned.analysis();
-            for (&dispatch_offset, dispatch_ref) in &owned.invoke_method_map {
+            for &(dispatch_offset, dispatch_ref) in &invokes {
                 let Some((callback_reg, target_methods)) = callback_dispatch_info(dispatch_ref)
                 else {
                     continue;
@@ -227,7 +228,7 @@ fn callback_targets(
         if !label.starts_with("move-result") {
             continue;
         }
-        for (&custom_offset, method_ref) in &owned.invoke_method_map {
+        for (custom_offset, method_ref) in invokes_by_offset(owned) {
             if !owned
                 .insn_at
                 .get(&custom_offset)

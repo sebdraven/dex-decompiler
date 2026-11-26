@@ -17,13 +17,24 @@ use super::util::*;
 /// Also collapses "if (cond) { return a; } else { return b; }" into "return cond ? a : b;" (JADX-style).
 /// When `is_constructor` is true, "receiver.<init>();" (no args) is simplified to "super();".
 pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
+    simplify_method_body_with_webs(body, is_constructor, &WebNames::default())
+}
+
+/// `webs`: what the bytecode decided about the names. Parameters are never dropped or
+/// undeclared temps (R2, R4); a web's name is replaced by a value only when it is an
+/// inlinable constant.
+pub(crate) fn simplify_method_body_with_webs(
+    body: &str,
+    is_constructor: bool,
+    webs: &WebNames,
+) -> String {
     let body = restore_synchronized_from_monitors(body);
     let body = fold_running_arithmetic(&body);
     let body = repair_self_ref_postinc_div(&body);
     let body = fold_postinc_division(&body);
     let body = fold_const_break_into_while(&body);
     let body = rewrite_nonreturning_while(&body);
-    let body = fold_array_length_assigns(&body);
+    let body = fold_array_length_assigns_with_webs(&body, webs);
     let body = fold_array_alloc_length_sum(&body);
     let body = fold_array_alloc_length_sum_via_temp(&body);
     let body = repair_merge_index_inits(&body);
@@ -300,22 +311,22 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     out = hoist_loop_bound_length_decl(&out);
     out = repair_missing_loop_else_break(&out);
     // Remove bare "var; /* move-exception */" lines and inline single-use temps (consts / simple copies).
-    out = inline_global_literal_temps(&out);
-    out = repair_self_sized_new_array(&out);
-    out = repair_register_reuse_scalars(&out);
+    out = inline_global_literal_temps_with_webs(&out, webs);
+    out = repair_self_sized_new_array_with_webs(&out, webs);
+    out = repair_register_reuse_scalars_with_webs(&out, webs);
     out = repair_loop_length_index_shadow(&out);
     out = repair_loop_bound_reassigns(&out);
     out = restore_array_store_postincrement(&out);
     out = restore_d8_merge_copy_loops(&out);
     // Fold instanceof into `if` before cleanup drops unused `z0 = x instanceof T`.
     out = fold_instanceof_into_conditions(&out);
-    out = cleanup_decompiler_artifacts(&out);
-    out = repair_self_referential_call_args(&out);
-    out = fix_undeclared_temp_assigns(&out);
+    out = cleanup_decompiler_artifacts_with_webs(&out, webs);
+    out = repair_self_referential_call_args_with_webs(&out, webs);
+    out = fix_undeclared_temp_assigns_with_webs(&out, webs);
     // Merge `x = new T(); x.<init>(args);` → `x = new T(args);`
     out = merge_constructor_calls(&out);
     // Fold `lit; x = lit.equals(y); if (x)` and collapse `!(!z)` conditions.
-    out = fold_equals_into_conditions(&out);
+    out = fold_equals_into_conditions_with_webs(&out, webs);
     // Drop leftover `url = "/login";` before `if ("/login".equals(…))`.
     out = drop_string_lits_folded_into_if(&out);
     // `if (!(lit.equals(x))) { A } else { B }` → `if (lit.equals(x)) { B } else { A }`
@@ -323,7 +334,7 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     // `} else { if (c) {` → `} else if (c) {`
     out = flatten_else_if_chains(&out);
     // Nested scheme/host Uri checks → `a && b`
-    out = merge_nested_uri_component_checks(&out);
+    out = merge_nested_uri_component_checks_with_webs(&out, webs);
     // General nested `if (A) { if (B) { BODY } }` → `if (A && B) { BODY }`
     out = merge_nested_if_and(&out);
     // `if (A) { BODY } else if (B) { BODY }` → `if (A || B) { BODY }`
@@ -362,13 +373,13 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     // `Integer[] a = new Integer[2]; a[0]=…; Arrays.asList(a)` → `Arrays.asList(…)`
     out = fold_arrays_as_list_filled_array(&out);
     // `int[] a = new int[]{…}; foo(a)` → `foo(new int[]{…})` (not into `new T[][]{ a }`)
-    out = inline_filled_array_into_calls(&out);
+    out = inline_filled_array_into_calls_with_webs(&out, webs);
     // `path = uri.getScheme(); if ("x".equals(path))` → inline getter into if when single-use.
-    out = inline_single_use_into_equals_if(&out);
+    out = inline_single_use_into_equals_if_with_webs(&out, webs);
     // `.setJavaScriptEnabled(1)` → `.setJavaScriptEnabled(true)` for boolean-looking APIs.
     out = polish_booleanish_int_args(&out);
     // `obj == 0` / `!= 0` → null when the name looks like a reference.
-    out = polish_null_comparisons_in_body(&out);
+    out = polish_null_comparisons_in_body_with_webs(&out, webs);
     // `x instanceof T == 0/null` → `!(x instanceof T)`, then flip if-eqz skip layout.
     out = polish_instanceof_comparisons_in_body(&out);
     out = flip_negated_instanceof_if_else(&out);
@@ -379,7 +390,7 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     out = restore_counting_for_loop(&out);
     out = hoist_loop_bound_length_decl(&out);
     out = repair_missing_loop_else_break(&out);
-    out = repair_register_reuse_scalars(&out);
+    out = repair_register_reuse_scalars_with_webs(&out, webs);
     // Only in constructors: simplify "receiver.<init>();" (no args) to "super();".
     if is_constructor {
         let mut simplified = String::new();
@@ -411,12 +422,12 @@ pub fn simplify_method_body(body: &str, is_constructor: bool) -> String {
     }
     // Rebase indentation to consistent 4-space levels (fixes over-indented bodies).
     out = normalize_java_indent(&out);
-    out = repair_register_reuse_scalars(&out);
+    out = repair_register_reuse_scalars_with_webs(&out, webs);
     out = repair_loop_length_index_shadow(&out);
     out = repair_loop_bound_reassigns(&out);
     out = restore_array_store_postincrement(&out);
     out = restore_d8_merge_copy_loops(&out);
-    out = cleanup_decompiler_artifacts(&out);
+    out = cleanup_decompiler_artifacts_with_webs(&out, webs);
     out = repair_ssa_temp_increments(&out);
     out = fold_running_arithmetic(&out);
     out = rewrite_nonreturning_while(&out);

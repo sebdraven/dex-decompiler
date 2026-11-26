@@ -1,6 +1,6 @@
 //! Inline temps and remove decompiler artifacts.
 
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
 
 use super::util::*;
 
@@ -94,11 +94,17 @@ pub(crate) fn inline_static_field_refs(body: &str) -> String {
 ///
 /// Live ranges stop at the next assignment to the same name, so reused temps like
 /// `s0 = "…"; …; s0 = this.foo;` are handled correctly.
+#[cfg(test)]
 pub(crate) fn cleanup_decompiler_artifacts(body: &str) -> String {
+    cleanup_decompiler_artifacts_with_webs(body, &WebNames::default())
+}
+
+/// A web's name is inlined only when it is an inlinable constant, whatever its form.
+pub(crate) fn cleanup_decompiler_artifacts_with_webs(body: &str, webs: &WebNames) -> String {
     let mut current = fold_immediate_overwrites(body);
     // Cast/call chains need multiple rounds: view→cast→getText→toString.
     for _ in 0..8 {
-        let next = cleanup_decompiler_artifacts_once(&current);
+        let next = cleanup_decompiler_artifacts_once_with_webs(&current, webs);
         if next == current {
             break;
         }
@@ -112,8 +118,8 @@ pub(crate) fn cleanup_decompiler_artifacts(body: &str) -> String {
 /// without reading it (jadx `CodeShrinkVisitor`).
 pub(crate) fn fold_immediate_overwrites(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip: HashSet<usize> = HashSet::new();
-    let mut replace: HashMap<usize, String> = HashMap::new();
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
+    let mut replace: DetHashMap<usize, String> = DetHashMap::default();
     let mut i = 0usize;
     while i + 1 < lines.len() {
         let Some((var, rhs1)) = parse_simple_assign_line(lines[i]) else {
@@ -183,7 +189,12 @@ pub(crate) fn fold_immediate_overwrites(body: &str) -> String {
     out
 }
 
+#[cfg(test)]
 pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
+    cleanup_decompiler_artifacts_once_with_webs(body, &WebNames::default())
+}
+
+fn cleanup_decompiler_artifacts_once_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
 
     struct InlineCand {
@@ -255,9 +266,13 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
     // *latest* live range in this pass — otherwise skipping both defs leaves a dangling use.
     // When the same temp name is reused (`i0 = layout; …; i0 = button;`), only inline the
     // *latest* live range in this pass — otherwise skipping both defs leaves a dangling use.
-    let mut latest_inline_by_var: HashMap<String, usize> = HashMap::new();
+    let mut latest_inline_by_var: DetHashMap<String, usize> = DetHashMap::default();
     for (i, c) in cands.iter().enumerate() {
-        if !is_temp_like_name(&c.var) || c.use_count == 0 {
+        let inlinable = webs.is_inlinable(&c.var);
+        if !webs.may_substitute(&c.var)
+            || !(inlinable || is_temp_like_name(&c.var))
+            || c.use_count == 0
+        {
             continue;
         }
         if has_index_increment_after(&lines, c.def_idx, &c.var) {
@@ -271,7 +286,8 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
         }
         // Allow `i`/`j`/`k` only for filled-array sizes/indices (`new T[i]`, `a[k]=…`).
         // Never inline them into loop tests or expressions like `j++ / i`.
-        if matches!(c.var.as_str(), "i" | "j" | "k")
+        if !inlinable
+            && matches!(c.var.as_str(), "i" | "j" | "k")
             && !all_uses_are_array_index_or_size(&lines, &c.var, c.def_idx, c.end_idx)
         {
             continue;
@@ -279,8 +295,13 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
         if all_uses_are_length_member(&lines, &c.var, c.def_idx, c.end_idx) {
             continue;
         }
-        let want = c.use_count == 1 || is_cheap_literal_rhs(&c.val);
+        let want = inlinable || c.use_count == 1 || is_cheap_literal_rhs(&c.val);
         if !want {
+            continue;
+        }
+        if !(inlinable || def_reaches_uses_alone(&lines, c.def_idx, c.end_idx, &c.var))
+            || literal_used_as_receiver(&lines, c.def_idx, c.end_idx, &c.var, &c.val)
+        {
             continue;
         }
         match latest_inline_by_var.get(&c.var) {
@@ -292,9 +313,12 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
     }
     // `y = 6; arr[y] = 1` and `y = this.pouet(); this.value2 = y` are register
     // reuse, not stores the source kept. Only bare reassignments (not `int y =`).
-    let mut bare_inline: HashSet<usize> = HashSet::new();
+    let mut bare_inline: DetHashSet<usize> = DetHashSet::default();
     for (i, c) in cands.iter().enumerate() {
-        if is_temp_like_name(&c.var) || !is_bare_reassign(lines[c.def_idx], &c.var) {
+        if !webs.may_substitute(&c.var)
+            || is_temp_like_name(&c.var)
+            || !is_bare_reassign(lines[c.def_idx], &c.var)
+        {
             continue;
         }
         let index_lit = c.use_count == 1
@@ -303,16 +327,17 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
         let call_rhs = c.use_count == 1
             && is_simple_call_expr(&c.val)
             && only_use_is_whole_rhs(&lines, &c.var, c.def_idx, c.end_idx);
-        if index_lit || call_rhs {
+        if (index_lit || call_rhs) && def_reaches_uses_alone(&lines, c.def_idx, c.end_idx, &c.var)
+        {
             bare_inline.insert(i);
         }
     }
-    let inline_set: HashSet<usize> = latest_inline_by_var
+    let inline_set: DetHashSet<usize> = latest_inline_by_var
         .values()
         .copied()
         .chain(bare_inline.iter().copied())
         .collect();
-    let skip_indices: HashSet<usize> = cands
+    let skip_indices: DetHashSet<usize> = cands
         .iter()
         .enumerate()
         .filter(|(i, c)| {
@@ -320,7 +345,8 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
             let used_after_def = lines[c.def_idx + 1..]
                 .iter()
                 .any(|l| ident_used_as_rvalue(l, &c.var));
-            (inline_set.contains(i) && (temp || bare_inline.contains(i)))
+            (inline_set.contains(i)
+                && (temp || bare_inline.contains(i) || webs.is_inlinable(&c.var)))
                 || (temp
                     && c.use_count == 0
                     && !used_after_def
@@ -331,6 +357,7 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
                     // Keep unused `double f = -5.0` / `float fff = -5.0f` for source fidelity.
                     && !is_typed_fp_or_long_const_decl(lines[c.def_idx]))
                 || (!temp
+                    && webs.substitution(&c.var).is_none()
                     && c.use_count == 0
                     && is_bare_reassign(lines[c.def_idx], &c.var)
                     && is_cheap_literal_rhs(&c.val))
@@ -397,6 +424,110 @@ pub(crate) fn cleanup_decompiler_artifacts_once(body: &str) -> String {
         }
     }
     out
+}
+
+fn indent_width(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Whether the definition on `def_idx` is the only one reaching the uses of `var` up to
+/// `end_idx` (its next assignment, or EOF), judged from the block structure (D1):
+/// no read outside the defining block, no conditional reassignment, no loop back edge
+/// that carries another value, and no declaration dropped under a later assignment.
+fn def_reaches_uses_alone(lines: &[&str], def_idx: usize, end_idx: usize, var: &str) -> bool {
+    let depth = indent_width(lines[def_idx]);
+    // Read before any earlier assignment: a loop back edge, or another variable.
+    let first_assign = lines[..def_idx]
+        .iter()
+        .position(|l| line_kills_var(l, var));
+    let first_read = lines[..def_idx]
+        .iter()
+        .position(|l| ident_used_as_rvalue(l, var));
+    if let Some(read) = first_read {
+        if first_assign.map_or(true, |assign| assign > read) {
+            return false;
+        }
+    }
+    // In a loop, a read earlier in the body sees this value on the next iteration.
+    if let Some(header) = enclosing_loop_header(lines, def_idx) {
+        if lines[header..def_idx]
+            .iter()
+            .any(|l| ident_used_as_rvalue(l, var))
+        {
+            return false;
+        }
+    }
+    // Past the end of the defining block, other definitions reach too.
+    let scope_end = lines
+        .iter()
+        .enumerate()
+        .skip(def_idx + 1)
+        .find(|(_, l)| {
+            let t = strip_trailing_comment(l);
+            let t = t.trim_start();
+            indent_width(l) < depth
+                && (t.starts_with('}') || t.starts_with("case ") || t.starts_with("default:"))
+        })
+        .map(|(j, _)| j)
+        .unwrap_or(lines.len());
+    let stop = (end_idx + 1).min(lines.len());
+    if scope_end < stop && lines[scope_end..stop].iter().any(|l| ident_occurs(l, var)) {
+        return false;
+    }
+    if end_idx < lines.len() {
+        // Reassigned inside a nested branch or loop.
+        if indent_width(lines[end_idx]) > depth {
+            return false;
+        }
+        // Dropping `T var = …;` would leave the later `var = …;` undeclared.
+        let def = strip_trailing_comment(lines[def_idx]);
+        let typed = def
+            .trim()
+            .split(" = ")
+            .next()
+            .is_some_and(|lhs| lhs.trim().contains(' '));
+        if typed {
+            return false;
+        }
+    }
+    true
+}
+
+/// Line index of the `while` / `for` / `do` header enclosing `idx`.
+fn enclosing_loop_header(lines: &[&str], idx: usize) -> Option<usize> {
+    let mut depth = indent_width(lines[idx]);
+    for k in (0..idx).rev() {
+        let width = indent_width(lines[k]);
+        if width >= depth {
+            continue;
+        }
+        let t = strip_trailing_comment(lines[k]);
+        let t = t.trim();
+        if !t.ends_with('{') {
+            continue;
+        }
+        depth = width;
+        if t.starts_with("while ")
+            || t.starts_with("while(")
+            || t.starts_with("for ")
+            || t.starts_with("for(")
+            || t == "do {"
+        {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// A numeric / null / boolean / char literal can never be a receiver: `0.x`, `null.f()`.
+fn literal_used_as_receiver(lines: &[&str], def_idx: usize, end_idx: usize, var: &str, val: &str) -> bool {
+    if !is_non_object_literal(val) {
+        return false;
+    }
+    let stop = (end_idx + 1).min(lines.len());
+    lines[def_idx + 1..stop]
+        .iter()
+        .any(|l| ident_is_receiver(&strip_trailing_comment(l), var))
 }
 
 /// The only reads of `var` in the live range are `expr[var]` or `new T[var]`.
@@ -491,28 +622,31 @@ fn only_use_is_whole_rhs(lines: &[&str], var: &str, def_idx: usize, end_idx: usi
 
 /// Inline temps assigned exactly once to a cheap literal across the whole method body.
 /// Inline temps assigned exactly once to a cheap literal across the whole method body.
-pub(crate) fn inline_global_literal_temps(body: &str) -> String {
+/// An inlinable constant is inlined whatever its name (`s12_r3_3`); another web's name
+/// never is.
+pub(crate) fn inline_global_literal_temps_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut assigns: HashMap<String, (usize, String)> = HashMap::new();
-    let mut assign_counts: HashMap<String, usize> = HashMap::new();
+    let mut assigns: DetHashMap<String, (usize, String)> = DetHashMap::default();
+    let mut assign_counts: DetHashMap<String, usize> = DetHashMap::default();
     for (idx, line) in lines.iter().enumerate() {
         let Some((var, val)) = parse_simple_assign_line(line) else {
             continue;
         };
-        if !is_cheap_literal_rhs(&val) {
+        if !is_cheap_literal_rhs(&val) || !webs.may_substitute(&var) {
             continue;
         }
+        let inlinable = webs.is_inlinable(&var);
         // Temps, or single-use debug consts used only as call args (`dist = 4`).
         // Do not globally inline `i`/`j`/`k` — cleanup handles filled-array
         // index/size live ranges; global inlining breaks loop tests (`while (i < j)`).
-        if matches!(var.as_str(), "i" | "j" | "k") {
+        if !inlinable && matches!(var.as_str(), "i" | "j" | "k") {
             continue;
         }
-        if !is_temp_like_name(&var) && var != "dist" {
+        if !inlinable && !is_temp_like_name(&var) && var != "dist" {
             continue;
         }
         // Keep unused `double yvwx2 = …` / float literals for source fidelity.
-        if is_typed_fp_or_long_const_decl(line) {
+        if !inlinable && is_typed_fp_or_long_const_decl(line) {
             continue;
         }
         if lines.iter().any(|l| is_index_increment(l, &var)) {
@@ -524,6 +658,16 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
             .enumerate()
             .skip(idx + 1)
             .any(|(_, l)| assign_lhs_var(l).as_deref() == Some(var.as_str()))
+        {
+            continue;
+        }
+        // The only assignment in the body, and it alone reaches every use (D1).
+        if lines
+            .iter()
+            .enumerate()
+            .any(|(j, l)| j != idx && line_kills_var(l, &var))
+            || !(inlinable || def_reaches_uses_alone(&lines, idx, lines.len(), &var))
+            || literal_used_as_receiver(&lines, idx, lines.len(), &var, &val)
         {
             continue;
         }
@@ -543,11 +687,11 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
         .cloned()
         .collect();
     inline_vars.sort();
-    let inline_vars: HashSet<String> = inline_vars.into_iter().collect();
+    let inline_vars: DetHashSet<String> = inline_vars.into_iter().collect();
     if inline_vars.is_empty() {
         return body.to_string();
     }
-    let skip: HashSet<usize> = assigns
+    let skip: DetHashSet<usize> = assigns
         .iter()
         .filter(|(v, _)| inline_vars.contains(*v))
         .map(|(_, (idx, _))| *idx)
@@ -587,8 +731,15 @@ pub(crate) fn inline_global_literal_temps(body: &str) -> String {
 /// `i = i0 + 1` / `int j = i1 + 1` after SSA unify → `i++` / `j++`.
 /// `i0 = i * i;` without a prior declaration → `int i0 = i * i;` (when inlining did not apply).
 pub(crate) fn fix_undeclared_temp_assigns(body: &str) -> String {
+    fix_undeclared_temp_assigns_with_webs(body, &WebNames::default())
+}
+
+/// Parameters are declared by the signature: reassigning one is not a declaration
+/// (`p0 = 0;` must not become `int p0 = 0;`, R2). A web's name may get its missing
+/// declaration whatever its form.
+pub(crate) fn fix_undeclared_temp_assigns_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut declared: HashSet<String> = HashSet::new();
+    let mut declared: DetHashSet<String> = webs.params.clone();
     let mut out = String::new();
     for (idx, line) in lines.iter().enumerate() {
         let binding = strip_trailing_comment(line);
@@ -596,10 +747,11 @@ pub(crate) fn fix_undeclared_temp_assigns(body: &str) -> String {
         let mut current = line.to_string();
         if let Some((var, rhs)) = parse_simple_assign_line(line) {
             // `i`/`j`/`k` are usually parameters or already-declared indexes — don't shadow them.
-            if is_temp_like_name(&var)
-                && !matches!(var.as_str(), "i" | "j" | "k")
+            let temp = is_temp_like_name(&var) && !matches!(var.as_str(), "i" | "j" | "k");
+            let web_type = webs.types.get(&var).filter(|_| webs.frozen.contains(&var));
+            if (temp || webs.frozen.contains(&var))
                 && !declared.contains(&var)
-                && !is_simple_call_expr(&rhs)
+                && (web_type.is_some() || !is_simple_call_expr(&rhs))
             {
                 if let Some(eq) = t.find(" = ") {
                     let lhs = t[..eq].trim();
@@ -607,7 +759,12 @@ pub(crate) fn fix_undeclared_temp_assigns(body: &str) -> String {
                         let indent = leading_indent(line);
                         let comment = line.get(binding.len()..).unwrap_or("");
                         let stmt = t.trim_end_matches(';');
-                        current = format!("{}int {};", indent, stmt);
+                        // The web's type, else what the definition shows, `int` last (D2, T1).
+                        let ty = web_type
+                            .cloned()
+                            .or_else(|| evident_type_of_rhs(&rhs))
+                            .unwrap_or_else(|| "int".to_string());
+                        current = format!("{}{} {};", indent, ty, stmt);
                         current.push_str(comment);
                     }
                 }
@@ -629,75 +786,114 @@ pub(crate) fn fix_undeclared_temp_assigns(body: &str) -> String {
     out
 }
 
+/// Java type an expression shows by itself: `(T) x`, `new T(…)`, `new T[n]`, literals.
+fn evident_type_of_rhs(rhs: &str) -> Option<String> {
+    let r = rhs.trim();
+    if r.starts_with('"') {
+        return Some("String".to_string());
+    }
+    if matches!(r, "true" | "false") {
+        return Some("boolean".to_string());
+    }
+    if r == "null" {
+        return Some("Object".to_string());
+    }
+    let is_type_char = |c: char| c.is_alphanumeric() || matches!(c, '.' | '_' | '$');
+    if let Some(rest) = r.strip_prefix("new ") {
+        let ty: String = rest.chars().take_while(|&c| is_type_char(c)).collect();
+        let after = &rest[ty.len()..];
+        if ty.is_empty() {
+            return None;
+        }
+        if after.starts_with('(') {
+            return Some(ty);
+        }
+        if after.starts_with('[') {
+            return Some(format!("{}{}", ty, "[]".repeat(after.matches('[').count())));
+        }
+        return None;
+    }
+    let (ty, operand) = r.strip_prefix('(')?.split_once(')')?;
+    let ty = ty.trim();
+    let looks_like_type = matches!(
+        ty.trim_end_matches("[]"),
+        "int" | "long" | "short" | "byte" | "char" | "boolean" | "float" | "double"
+    ) || ty.contains('.')
+        || ty.starts_with(|c: char| c.is_ascii_uppercase());
+    let is_cast = looks_like_type
+        && ty.chars().all(|c| is_type_char(c) || matches!(c, '[' | ']'))
+        && operand
+            .trim_start()
+            .starts_with(|c: char| c.is_alphanumeric() || matches!(c, '(' | '"' | '_' | '$'));
+    is_cast.then(|| ty.to_string())
+}
+
 /// Merge `x = new Foo();` + `x.<init>(args);` (and typed forms) into `x = new Foo(args);`.
-/// Merge `x = new Foo();` + `x.<init>(args);` (and typed forms) into `x = new Foo(args);`.
+/// Statements loading the arguments may sit in between (D7); the merged statement takes
+/// the `<init>` position so those arguments are defined before use.
 pub(crate) fn merge_constructor_calls(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
     if lines.len() < 2 {
         return body.to_string();
     }
-    let mut skip: HashSet<usize> = HashSet::new();
-    let mut replacements: HashMap<usize, String> = HashMap::new();
-    let mut i = 0;
-    while i + 1 < lines.len() {
+    let mut skip: DetHashSet<usize> = DetHashSet::default();
+    let mut replacements: DetHashMap<usize, String> = DetHashMap::default();
+    for i in 0..lines.len() {
+        if skip.contains(&i) {
+            continue;
+        }
         let binding = strip_trailing_comment(lines[i]);
         let t = binding.trim();
         let Some(eq) = t.find(" = ") else {
-            i += 1;
             continue;
         };
         let lhs = t[..eq].trim();
         let rhs = t[eq + 3..].trim_end_matches(';').trim();
         let var = lhs.rsplit(' ').next().unwrap_or(lhs);
         let Some(class) = rhs.strip_prefix("new ").and_then(|s| s.strip_suffix("()")) else {
-            i += 1;
             continue;
         };
-        // Skip intervening simple assigns that don't touch `var`.
+        let indent = leading_indent(lines[i]);
         let mut j = i + 1;
         while j < lines.len() {
-            let jb = strip_trailing_comment(lines[j]);
-            let jt = jb.trim();
-            if let Some((init_var, args)) = parse_init_call(lines[j]) {
-                if init_var == var {
-                    let indent = leading_indent(lines[i]);
-                    let typed = if lhs.contains(' ') {
-                        format!(
-                            "{}{} = new {}({});",
-                            indent,
-                            lhs,
-                            class,
-                            args.unwrap_or_default()
-                        )
-                    } else {
-                        format!(
-                            "{}{} = new {}({});",
-                            indent,
-                            var,
-                            class,
-                            args.unwrap_or_default()
-                        )
-                    };
-                    replacements.insert(i, typed);
-                    skip.insert(j);
-                    i = j + 1;
-                    break;
-                }
-            }
-            if assign_lhs_var(lines[j]).as_deref() == Some(var) {
-                i += 1;
-                break;
-            }
-            // Allow simple temps between new and init.
-            if parse_simple_assign_line(lines[j]).is_some() || jt.is_empty() {
+            if skip.contains(&j) {
                 j += 1;
                 continue;
             }
-            i += 1;
+            if let Some((init_var, args)) = parse_init_call(lines[j]) {
+                if init_var == var {
+                    replacements.insert(
+                        j,
+                        format!("{}{} = new {}({});", indent, lhs, class, args.unwrap_or_default()),
+                    );
+                    skip.insert(i);
+                    break;
+                }
+            }
+            let jb = strip_trailing_comment(lines[j]);
+            let jt = jb.trim();
+            if jt.is_empty() {
+                j += 1;
+                continue;
+            }
+            if assign_lhs_var(lines[j]).as_deref() == Some(var) || ident_occurs(jt, var) {
+                break;
+            }
+            // Argument set-up in the same block: temps, nested `new`, `sb.append(x);`.
+            let plain_stmt = jt.ends_with(';')
+                && !jt.contains('{')
+                && !jt.starts_with('}')
+                && !jt.starts_with("return")
+                && !jt.starts_with("throw ")
+                && jt != "break;"
+                && jt != "continue;";
+            if parse_simple_assign_line(lines[j]).is_some()
+                || (plain_stmt && leading_indent(lines[j]) == indent)
+            {
+                j += 1;
+                continue;
+            }
             break;
-        }
-        if j >= lines.len() {
-            i += 1;
         }
     }
     if replacements.is_empty() {

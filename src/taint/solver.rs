@@ -8,6 +8,7 @@ use rayon::prelude::*;
 
 use crate::decompile::value_flow::ValueFlowAnalysisOwned;
 use crate::decompile::Decompiler;
+use crate::detectors::invokes_by_offset;
 use crate::error::Result;
 
 use super::call_graph::{CallEdge, CallGraph};
@@ -358,6 +359,13 @@ fn sanitize_kinds(kinds: &HashSet<String>, san: &SanitizerModel) -> HashSet<Stri
         .collect()
 }
 
+/// Set contents in sorted order: hash-set iteration order differs between runs.
+fn sorted<T: Ord + Clone>(set: &HashSet<T>) -> Vec<T> {
+    let mut out: Vec<T> = set.iter().cloned().collect();
+    out.sort_unstable();
+    out
+}
+
 pub(crate) fn param_reg_from_sizes(registers_size: u32, ins_size: u32, idx: u32) -> Option<u32> {
     if idx < ins_size {
         Some(registers_size.saturating_sub(ins_size) + idx)
@@ -705,7 +713,9 @@ fn collect_class_field_strings(
     vf_cache: &HashMap<MethodId, ValueFlowAnalysisOwned>,
 ) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = HashMap::new();
-    for owned in vf_cache.values() {
+    let mut mids: Vec<&MethodId> = vf_cache.keys().collect();
+    mids.sort_unstable_by_key(|mid| mid.0);
+    for owned in mids.into_iter().filter_map(|mid| vf_cache.get(mid)) {
         let mut last_str: HashMap<u32, String> = HashMap::new();
         let mut offs: Vec<u32> = owned.insn_at.keys().copied().collect();
         offs.sort_unstable();
@@ -744,7 +754,9 @@ fn recover_dest_url(
 ) -> Option<String> {
     let mut https: Vec<String> = Vec::new();
     let mut paths: Vec<String> = Vec::new();
-    for label in owned.insn_at.values() {
+    let mut labels: Vec<(&u32, &String)> = owned.insn_at.iter().collect();
+    labels.sort_unstable_by_key(|&(&off, _)| off);
+    for (_, label) in labels {
         if let Some((_, s)) = parse_const_string_label(label) {
             if looks_like_url(&s) {
                 https.push(s);
@@ -760,7 +772,10 @@ fn recover_dest_url(
             } else if is_host_field_name(field_leaf_name(&path)) {
                 if let Some(val) = field_consts
                     .iter()
-                    .find(|(k, _)| field_leaf_name(k).eq_ignore_ascii_case(field_leaf_name(&path)))
+                    .filter(|(k, _)| {
+                        field_leaf_name(k).eq_ignore_ascii_case(field_leaf_name(&path))
+                    })
+                    .min_by(|a, b| a.0.cmp(b.0))
                     .map(|(_, v)| v.clone())
                 {
                     if looks_like_url(&val) {
@@ -1029,11 +1044,11 @@ fn compose_method_summaries(
                             .param_to_sinks
                             .entry(caller_param)
                             .or_default();
-                            for sink in sinks.iter().take(MAX_SINK_KINDS_PER_PARAM) {
+                            for sink in sorted(sinks).into_iter().take(MAX_SINK_KINDS_PER_PARAM) {
                                 if dst.len() >= MAX_SINK_KINDS_PER_PARAM {
                                     break;
                                 }
-                                changed |= dst.insert(sink.clone());
+                                changed |= dst.insert(sink);
                             }
                         }
                         if callee_sum.param_to_return.contains(&(callee_param as u32)) {
@@ -1345,7 +1360,8 @@ pub fn solve_dexes(
         }
 
         if !dirty.is_empty() {
-            let dirty_ids: Vec<MethodId> = dirty.iter().copied().collect();
+            let mut dirty_ids: Vec<MethodId> = dirty.iter().copied().collect();
+            dirty_ids.sort_unstable_by_key(|mid| mid.0);
             let summaries_snap = summaries.clone();
             let parallel_out: Vec<_> = dirty_ids
                 .par_iter()
@@ -1417,19 +1433,21 @@ pub fn solve_dexes(
         // Parallel scan of call edges for arg→param taint transfer.
         // Must run even when the worklist was empty after pass-0 (otherwise
         // interprocedural arg→param never starts).
-        let edge_list: Vec<_> = if first_interproc_edge_scan {
+        let mut scan_ids: Vec<MethodId> = if first_interproc_edge_scan {
             first_interproc_edge_scan = false;
-            call_graph.outs.values().flat_map(|v| v.iter()).collect()
+            call_graph.outs.keys().copied().collect()
         } else {
             let mut scan_ids = dirty;
             scan_ids.extend(return_grew);
             scan_ids.extend(inject_callers);
-            scan_ids
-                .iter()
-                .filter_map(|id| call_graph.outs.get(id))
-                .flatten()
-                .collect()
+            scan_ids.into_iter().collect()
         };
+        scan_ids.sort_unstable_by_key(|mid| mid.0);
+        let edge_list: Vec<_> = scan_ids
+            .iter()
+            .filter_map(|id| call_graph.outs.get(id))
+            .flatten()
+            .collect();
         let summaries_snap = summaries.clone();
         let edge_out: Vec<(Vec<(MethodId, u32, String)>, Vec<Issue>)> = edge_list
             .par_iter()
@@ -1461,14 +1479,14 @@ pub fn solve_dexes(
                         .get(&edge.callee)
                         .map(|s| s.param_to_return.contains(&(i as u32)))
                         .unwrap_or(false);
-                    for kind in kinds {
+                    for kind in sorted(&kinds) {
                         if let Some(san) = config.find_sanitizer(&edge.method_ref) {
                             let set = sanitize_kinds(&HashSet::from([kind.clone()]), san);
                             if set.is_empty() {
                                 continue;
                             }
                         }
-                        for sink_kind in &callee_sinks {
+                        for sink_kind in &sorted(&callee_sinks) {
                             let frames = interproc_frames(
                                 &index,
                                 owned,
@@ -1597,7 +1615,9 @@ fn propagate_returns(
     inject_callers: &mut HashSet<MethodId>,
 ) -> bool {
     let mut progressed = false;
-    for edges in call_graph.ins.values() {
+    let mut callees: Vec<&MethodId> = call_graph.ins.keys().collect();
+    callees.sort_unstable_by_key(|mid| mid.0);
+    for edges in callees.into_iter().filter_map(|mid| call_graph.ins.get(mid)) {
         for edge in edges {
             let ret_kinds = summaries
                 .get(&edge.callee)
@@ -1616,7 +1636,7 @@ fn propagate_returns(
             // Inject return kinds into caller local analysis by treating them as sources at move-result,
             // then check sinks in caller (via analyze with synthetic param — easier: expand return into
             // a temporary local re-scan).
-            for kind in &ret_kinds {
+            for kind in &sorted(&ret_kinds) {
                 // Record as if a source appeared at move-result; run sink check from that seed.
                 let analysis = owned.analysis();
                 let flow = analysis.value_flow_from_seed(mr_off, mr_reg);
@@ -1747,16 +1767,19 @@ fn analyze_method(
     }
 
     // 2) Seed from interprocedural parameter kinds (and return-injection sentinels).
-    let param_kinds = summaries
+    let mut param_kinds: Vec<(u32, HashSet<String>)> = summaries
         .get(&mid)
-        .map(|s| s.param_kinds.clone())
+        .map(|s| s.param_kinds.clone().into_iter().collect())
         .unwrap_or_default();
+    param_kinds.sort_unstable_by_key(|(param_key, _)| *param_key);
+    let mut rw_by_offset: Vec<(&u32, &(Vec<u32>, Vec<u32>))> = owned.rw_map.iter().collect();
+    rw_by_offset.sort_unstable_by_key(|&(&off, _)| off);
     for (param_key, kinds) in &param_kinds {
         if *param_key >= 0x8000_0000 {
             // Return injection at invoke offset encoded in low bits.
             let invoke_off = param_key & 0x7fff_ffff;
             if let Some((off, reg)) = move_result_for_invoke(owned, invoke_off) {
-                for kind in kinds {
+                for kind in &sorted(kinds) {
                     seed_and_propagate(&mut local, &analysis, owned, config, off, reg, kind);
                 }
             }
@@ -1764,10 +1787,10 @@ fn analyze_method(
         }
         // Dalvik: param i lives in v(registers_size - ins_size + i).
         if let Some(reg) = param_reg(owned, *param_key) {
-            for kind in kinds {
+            for kind in &sorted(kinds) {
                 seed_param_register(&mut local, &analysis, owned, config, reg, kind);
                 // Re-scan sink reads after param seed (VF from 0 misses incoming params).
-                for (&roff, (reads, _)) in &owned.rw_map {
+                for &(&roff, (reads, _)) in &rw_by_offset {
                     if !reads
                         .iter()
                         .any(|r| local.kinds_at(roff, *r).contains(kind.as_str()))
@@ -1791,7 +1814,7 @@ fn analyze_method(
     apply_propagations(&mut local, owned, config);
 
     // 4) Sink checks for all tainted regs at invoke sites.
-    for (&invoke_off, method_ref) in &owned.invoke_method_map {
+    for (invoke_off, method_ref) in invokes_by_offset(owned) {
         if let Some(sink) = config.find_sink(method_ref) {
             let args = owned
                 .rw_map
@@ -1801,7 +1824,7 @@ fn analyze_method(
             if let Some(idx) = port_to_arg_index(&sink.port) {
                 if let Some(&reg) = args.get(idx as usize) {
                     let kinds = local.kinds_at(invoke_off, reg);
-                    for kind in kinds.into_iter() {
+                    for kind in sorted(&kinds) {
                         emit_issue(
                             index,
                             mid,
@@ -1947,7 +1970,7 @@ fn apply_propagations(
     // so later startActivity/commit see putExtra/setData taint.
     for _ in 0..4 {
         let mut updates: Vec<(u32, u32, String)> = Vec::new();
-        for (&invoke_off, method_ref) in &owned.invoke_method_map {
+        for (invoke_off, method_ref) in invokes_by_offset(owned) {
             let props = config.find_propagations(method_ref);
             if props.is_empty() {
                 continue;
@@ -2000,7 +2023,7 @@ fn apply_propagations(
                                             } else {
                                                 format!("extra:{key}")
                                             };
-                                            for k in &kinds {
+                                            for k in &sorted(&kinds) {
                                                 propagate_path(
                                                     local, &analysis, invoke_off, to_reg, &path, k,
                                                 );
@@ -2092,7 +2115,7 @@ fn apply_field_heap(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned) {
                 if kinds.is_empty() {
                     local.clear_path(off, obj, &path);
                 } else {
-                    for k in kinds {
+                    for k in sorted(&kinds) {
                         propagate_path(local, &analysis, off, obj, &path, &k);
                     }
                 }
@@ -2122,7 +2145,7 @@ fn apply_field_heap(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned) {
                 if kinds.is_empty() {
                     local.clear_path(off, array, &path);
                 } else {
-                    for k in kinds {
+                    for k in sorted(&kinds) {
                         propagate_path(local, &analysis, off, array, &path, &k);
                     }
                 }
@@ -2143,7 +2166,7 @@ fn apply_field_heap(local: &mut LocalTaint, owned: &ValueFlowAnalysisOwned) {
             propagate_register(local, &analysis, off, dest, &k);
         }
     }
-    for (&invoke_off, method_ref) in &owned.invoke_method_map {
+    for (invoke_off, method_ref) in invokes_by_offset(owned) {
         if !is_extra_get(method_ref) && !is_map_get(method_ref) {
             continue;
         }
@@ -2608,18 +2631,20 @@ fn compute_local_taint_uncached(
         }
     }
     if let Some(sum) = summaries.get(&mid) {
-        for (param_key, kinds) in &sum.param_kinds {
+        let mut param_kinds: Vec<(&u32, &HashSet<String>)> = sum.param_kinds.iter().collect();
+        param_kinds.sort_unstable_by_key(|&(&param_key, _)| param_key);
+        for (param_key, kinds) in param_kinds {
             if *param_key >= 0x8000_0000 {
                 let invoke_off = param_key & 0x7fff_ffff;
                 if let Some((off, reg)) = move_result_for_invoke(owned, invoke_off) {
-                    for kind in kinds {
+                    for kind in &sorted(kinds) {
                         seed_and_propagate(&mut local, &analysis, owned, config, off, reg, kind);
                     }
                 }
                 continue;
             }
             if let Some(reg) = param_reg(owned, *param_key) {
-                for kind in kinds {
+                for kind in &sorted(kinds) {
                     seed_param_register(&mut local, &analysis, owned, config, reg, kind);
                 }
             }

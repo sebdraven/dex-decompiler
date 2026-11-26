@@ -1,6 +1,6 @@
 //! Cast, string-concat, and array-literal polish passes.
 
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
 
 use super::util::*;
 
@@ -230,7 +230,7 @@ pub(crate) fn split_leading_cast(expr: &str) -> Option<(String, String)> {
     }
     let mut depth = 0i32;
     let mut end = None;
-    for (i, c) in e.chars().enumerate() {
+    for (i, c) in e.char_indices() {
         match c {
             '(' => depth += 1,
             ')' => {
@@ -583,7 +583,7 @@ pub(crate) fn fold_2d_array_row_literals_once(body: &str) -> String {
         if !ok || row_lits.len() != row_refs.len() {
             continue;
         }
-        let mut lit_by_var: HashMap<String, String> = HashMap::new();
+        let mut lit_by_var: DetHashMap<String, String> = DetHashMap::default();
         for (j, lit) in &row_lits {
             if let Some((v, _, _)) = parse_1d_array_literal_init(lines[*j]) {
                 lit_by_var.insert(v, lit.clone());
@@ -597,7 +597,7 @@ pub(crate) fn fold_2d_array_row_literals_once(body: &str) -> String {
             continue;
         }
         let indent = leading_indent(lines[idx]);
-        let remove: HashSet<usize> = row_lits.iter().map(|(j, _)| *j).collect();
+        let remove: DetHashSet<usize> = row_lits.iter().map(|(j, _)| *j).collect();
         let new_line = format!(
             "{}{}[][] {} = new {}[][]{{ {} }};",
             indent,
@@ -711,7 +711,7 @@ fn fold_arrays_as_list_filled_array_once(body: &str) -> String {
         }
         let args: Vec<String> = elems.into_iter().map(|e| e.unwrap()).collect();
         let as_list = format!("Arrays.asList({})", args.join(", "));
-        let skip: HashSet<usize> = std::iter::once(i)
+        let skip: DetHashSet<usize> = std::iter::once(i)
             .chain(store_idxs.iter().copied())
             .collect();
         let mut out = String::new();
@@ -832,10 +832,10 @@ fn strip_box_value_of(expr: &str) -> String {
 
 /// `int[] a = new int[]{1,2,3}; foo(a)` → `foo(new int[]{1,2,3})` when `a` is only used in calls
 /// (not as a row of `new T[][]{ a, … }`, which fold_2d handles).
-pub(crate) fn inline_filled_array_into_calls(body: &str) -> String {
+pub(crate) fn inline_filled_array_into_calls_with_webs(body: &str, webs: &WebNames) -> String {
     let mut current = body.to_string();
     for _ in 0..8 {
-        let next = inline_filled_array_into_calls_once(&current);
+        let next = inline_filled_array_into_calls_once(&current, webs);
         if next == current {
             break;
         }
@@ -844,13 +844,14 @@ pub(crate) fn inline_filled_array_into_calls(body: &str) -> String {
     current
 }
 
-fn inline_filled_array_into_calls_once(body: &str) -> String {
+fn inline_filled_array_into_calls_once(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
     for i in 0..lines.len() {
         let Some((var, rhs)) = parse_simple_assign_line(lines[i]) else {
             continue;
         };
-        if !is_temp_like_name(&var) || !is_filled_array_literal(&rhs) {
+        if !is_temp_like_name(&var) || !is_filled_array_literal(&rhs) || !webs.may_substitute(&var)
+        {
             continue;
         }
         let mut use_idxs: Vec<usize> = Vec::new();
@@ -899,8 +900,8 @@ fn inline_filled_array_into_calls_once(body: &str) -> String {
 
 fn rebuild_skip_repl(
     lines: &[&str],
-    skip: &HashSet<usize>,
-    repl: &HashMap<usize, String>,
+    skip: &DetHashSet<usize>,
+    repl: &DetHashMap<usize, String>,
     trailing_nl: bool,
 ) -> String {
     let mut out = String::new();
@@ -924,8 +925,8 @@ fn rebuild_skip_repl(
 /// Numeric casts of a bare name or literal are dropped (`(double) g` → `g`).
 pub(crate) fn fold_running_arithmetic(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip = HashSet::new();
-    let mut repl: HashMap<usize, String> = HashMap::new();
+    let mut skip = DetHashSet::default();
+    let mut repl: DetHashMap<usize, String> = DetHashMap::default();
     let mut i = 0;
     while i < lines.len() {
         let Some((var, rhs)) = parse_simple_assign_line(lines[i]) else {
@@ -975,8 +976,8 @@ pub(crate) fn fold_running_arithmetic(body: &str) -> String {
 /// `j_0 = (j_0 + 1) / i; i = j_0; j_0 = j_0;` → `i = j++ / i;`
 pub(crate) fn repair_self_ref_postinc_div(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip = HashSet::new();
-    let mut repl: HashMap<usize, String> = HashMap::new();
+    let mut skip = DetHashSet::default();
+    let mut repl: DetHashMap<usize, String> = DetHashMap::default();
     let mut i = 0;
     while i + 1 < lines.len() {
         let Some((t0, rhs0)) = parse_simple_assign_line(lines[i]) else {
@@ -1036,8 +1037,8 @@ pub(crate) fn repair_self_ref_postinc_div(body: &str) -> String {
 /// `int t = j + 1; j = j / i; i = j; j = t;` → `i = j++ / i;`.
 pub(crate) fn fold_postinc_division(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip = HashSet::new();
-    let mut repl: HashMap<usize, String> = HashMap::new();
+    let mut skip = DetHashSet::default();
+    let mut repl: DetHashMap<usize, String> = DetHashMap::default();
     let mut i = 0;
     while i + 3 < lines.len() {
         let Some((tmp, base)) = parse_plus_one_assign(lines[i]) else {
@@ -1124,9 +1125,9 @@ pub(crate) fn wrap_postinc_div_try(
         wrapped.push_str(&format!("{inner}continue;\n"));
     }
     wrapped.push_str(&format!("{indent}}}"));
-    let mut repl = HashMap::new();
+    let mut repl = DetHashMap::default();
     repl.insert(idx, wrapped);
-    rebuild_skip_repl(&lines, &HashSet::new(), &repl, body.ends_with('\n'))
+    rebuild_skip_repl(&lines, &DetHashSet::default(), &repl, body.ends_with('\n'))
 }
 
 fn enclosing_while_has_and(lines: &[&str], idx: usize) -> bool {
@@ -1287,5 +1288,26 @@ fn parse_copy_from(line: &str, from: &str) -> Option<String> {
         Some(var)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_leading_cast_non_ascii() {
+        assert_eq!(
+            split_leading_cast("(java.lang.String)\u{205f}x"),
+            Some(("java.lang.String".to_string(), "x".to_string()))
+        );
+        assert_eq!(
+            split_leading_cast("(\u{205f}java.lang.String)x"),
+            Some(("java.lang.String".to_string(), "x".to_string()))
+        );
+        assert_eq!(
+            split_leading_cast("(a.问.Foo) é"),
+            Some(("a.问.Foo".to_string(), "é".to_string()))
+        );
     }
 }

@@ -30,7 +30,9 @@ const TARGET_SETTERS: &[&str] = &[
 
 fn const_strings(owned: &ValueFlowAnalysisOwned) -> Vec<String> {
     let mut out = Vec::new();
-    for insn in owned.insn_at.values() {
+    let mut insns: Vec<(&u32, &String)> = owned.insn_at.iter().collect();
+    insns.sort_unstable_by_key(|&(&off, _)| off);
+    for (_, insn) in insns {
         let lower = insn.as_str();
         if !(lower.contains("const-string") || lower.contains("const-string/jumbo")) {
             continue;

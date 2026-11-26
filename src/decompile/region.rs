@@ -4,7 +4,9 @@
 //! walks the tree to produce Java if/else and while.
 
 use crate::decompile::cfg::{BlockEnd, BlockId, MethodCfg};
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
+use std::collections::HashSet;
+use std::hash::BuildHasher;
 
 /// Single-entry single-exit style region for structured emission.
 #[derive(Debug, Clone)]
@@ -30,14 +32,109 @@ pub enum Region {
         /// emitted with that case instead of as an empty trailing label.
         default_case: Option<i32>,
     },
+    /// `label: { body }`; on a loop, `label: while (true) { … }`.
+    Labeled { label: String, body: Box<Region> },
+    /// `break;` or `break label;`.
+    Break { label: Option<String> },
+    /// `continue;` or `continue label;`.
+    Continue { label: Option<String> },
 }
+
+/// Body region a pattern returns in place of a lone exit `break;` (nothing to emit).
+static EMPTY_REGION: Region = Region::Seq(Vec::new());
 
 /// Returns true if the region has no substantive content (empty seq or seq of empty regions).
 /// Used to omit useless `} else { }` in emission.
 pub fn region_is_empty(region: &Region) -> bool {
     match region {
         Region::Seq(children) => children.is_empty() || children.iter().all(region_is_empty),
-        Region::Block(_) | Region::If { .. } | Region::Loop { .. } | Region::Switch { .. } => false,
+        Region::Labeled { body, .. } => region_is_empty(body),
+        Region::Block(_)
+        | Region::If { .. }
+        | Region::Loop { .. }
+        | Region::Switch { .. }
+        | Region::Break { .. }
+        | Region::Continue { .. } => false,
+    }
+}
+
+/// Contains an explicit `break` or `continue` (trees built by `structure::build`).
+pub fn region_has_jump(region: &Region) -> bool {
+    match region {
+        Region::Break { .. } | Region::Continue { .. } => true,
+        Region::Block(_) => false,
+        Region::Seq(children) => children.iter().any(region_has_jump),
+        Region::If {
+            then_branch,
+            else_branch,
+            ..
+        } => region_has_jump(then_branch) || region_has_jump(else_branch),
+        Region::Loop { body, .. } | Region::Labeled { body, .. } => region_has_jump(body),
+        Region::Switch { cases, default, .. } => {
+            cases.iter().any(|(_, r)| region_has_jump(r)) || region_has_jump(default)
+        }
+    }
+}
+
+/// A `break` (or, with `continues`, a `continue`) that may leave the loop whose body
+/// this is: unlabeled outside any inner loop (or switch, for `break`), or labeled.
+fn region_may_jump_out_of_loop(region: &Region, continues: bool) -> bool {
+    fn labeled_jump(region: &Region, continues: bool) -> bool {
+        match region {
+            Region::Break { label } => !continues && label.is_some(),
+            Region::Continue { label } => continues && label.is_some(),
+            Region::Block(_) => false,
+            Region::Seq(children) => children.iter().any(|c| labeled_jump(c, continues)),
+            Region::If {
+                then_branch,
+                else_branch,
+                ..
+            } => labeled_jump(then_branch, continues) || labeled_jump(else_branch, continues),
+            Region::Loop { body, .. } | Region::Labeled { body, .. } => {
+                labeled_jump(body, continues)
+            }
+            Region::Switch { cases, default, .. } => {
+                cases.iter().any(|(_, r)| labeled_jump(r, continues))
+                    || labeled_jump(default, continues)
+            }
+        }
+    }
+    match region {
+        Region::Break { .. } => !continues,
+        Region::Continue { .. } => continues,
+        Region::Block(_) => false,
+        Region::Seq(children) => children
+            .iter()
+            .any(|c| region_may_jump_out_of_loop(c, continues)),
+        Region::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            region_may_jump_out_of_loop(then_branch, continues)
+                || region_may_jump_out_of_loop(else_branch, continues)
+        }
+        Region::Labeled { body, .. } => region_may_jump_out_of_loop(body, continues),
+        Region::Loop { body, .. } => labeled_jump(body, continues),
+        Region::Switch { cases, default, .. } if !continues => {
+            cases.iter().any(|(_, r)| labeled_jump(r, false)) || labeled_jump(default, false)
+        }
+        Region::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|(_, r)| region_may_jump_out_of_loop(r, true))
+                || region_may_jump_out_of_loop(default, true)
+        }
+    }
+}
+
+/// A single unlabeled `break;` (or `continue;`), possibly in a one-element `Seq`.
+fn is_lone_jump(region: &Region, continues: bool) -> bool {
+    match region {
+        Region::Break { label: None } => !continues,
+        Region::Continue { label: None } => continues,
+        Region::Seq(children) if children.len() == 1 => is_lone_jump(&children[0], continues),
+        _ => false,
     }
 }
 
@@ -54,7 +151,12 @@ pub fn region_is_empty_with_cfg(region: &Region, cfg: &MethodCfg) -> bool {
         Region::Seq(children) => {
             children.is_empty() || children.iter().all(|c| region_is_empty_with_cfg(c, cfg))
         }
-        Region::If { .. } | Region::Loop { .. } | Region::Switch { .. } => false,
+        Region::Labeled { body, .. } => region_is_empty_with_cfg(body, cfg),
+        Region::If { .. }
+        | Region::Loop { .. }
+        | Region::Switch { .. }
+        | Region::Break { .. }
+        | Region::Continue { .. } => false,
     }
 }
 
@@ -98,8 +200,8 @@ pub fn region_contains_if(region: &Region) -> bool {
     match region {
         Region::If { .. } | Region::Switch { .. } => true,
         Region::Seq(children) => children.iter().any(region_contains_if),
-        Region::Loop { body, .. } => region_contains_if(body),
-        Region::Block(_) => false,
+        Region::Loop { body, .. } | Region::Labeled { body, .. } => region_contains_if(body),
+        Region::Block(_) | Region::Break { .. } | Region::Continue { .. } => false,
     }
 }
 
@@ -107,7 +209,8 @@ pub fn region_contains_if(region: &Region) -> bool {
 /// Used to prefer "if (cond) { short/return } else { loop }" by swapping when then has loop and else doesn't.
 pub fn region_contains_loop(region: &Region) -> bool {
     match region {
-        Region::Block(_) => false,
+        Region::Block(_) | Region::Break { .. } | Region::Continue { .. } => false,
+        Region::Labeled { body, .. } => region_contains_loop(body),
         Region::Seq(children) => children.iter().any(region_contains_loop),
         Region::If {
             then_branch,
@@ -138,6 +241,21 @@ pub fn loop_body_break_pattern(body: &Region, header: BlockId) -> Option<(&str, 
                 else_branch,
             },
         ) if *bid == header => {
+            if region_has_jump(body) {
+                // Explicit jumps: `then` is emitted after the loop. Only a test that ends
+                // the body and leaves by a lone `break;` (nothing after the loop to
+                // emit), or by a jump-free path while no `break` targets the loop, fits.
+                if children.len() != 2 {
+                    return None;
+                }
+                if is_lone_jump(then_branch, false) {
+                    return Some((condition.as_str(), else_branch, &EMPTY_REGION));
+                }
+                if region_has_jump(then_branch) || region_may_jump_out_of_loop(else_branch, false)
+                {
+                    return None;
+                }
+            }
             // Empty-then + non-empty-else is do-while / while(true) territory, not break-while.
             if region_is_empty(then_branch) && !region_is_empty(else_branch) {
                 return None;
@@ -157,7 +275,8 @@ pub fn loop_body_break_pattern_trailing(
     let Region::Seq(children) = body else {
         return None;
     };
-    if children.is_empty() {
+    // The test would move above the blocks that precede it.
+    if children.is_empty() || region_has_jump(body) {
         return None;
     }
     match children.first()? {
@@ -288,6 +407,16 @@ pub fn format_region_debug(region: &Region, cfg: &MethodCfg) -> String {
                 let _ = writeln!(out, "{:indent$}default:", "", indent = d * 2);
                 walk(default, cfg, d + 1, out);
             }
+            Region::Labeled { label, body } => {
+                let _ = writeln!(out, "{:indent$}Labeled({label})", "", indent = d * 2);
+                walk(body, cfg, d + 1, out);
+            }
+            Region::Break { label } => {
+                let _ = writeln!(out, "{:indent$}Break({label:?})", "", indent = d * 2);
+            }
+            Region::Continue { label } => {
+                let _ = writeln!(out, "{:indent$}Continue({label:?})", "", indent = d * 2);
+            }
         }
     }
     walk(region, cfg, 0, &mut out);
@@ -309,11 +438,12 @@ fn collect_block_ids(region: &Region, out: &mut Vec<BlockId>) {
             collect_block_ids(then_branch, out);
             collect_block_ids(else_branch, out);
         }
-        Region::Loop { body, .. } => collect_block_ids(body, out),
+        Region::Loop { body, .. } | Region::Labeled { body, .. } => collect_block_ids(body, out),
         Region::Switch { cases, default, .. } => {
             cases.iter().for_each(|(_, r)| collect_block_ids(r, out));
             collect_block_ids(default, out);
         }
+        Region::Break { .. } | Region::Continue { .. } => {}
     }
 }
 
@@ -335,13 +465,16 @@ pub fn region_has_non_return_work(region: &Region, cfg: &MethodCfg) -> bool {
             region_has_non_return_work(then_branch, cfg)
                 || region_has_non_return_work(else_branch, cfg)
         }
-        Region::Loop { body, .. } => region_has_non_return_work(body, cfg),
+        Region::Loop { body, .. } | Region::Labeled { body, .. } => {
+            region_has_non_return_work(body, cfg)
+        }
         Region::Switch { cases, default, .. } => {
             cases
                 .iter()
                 .any(|(_, r)| region_has_non_return_work(r, cfg))
                 || region_has_non_return_work(default, cfg)
         }
+        Region::Break { .. } | Region::Continue { .. } => true,
     }
 }
 
@@ -528,6 +661,9 @@ pub fn peel_sequential_loop_tails(region: Region, cfg: &MethodCfg) -> Region {
 
 /// L3-2: sequential exit tests in a loop prefix → `(condition, exit_region)` chain.
 pub fn loop_prefix_multi_exit_ifs(region: &Region, header: BlockId) -> Vec<(String, Region)> {
+    if region_has_jump(region) {
+        return Vec::new();
+    }
     let Some(middle) = loop_body_break_middle(region, header) else {
         return Vec::new();
     };
@@ -563,7 +699,7 @@ fn resolve_then_start(
     branch_target: BlockId,
     fall_through: BlockId,
     loop_header: Option<BlockId>,
-    emitted: &HashSet<BlockId>,
+    emitted: &DetHashSet<BlockId>,
 ) -> BlockId {
     if loop_header == Some(branch_target) {
         return branch_target;
@@ -627,7 +763,8 @@ pub fn loop_body_do_while_pattern(
     let Region::Seq(children) = body else {
         return None;
     };
-    if children.len() < 3 {
+    // An empty arm stands for the back edge only in implicit-jump trees.
+    if children.len() < 3 || region_has_jump(body) {
         return None;
     }
     match &children[0] {
@@ -665,7 +802,7 @@ pub fn loop_body_do_while_loose(body: &Region, header: BlockId) -> Option<(&str,
     let Region::Seq(children) = body else {
         return None;
     };
-    if children.len() < 2 {
+    if children.len() < 2 || region_has_jump(body) {
         return None;
     }
     let last = children.last()?;
@@ -700,6 +837,9 @@ pub fn loop_body_do_while_exit_in_else(
     if children.is_empty() {
         return None;
     }
+    if region_has_jump(body) {
+        return explicit_do_while(children);
+    }
     let Region::Block(first) = &children[0] else {
         return None;
     };
@@ -709,6 +849,27 @@ pub fn loop_body_do_while_exit_in_else(
     let (cond, else_branch, if_idx) = trailing_continue_if(children)?;
     let do_body = Region::Seq(children[..if_idx].to_vec());
     Some((cond, do_body, else_branch))
+}
+
+/// Explicit-jump body ending in `if (c) continue; else break;`: `do { prefix } while (c);`,
+/// provided no other `continue` reaches the header (in a do-while it would test `c`).
+fn explicit_do_while(children: &[Region]) -> Option<(&str, Region, &Region)> {
+    let (last, prefix) = children.split_last()?;
+    let Region::If {
+        condition,
+        then_branch,
+        else_branch,
+    } = last
+    else {
+        return None;
+    };
+    if !is_lone_jump(then_branch, true) || !is_lone_jump(else_branch, false) {
+        return None;
+    }
+    if prefix.iter().any(|r| region_may_jump_out_of_loop(r, true)) {
+        return None;
+    }
+    Some((condition.as_str(), Region::Seq(prefix.to_vec()), &EMPTY_REGION))
 }
 
 /// Find a trailing `If(empty then, else exit)`; returns condition, else branch, and If index.
@@ -744,6 +905,8 @@ pub fn region_contains_block(region: &Region, id: BlockId) -> bool {
             cases.iter().any(|(_, r)| region_contains_block(r, id))
                 || region_contains_block(default, id)
         }
+        Region::Labeled { body, .. } => region_contains_block(body, id),
+        Region::Break { .. } | Region::Continue { .. } => false,
     }
 }
 
@@ -757,11 +920,12 @@ pub fn first_block(region: &Region) -> Option<BlockId> {
             else_branch,
             ..
         } => first_block(then_branch).or_else(|| first_block(else_branch)),
-        Region::Loop { body, .. } => first_block(body),
+        Region::Loop { body, .. } | Region::Labeled { body, .. } => first_block(body),
         Region::Switch { cases, default, .. } => cases
             .first()
             .and_then(|(_, r)| first_block(r))
             .or_else(|| first_block(default)),
+        Region::Break { .. } | Region::Continue { .. } => None,
     }
 }
 
@@ -770,7 +934,12 @@ pub fn last_block(region: &Region) -> Option<BlockId> {
     match region {
         Region::Block(bid) => Some(*bid),
         Region::Seq(children) => children.last().and_then(last_block),
-        Region::If { .. } | Region::Loop { .. } | Region::Switch { .. } => None,
+        Region::If { .. }
+        | Region::Loop { .. }
+        | Region::Switch { .. }
+        | Region::Labeled { .. }
+        | Region::Break { .. }
+        | Region::Continue { .. } => None,
     }
 }
 
@@ -850,7 +1019,7 @@ pub fn for_loop_pattern(
 /// Build a region tree from the CFG starting at entry.
 /// Uses the same structure as the current emit (loop headers -> Loop, conditionals -> If, rest -> Seq).
 pub fn build_regions(cfg: &MethodCfg, entry: BlockId) -> Option<Region> {
-    let mut emitted = HashSet::new();
+    let mut emitted = DetHashSet::default();
     build_regions_rec(cfg, entry, None, &mut emitted, None)
 }
 
@@ -861,16 +1030,17 @@ pub fn build_regions_with_peeled_tails(cfg: &MethodCfg, entry: BlockId) -> Optio
 
 /// Like build_regions but only includes blocks in `allowed`. Used for try body (only try-range blocks)
 /// or catch body (only handler-range blocks). Successors outside `allowed` are treated as exit.
-pub fn build_regions_filtered(
+pub fn build_regions_filtered<S: BuildHasher>(
     cfg: &MethodCfg,
     entry: BlockId,
-    allowed: &HashSet<BlockId>,
+    allowed: &HashSet<BlockId, S>,
 ) -> Option<Region> {
     if !allowed.contains(&entry) {
         return None;
     }
-    let mut emitted = HashSet::new();
-    build_regions_rec(cfg, entry, None, &mut emitted, Some(allowed))
+    let allowed: DetHashSet<BlockId> = allowed.iter().copied().collect();
+    let mut emitted = DetHashSet::default();
+    build_regions_rec(cfg, entry, None, &mut emitted, Some(&allowed))
 }
 
 fn build_if_branches(
@@ -878,8 +1048,8 @@ fn build_if_branches(
     then_start: BlockId,
     fall_through: BlockId,
     loop_header: Option<BlockId>,
-    emitted: &mut HashSet<BlockId>,
-    allowed: Option<&HashSet<BlockId>>,
+    emitted: &mut DetHashSet<BlockId>,
+    allowed: Option<&DetHashSet<BlockId>>,
     exit_target: bool,
 ) -> (Region, Region) {
     if exit_target {
@@ -903,10 +1073,10 @@ fn build_if_branches_until(
     cfg: &MethodCfg,
     then_start: BlockId,
     fall_through: BlockId,
-    stop_at: &HashSet<BlockId>,
+    stop_at: &DetHashSet<BlockId>,
     loop_header: Option<BlockId>,
-    emitted: &mut HashSet<BlockId>,
-    allowed: Option<&HashSet<BlockId>>,
+    emitted: &mut DetHashSet<BlockId>,
+    allowed: Option<&DetHashSet<BlockId>>,
     exit_target: bool,
 ) -> (Region, Region) {
     if exit_target {
@@ -994,7 +1164,7 @@ fn switch_join_block(
     cases: &[(i32, BlockId)],
     default_block: BlockId,
 ) -> Option<BlockId> {
-    let mut arms: HashSet<BlockId> = cases.iter().map(|(_, b)| *b).collect();
+    let mut arms: DetHashSet<BlockId> = cases.iter().map(|(_, b)| *b).collect();
     arms.insert(default_block);
     if arms.len() < 2 {
         return None;
@@ -1037,8 +1207,8 @@ fn block_successors(cfg: &MethodCfg, bid: BlockId) -> Vec<BlockId> {
 }
 
 /// Blocks reached by leaving `start`, not including `start` itself.
-fn reachable_after(cfg: &MethodCfg, start: BlockId) -> HashSet<BlockId> {
-    let mut seen = HashSet::new();
+fn reachable_after(cfg: &MethodCfg, start: BlockId) -> DetHashSet<BlockId> {
+    let mut seen = DetHashSet::default();
     let mut stack = block_successors(cfg, start);
     while let Some(b) = stack.pop() {
         if !seen.insert(b) || seen.len() > 64 {
@@ -1057,12 +1227,12 @@ fn switch_common_exit(
     cases: &[(i32, BlockId)],
     default_block: BlockId,
 ) -> Option<BlockId> {
-    let mut arms: HashSet<BlockId> = cases.iter().map(|(_, b)| *b).collect();
+    let mut arms: DetHashSet<BlockId> = cases.iter().map(|(_, b)| *b).collect();
     arms.insert(default_block);
     if arms.len() < 2 {
         return None;
     }
-    let mut inter: Option<HashSet<BlockId>> = None;
+    let mut inter: Option<DetHashSet<BlockId>> = None;
     for &arm in &arms {
         let reach = reachable_after(cfg, arm);
         inter = Some(match inter {
@@ -1092,8 +1262,8 @@ fn build_regions_rec(
     cfg: &MethodCfg,
     block_id: BlockId,
     loop_header: Option<BlockId>,
-    emitted: &mut HashSet<BlockId>,
-    allowed: Option<&HashSet<BlockId>>,
+    emitted: &mut DetHashSet<BlockId>,
+    allowed: Option<&DetHashSet<BlockId>>,
 ) -> Option<Region> {
     if emitted.contains(&block_id) {
         return None;
@@ -1189,7 +1359,7 @@ fn build_regions_rec(
             };
 
             if let Some(join_id) = diamond_join {
-                let stop_at: HashSet<BlockId> = std::iter::once(join_id).collect();
+                let stop_at: DetHashSet<BlockId> = std::iter::once(join_id).collect();
                 let else_r = build_regions_rec_until(
                     cfg,
                     *fall_through,
@@ -1269,12 +1439,12 @@ fn build_regions_rec(
         } => {
             let join = switch_join_block(cfg, cases, *default_block)
                 .or_else(|| switch_common_exit(cfg, cases, *default_block));
-            let mut stop_at: HashSet<BlockId> = cases
+            let mut stop_at: DetHashSet<BlockId> = cases
                 .iter()
                 .map(|(_, bid)| *bid)
                 .chain(std::iter::once(*default_block))
                 .collect();
-            let mut outlined: HashMap<BlockId, BlockId> = HashMap::new();
+            let mut outlined: DetHashMap<BlockId, BlockId> = DetHashMap::default();
             if let Some(j) = join {
                 stop_at.insert(j);
                 let mut arms: Vec<BlockId> = cases.iter().map(|(_, b)| *b).collect();
@@ -1288,7 +1458,7 @@ fn build_regions_rec(
             }
             // Several cases can share one target (`case 1: case 2: body`).
             // Only the last label owns the body; earlier ones are bare labels.
-            let mut owner_at: HashMap<BlockId, usize> = HashMap::new();
+            let mut owner_at: DetHashMap<BlockId, usize> = DetHashMap::default();
             for (i, (_, bid)) in cases.iter().enumerate() {
                 owner_at.insert(*bid, i);
             }
@@ -1373,10 +1543,10 @@ fn build_regions_rec(
 fn build_regions_rec_until(
     cfg: &MethodCfg,
     block_id: BlockId,
-    stop_at: &HashSet<BlockId>,
+    stop_at: &DetHashSet<BlockId>,
     loop_header: Option<BlockId>,
-    emitted: &mut HashSet<BlockId>,
-    allowed: Option<&HashSet<BlockId>>,
+    emitted: &mut DetHashSet<BlockId>,
+    allowed: Option<&DetHashSet<BlockId>>,
 ) -> Option<Region> {
     if stop_at.contains(&block_id) {
         return None;
@@ -1519,8 +1689,8 @@ fn build_regions_rec_until(
 fn build_loop_body(
     cfg: &MethodCfg,
     header_id: BlockId,
-    emitted: &mut HashSet<BlockId>,
-    allowed: Option<&HashSet<BlockId>>,
+    emitted: &mut DetHashSet<BlockId>,
+    allowed: Option<&DetHashSet<BlockId>>,
 ) -> Region {
     let block = &cfg.blocks[header_id];
     let block_reg = Region::Block(header_id);
@@ -1642,7 +1812,11 @@ mod tests {
                 else_branch,
                 ..
             } => contains_loop(then_branch) || contains_loop(else_branch),
-            Region::Block(_) | Region::Switch { .. } => false,
+            Region::Labeled { body, .. } => contains_loop(body),
+            Region::Block(_)
+            | Region::Switch { .. }
+            | Region::Break { .. }
+            | Region::Continue { .. } => false,
         }
     }
 
@@ -1715,18 +1889,24 @@ mod tests {
                     else_branch,
                     ..
                 } => block_count(then_branch) + block_count(else_branch),
-                Region::Loop { body, .. } => block_count(body),
+                Region::Loop { body, .. } | Region::Labeled { body, .. } => block_count(body),
                 Region::Switch { cases, default, .. } => {
                     cases.iter().map(|(_, r)| block_count(r)).sum::<usize>() + block_count(default)
                 }
+                Region::Break { .. } | Region::Continue { .. } => 0,
             }
         }
         fn first_if_then_branch(r: &Region) -> Option<&Region> {
             match r {
                 Region::If { then_branch, .. } => Some(then_branch),
                 Region::Seq(s) => s.iter().find_map(first_if_then_branch),
-                Region::Loop { body, .. } => first_if_then_branch(body.as_ref()),
-                Region::Block(_) | Region::Switch { .. } => None,
+                Region::Loop { body, .. } | Region::Labeled { body, .. } => {
+                    first_if_then_branch(body.as_ref())
+                }
+                Region::Block(_)
+                | Region::Switch { .. }
+                | Region::Break { .. }
+                | Region::Continue { .. } => None,
             }
         }
         let then_branch = first_if_then_branch(&r).expect("region tree should contain an If");
@@ -1776,7 +1956,11 @@ mod tests {
                     contains_loop_header(then_branch, header)
                         || contains_loop_header(else_branch, header)
                 }
-                Region::Block(_) | Region::Switch { .. } => false,
+                Region::Labeled { body, .. } => contains_loop_header(body, header),
+                Region::Block(_)
+                | Region::Switch { .. }
+                | Region::Break { .. }
+                | Region::Continue { .. } => false,
             }
         }
         fn contains_return(r: &Region, cfg: &MethodCfg) -> bool {
@@ -1790,11 +1974,14 @@ mod tests {
                     else_branch,
                     ..
                 } => contains_return(then_branch, cfg) || contains_return(else_branch, cfg),
-                Region::Loop { body, .. } => contains_return(body, cfg),
+                Region::Loop { body, .. } | Region::Labeled { body, .. } => {
+                    contains_return(body, cfg)
+                }
                 Region::Switch { cases, default, .. } => {
                     cases.iter().any(|(_, c)| contains_return(c, cfg))
                         || contains_return(default, cfg)
                 }
+                Region::Break { .. } | Region::Continue { .. } => false,
             }
         }
         // At least one loop header from the CFG must appear, and the return block must be reachable in the tree.
@@ -1857,7 +2044,8 @@ mod tests {
                 Region::Switch { cases, default, .. } => {
                     cases.iter().map(|(_, b)| count_loops(b)).sum::<usize>() + count_loops(default)
                 }
-                Region::Block(_) => 0,
+                Region::Labeled { body, .. } => count_loops(body),
+                Region::Block(_) | Region::Break { .. } | Region::Continue { .. } => 0,
             }
         }
         assert!(
@@ -1893,10 +2081,11 @@ mod tests {
                     else_branch,
                     ..
                 } => has_return(then_branch, cfg) || has_return(else_branch, cfg),
-                Region::Loop { body, .. } => has_return(body, cfg),
+                Region::Loop { body, .. } | Region::Labeled { body, .. } => has_return(body, cfg),
                 Region::Switch { cases, default, .. } => {
                     cases.iter().any(|(_, c)| has_return(c, cfg)) || has_return(default, cfg)
                 }
+                Region::Break { .. } | Region::Continue { .. } => false,
             }
         }
         assert!(

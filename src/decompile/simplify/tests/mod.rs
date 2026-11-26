@@ -4,6 +4,7 @@ use super::cleanup::*;
 use super::conditions::*;
 use super::loops::*;
 use super::util::*;
+use crate::decompile::DetHashSet;
 use super::{
     java_string_hash_code, merge_duplicate_finally, normalize_java_indent, restore_string_switch,
     simplify_method_body,
@@ -717,6 +718,32 @@ mod pipeline {
         assert!(out.contains("i == 0"), "became null:\n{out}");
         assert!(!out.contains("== null"), "{out}");
     }
+
+    #[test]
+    fn text_rewrites_keep_non_ascii() {
+        assert_eq!(
+            replace_ident_as_expr("log(\"┌─┐ 友盟\", x, a.x);", "x", "y"),
+            "log(\"┌─┐ 友盟\", y, a.x);"
+        );
+        assert_eq!(
+            replace_ident_as_expr("a.日志 = 日志;", "日志", "v"),
+            "a.日志 = v;"
+        );
+        assert_eq!(
+            polish_booleanish_int_args("w.setVisible(1); s = \"╚═╝ 日志\";"),
+            "w.setVisible(true); s = \"╚═╝ 日志\";"
+        );
+    }
+
+    #[test]
+    fn split_args_non_ascii_before_comma() {
+        let line = "        invoke-virtual( café, v1, Foo.bar(java.lang.String, int) );";
+        let (args, method_name) = parse_invoke_args_and_method(line).unwrap();
+        assert_eq!(args, "café, v1");
+        assert_eq!(method_name, "Foo.bar");
+        assert_eq!(split_first_arg("问题, v1").as_deref(), Some("问题"));
+        assert_eq!(split_first_arg("\"é,\", v1").as_deref(), Some("\"é,\""));
+    }
 }
 
 mod string_switch {
@@ -1397,6 +1424,26 @@ mod string_switch {
         );
     }
 
+    /// `F2.k.close()`: a value declared in the try and closed there, under a finally that
+    /// does not close it, stays a plain try/finally.
+    #[test]
+    fn resource_closed_in_try_under_unrelated_finally_is_not_try_with_resources() {
+        let body = r#"        try {
+            F2.q v0_r0 = (F2.q) this.e;
+            v0_r0.close();
+        } finally {
+            if (v5_r1 == null) {
+                v5_r1 = e;
+            }
+        }
+"#;
+        let out = simplify_method_body(body, false);
+        assert!(!out.contains("try ("), "{}", out);
+        assert!(out.contains("v0_r0.close();"), "{}", out);
+        assert!(out.contains("} finally {"), "{}", out);
+        assert_eq!(out.matches('{').count(), out.matches('}').count(), "{}", out);
+    }
+
     #[test]
     fn jadx_strip_redundant_cast() {
         let body = r#"        String s = (String) new String("x");
@@ -1736,6 +1783,271 @@ mod string_switch {
         assert!(
             !out.contains("k_0") && !out.contains("j_0"),
             "compare temps should inline:\n{out}"
+        );
+    }
+}
+
+/// Register reuse: a definition is inlined only into the uses it alone reaches.
+/// Bodies keep their indentation: block structure is read from it.
+mod variable_reuse {
+    use super::*;
+
+    /// D1 (001173): `"wsClient"` is stored in a branch; after the join `s0` may still
+    /// hold `this.client`, so the literal must not become the receiver.
+    #[test]
+    fn literal_stored_in_a_branch_is_not_inlined_after_the_join() {
+        let body = concat!(
+            "        s0 = this.client;\n",
+            "        if (z0) {\n",
+            "            s0 = \"wsClient\";\n",
+            "            Log.d(\"T\", s0);\n",
+            "        }\n",
+            "        s0.f();\n",
+        );
+        let out = cleanup_decompiler_artifacts(body);
+        assert!(!out.contains("\"wsClient\".f()"), "{out}");
+        assert!(out.contains("s0.f();"), "{out}");
+    }
+
+    /// D1: the loop reads, on the next iteration, the value assigned at its end.
+    #[test]
+    fn literal_assigned_in_a_loop_is_not_inlined_over_the_back_edge() {
+        let body = concat!(
+            "        s0 = this.first;\n",
+            "        while (z0) {\n",
+            "            this.use(s0);\n",
+            "            s0 = \"next\";\n",
+            "            this.log(s0);\n",
+            "        }\n",
+        );
+        let out = cleanup_decompiler_artifacts(body);
+        assert!(out.contains("this.use(s0);"), "{out}");
+        assert!(out.contains("s0 = \"next\";"), "{out}");
+    }
+
+    /// D5 (000128, 000137): a numeric literal is never a receiver (`0.x.j(…)`).
+    #[test]
+    fn numeric_literal_is_never_inlined_as_a_receiver() {
+        let body = concat!("        p0 = 0;\n", "        p0.x.j(1);\n");
+        let cleaned = cleanup_decompiler_artifacts(body);
+        assert!(!cleaned.contains("0.x"), "{cleaned}");
+        let simplified = simplify_method_body(body, false);
+        assert!(!simplified.contains("0.x"), "{simplified}");
+    }
+
+    /// D2 (001155): an undeclared temp is declared with the type of its definition.
+    #[test]
+    fn undeclared_temp_takes_the_type_of_its_definition() {
+        let body = concat!(
+            "        s4 = (android.os.PowerManager) obj0;\n",
+            "        s5 = \"alarm\";\n",
+            "        i6 = i0 + 1;\n",
+        );
+        let out = fix_undeclared_temp_assigns(body);
+        assert!(out.contains("android.os.PowerManager s4 = (android.os.PowerManager) obj0;"), "{out}");
+        assert!(out.contains("String s5 = \"alarm\";"), "{out}");
+        assert!(out.contains("int i6 = i0 + 1;"), "{out}");
+    }
+
+    /// R2 (000128 f()): reassigning a parameter is not a declaration (`int p0 = 0;`).
+    #[test]
+    fn reassigned_parameter_is_not_redeclared() {
+        let webs = WebNames {
+            params: ["p0".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let out = fix_undeclared_temp_assigns_with_webs("        p0 = 0;\n", &webs);
+        assert!(!out.contains("int p0"), "{out}");
+        assert!(out.contains("p0 = 0;"), "{out}");
+    }
+
+    /// R3 (001155 onCreate): `local6 = local6.edit()` never becomes `2131230978.edit()`.
+    #[test]
+    fn self_referential_repairs_never_put_a_number_as_receiver() {
+        use crate::decompile::simplify::repair::{
+            repair_register_reuse_scalars, repair_self_referential_call_args,
+        };
+        let body = concat!(
+            "        local6 = 2131230978;\n",
+            "        this.findViewById(local6);\n",
+            "        local6 = local6.edit();\n",
+        );
+        let out = repair_register_reuse_scalars(body);
+        assert!(!out.contains("2131230978.edit()"), "{out}");
+        let out = repair_self_referential_call_args(body);
+        assert!(!out.contains("2131230978.edit()"), "{out}");
+    }
+
+    /// R3: a string literal stays a legitimate receiver.
+    #[test]
+    fn string_literal_receiver_is_allowed() {
+        assert!(!is_non_object_literal("\"RESP:\""));
+        assert!(is_non_object_literal("2131230978"));
+        assert!(is_non_object_literal("null"));
+        assert!(ident_is_receiver("local6.edit()", "local6"));
+        assert!(!ident_is_receiver("this.local6", "local6"));
+    }
+
+    /// R4 (001155 onRequestPermissionsResult, 000137 b()): a parameter never assigned in the
+    /// body is not a dropped temp: `arr1` must not become `1`, `s1` must not become the
+    /// method's only literal.
+    #[test]
+    fn parameters_are_never_replaced_as_undeclared_temps() {
+        use crate::decompile::simplify::repair::repair_register_reuse_scalars_with_webs;
+        let webs = WebNames {
+            params: ["this", "i0", "arr1", "arr2", "s1"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ..Default::default()
+        };
+        let body = concat!(
+            "        f2.e.e(arr1, \"permissions\");\n",
+            "        f2.e.e(arr2, \"grantResults\");\n",
+            "        super.onRequestPermissionsResult(i0, arr1, arr2);\n",
+        );
+        let out = repair_register_reuse_scalars_with_webs(body, &webs);
+        assert_eq!(out.trim_end(), body.trim_end(), "{out}");
+        let body = concat!("        s0 = \"error\";\n", "        v0.put(s0, s1);\n");
+        let out = repair_register_reuse_scalars_with_webs(body, &webs);
+        assert!(out.contains("v0.put(s0, s1);"), "{out}");
+    }
+
+    fn webs(inlinable: &[&str], frozen: &[&str]) -> WebNames {
+        let set = |names: &[&str]| -> DetHashSet<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        };
+        WebNames {
+            inlinable: set(inlinable),
+            frozen: set(frozen),
+            ..Default::default()
+        }
+    }
+
+    /// S2 (001173 a()): an inlinable constant is inlined whatever the form of its name.
+    #[test]
+    fn inlinable_constant_is_inlined_whatever_its_name() {
+        let body = concat!(
+            "        String s12_r3_3 = \"Max WebSocket attempts reached, falling back to TCP\";\n",
+            "        android.util.Log.d(\"ConnectionService\", s12_r3_3);\n",
+        );
+        let webs = webs(&["s12_r3_3"], &["s12_r3_3"]);
+        let out = inline_global_literal_temps_with_webs(body, &webs);
+        assert!(
+            out.contains(
+                "android.util.Log.d(\"ConnectionService\", \"Max WebSocket attempts reached, falling back to TCP\");"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("s12_r3_3"), "{out}");
+    }
+
+    /// S2 (001155 t()): a variable assigned in the try and in the catch, read after the
+    /// join, is one web with two definitions: not inlinable, the text stays as emitted.
+    #[test]
+    fn frozen_name_across_try_and_catch_is_left_alone() {
+        use crate::decompile::simplify::repair::{
+            repair_register_reuse_scalars_with_webs, repair_self_referential_call_args_with_webs,
+        };
+        let body = concat!(
+            "        try {\n",
+            "            s1 = this.getString(i0);\n",
+            "        } catch (Exception e) {\n",
+            "            s1 = \"System Service\";\n",
+            "        }\n",
+            "        android.util.Log.d(\"T\", s1);\n",
+        );
+        let webs = webs(&[], &["s1", "e", "i0"]);
+        let out = inline_global_literal_temps_with_webs(body, &webs);
+        let out = cleanup_decompiler_artifacts_with_webs(&out, &webs);
+        let out = repair_register_reuse_scalars_with_webs(&out, &webs);
+        let out = repair_self_referential_call_args_with_webs(&out, &webs);
+        assert_eq!(out.trim_end(), body.trim_end(), "{out}");
+    }
+
+    /// S2/S4 (000128 c()): a frozen name read without definition is never replaced by a
+    /// literal; it stays visible.
+    #[test]
+    fn frozen_name_is_never_replaced_by_register_reuse_repairs() {
+        use crate::decompile::simplify::repair::repair_register_reuse_scalars_with_webs;
+        let body = concat!("        i0 = 0;\n", "        this.a(local2, local1);\n");
+        let webs = webs(&[], &["i0", "local1", "local2"]);
+        let out = repair_register_reuse_scalars_with_webs(body, &webs);
+        assert!(out.contains("this.a(local2, local1);"), "{out}");
+    }
+
+    /// S3 (000392 b()): the exception of a catch clause is never replaced by a literal.
+    #[test]
+    fn catch_variable_is_never_replaced_by_a_literal() {
+        let body = concat!(
+            "        try {\n",
+            "            s1 = \"RESP:IDIOT:STOPPED\";\n",
+            "            p0.e(s1);\n",
+            "        } catch (Exception e) {\n",
+            "            p0.e(\"RESP:IDIOT:ERROR:\" + e.getMessage());\n",
+            "        }\n",
+        );
+        let webs = webs(&["s1"], &["s1", "e"]);
+        let out = inline_global_literal_temps_with_webs(body, &webs);
+        let out = cleanup_decompiler_artifacts_with_webs(&out, &webs);
+        assert!(out.contains("p0.e(\"RESP:IDIOT:ERROR:\" + e.getMessage());"), "{out}");
+        assert!(out.contains("p0.e(\"RESP:IDIOT:STOPPED\");"), "{out}");
+    }
+
+    fn typed(names: &[(&str, &str)]) -> WebNames {
+        let mut webs = webs(&[], &names.iter().map(|(n, _)| *n).collect::<Vec<_>>());
+        webs.types = names
+            .iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect();
+        webs
+    }
+
+    /// T1 (001155 o()): a web's name is declared with the web's type, not `int`, even when
+    /// the definition does not show it.
+    #[test]
+    fn frozen_name_is_declared_with_its_web_type() {
+        let webs = typed(&[("s3_r0", "String")]);
+        let out = fix_undeclared_temp_assigns_with_webs("        s3_r0 = s3 + s5;\n", &webs);
+        assert!(out.contains("String s3_r0 = s3 + s5;"), "{out}");
+    }
+
+    /// T2 (001155 n(), onCreate): a zero test on a web's name follows its type: `== 0` for
+    /// an int, `!x` for a boolean, `== null` for a reference.
+    #[test]
+    fn zero_test_follows_the_web_type() {
+        let webs = typed(&[("length", "int"), ("s1_r2", "boolean"), ("obj1", "View")]);
+        let body = concat!(
+            "        if (length == 0) {\n",
+            "        if (s1_r2 == 0) {\n",
+            "        if (obj1 != 0) {\n",
+        );
+        let out = polish_null_comparisons_in_body_with_webs(body, &webs);
+        assert!(out.contains("if (length == 0) {"), "{out}");
+        assert!(out.contains("if (!s1_r2) {"), "{out}");
+        assert!(out.contains("if (obj1 != null) {"), "{out}");
+    }
+
+    /// D7 (001173 onCreate): `new` + argument set-up + `<init>` → one `new T(args)` placed
+    /// after the arguments it uses.
+    #[test]
+    fn constructor_merges_across_argument_setup() {
+        let body = concat!(
+            "        D0.K v2 = new D0.K();\n",
+            "        java.lang.StringBuilder sb0 = new java.lang.StringBuilder();\n",
+            "        sb0.<init>();\n",
+            "        sb0.append(s1);\n",
+            "        String s2 = sb0.toString();\n",
+            "        v2.<init>(s2);\n",
+        );
+        let out = merge_constructor_calls(body);
+        assert!(!out.contains("<init>"), "{out}");
+        let built = out.find("D0.K v2 = new D0.K(s2);").expect(&out);
+        let arg = out.find("String s2 = sb0.toString();").expect(&out);
+        assert!(arg < built, "{out}");
+        assert!(
+            out.contains("java.lang.StringBuilder sb0 = new java.lang.StringBuilder();"),
+            "{out}"
         );
     }
 }

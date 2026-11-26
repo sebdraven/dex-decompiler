@@ -2,7 +2,7 @@
 
 use dex_parser::{ClassData, ClassDef, DexFile};
 
-use super::annotations::EncodedValue;
+use super::annotations::{read_encoded_value, EncodedValue};
 use crate::java;
 
 /// One static field initializer from `class_def.static_values_off`.
@@ -93,25 +93,55 @@ fn replace_literal_token(src: &str, lit: &str, repl: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let bytes = src.as_bytes();
     let lit_b = lit.as_bytes();
+    // Unreplaced text is copied as `&str` slices from `copied`; match bounds are char boundaries.
+    let mut copied = 0;
+    // Don't replace inside string literals.
+    let mut in_string = false;
     let mut i = 0;
     while i < bytes.len() {
-        if i + lit_b.len() <= bytes.len() && &bytes[i..i + lit_b.len()] == lit_b {
+        if !in_string && bytes[i..].starts_with(lit_b) {
             let before_ok = i == 0 || !is_token_char(bytes[i - 1]);
             let after = i + lit_b.len();
             let after_ok = after >= bytes.len() || !is_token_char(bytes[after]);
-            // Don't replace inside string literals (naive: odd number of quotes before).
-            let prefix = &src[..i];
-            let in_string = prefix.matches('"').count() % 2 == 1;
-            if before_ok && after_ok && !in_string {
+            if before_ok && after_ok {
+                out.push_str(&src[copied..i]);
                 out.push_str(repl);
                 i = after;
+                copied = i;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'\'' if !in_string => {
+                if let Some(end) = char_literal_end(src, i) {
+                    i = end;
+                    continue;
+                }
+            }
+            _ => {}
+        }
         i += 1;
     }
+    out.push_str(&src[copied..]);
     out
+}
+
+/// End (exclusive) of a Java char literal opening at `src[i] == '\''`, if one starts there.
+fn char_literal_end(src: &str, i: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut j = i + 1;
+    if *bytes.get(j)? == b'\\' {
+        // `'\n'`, `'\''`, `'\177'`, `'\u00e9'`
+        j += 2;
+        while j < bytes.len() && j < i + 7 && bytes[j] != b'\'' {
+            j += 1;
+        }
+    } else {
+        j += src.get(j..)?.chars().next()?.len_utf8();
+    }
+    (bytes.get(j) == Some(&b'\'')).then_some(j + 1)
 }
 
 fn is_token_char(b: u8) -> bool {
@@ -217,100 +247,23 @@ fn read_uleb128(data: &[u8], pos: &mut usize) -> Option<u32> {
     Some(result)
 }
 
-fn read_encoded_value(data: &[u8], pos: &mut usize) -> Option<EncodedValue> {
-    if *pos >= data.len() {
-        return None;
-    }
-    let header = data[*pos];
-    *pos += 1;
-    let value_type = header & 0x1f;
-    let value_arg = (header >> 5) as usize;
-    match value_type {
-        0x00 => {
-            let v = data.get(*pos).copied()? as i8;
-            *pos += 1;
-            Some(EncodedValue::Byte(v))
-        }
-        0x02 => {
-            let mut buf = [0u8; 2];
-            for i in 0..=value_arg.min(1) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Short(i16::from_le_bytes(buf)))
-        }
-        0x03 => {
-            let mut buf = [0u8; 2];
-            for i in 0..=value_arg.min(1) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Char(u16::from_le_bytes(buf)))
-        }
-        0x04 => {
-            let mut buf = [0u8; 4];
-            for i in 0..=value_arg.min(3) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Int(i32::from_le_bytes(buf)))
-        }
-        0x06 => {
-            let mut buf = [0u8; 8];
-            for i in 0..=value_arg.min(7) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Long(i64::from_le_bytes(buf)))
-        }
-        0x10 => {
-            let mut buf = [0u8; 4];
-            for i in 0..=value_arg.min(3) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Float(f32::from_bits(u32::from_le_bytes(buf))))
-        }
-        0x11 => {
-            let mut buf = [0u8; 8];
-            for i in 0..=value_arg.min(7) {
-                buf[i] = *data.get(*pos)?;
-                *pos += 1;
-            }
-            Some(EncodedValue::Double(f64::from_bits(u64::from_le_bytes(
-                buf,
-            ))))
-        }
-        0x17 => {
-            let mut v: u32 = 0;
-            for i in 0..=value_arg {
-                let b = *data.get(*pos)? as u32;
-                *pos += 1;
-                v |= b << (8 * i);
-            }
-            Some(EncodedValue::String(v))
-        }
-        0x18 => {
-            let mut v: u32 = 0;
-            for i in 0..=value_arg {
-                let b = *data.get(*pos)? as u32;
-                *pos += 1;
-                v |= b << (8 * i);
-            }
-            Some(EncodedValue::Type(v))
-        }
-        0x1e => Some(EncodedValue::Null),
-        0x1f => Some(EncodedValue::Boolean(value_arg != 0)),
-        _ => {
-            *pos = (*pos).saturating_add(value_arg + 1);
-            Some(EncodedValue::Other)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_values_float_double_and_negative_int() {
+        let data = b"\x04\x31\x14\x40\x31\xE0\x3F\x30\x80\x3F\x04\xFF";
+        assert_eq!(
+            parse_encoded_array(data, 0),
+            Some(vec![
+                EncodedValue::Double(5.0),
+                EncodedValue::Double(0.5),
+                EncodedValue::Float(1.0),
+                EncodedValue::Int(-1),
+            ])
+        );
+    }
 
     #[test]
     fn replace_literal_int() {
@@ -318,5 +271,46 @@ mod tests {
         let out = apply_const_field_replacements(body, &[("42".into(), "Foo.ANSWER".into())]);
         assert!(out.contains("Foo.ANSWER"));
         assert!(!out.contains("= 42"));
+    }
+
+    #[test]
+    fn replace_literal_keeps_non_ascii_strings() {
+        let body = "        Log.d(\"┌──────┐ 友盟 │\", 42);\n        int y = 7;\n        String s = \"╚═╝ 日志\";\n        return 42 + 7;\n";
+        let reps = [
+            ("42".to_string(), "Foo.A".to_string()),
+            ("7".to_string(), "Foo.B".to_string()),
+        ];
+        let out = apply_const_field_replacements(body, &reps);
+        let expected = "        Log.d(\"┌──────┐ 友盟 │\", Foo.A);\n        int y = Foo.B;\n        String s = \"╚═╝ 日志\";\n        return Foo.A + Foo.B;\n";
+        assert_eq!(out.as_bytes(), expected.as_bytes());
+        assert_eq!(
+            out.len(),
+            body.len() + 2 * ("Foo.A".len() - "42".len()) + 2 * ("Foo.B".len() - "7".len())
+        );
+    }
+
+    #[test]
+    fn replace_literal_many_passes_no_growth() {
+        let body = "        String s = \"┌─┬─┐ 友盟统计 ╔═╗\";\n        int x = 1000;\n";
+        let reps: Vec<(String, String)> = (0..20)
+            .map(|k| ((1000 + k).to_string(), format!("Foo.C{}", k)))
+            .collect();
+        let out = apply_const_field_replacements(body, &reps);
+        assert_eq!(out, body.replace("1000", "Foo.C0"));
+        assert_eq!(out.len(), body.len() - "1000".len() + "Foo.C0".len());
+    }
+
+    #[test]
+    fn replace_literal_skips_string_with_escaped_quote() {
+        let body = "        log(\"say \\\"42\\\" now\", 42);\n";
+        let out = apply_const_field_replacements(body, &[("42".into(), "Foo.A".into())]);
+        assert_eq!(out, "        log(\"say \\\"42\\\" now\", Foo.A);\n");
+    }
+
+    #[test]
+    fn replace_literal_ignores_quote_char_literal() {
+        let body = "        char q = '\"';\n        int x = 42;\n";
+        let out = apply_const_field_replacements(body, &[("42".into(), "Foo.A".into())]);
+        assert_eq!(out, "        char q = '\"';\n        int x = Foo.A;\n");
     }
 }

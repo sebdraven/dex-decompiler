@@ -1,6 +1,7 @@
 //! Try/catch/finally, do-while, and enum switch-map restoration.
 
 use super::util::*;
+use crate::decompile::{DetHashMap, DetHashSet};
 
 /// Strip `Objects.requireNonNull` / Kotlin `Intrinsics.checkNotNull*` wrappers.
 pub(crate) fn strip_require_non_null(body: &str) -> String {
@@ -362,7 +363,7 @@ pub(crate) fn parse_if_break_oneliner(line: &str) -> Option<String> {
     // Find matching `)` before ` break;`
     let mut depth = 0i32;
     let mut close = None;
-    for (i, c) in rest.chars().enumerate() {
+    for (i, c) in rest.char_indices() {
         match c {
             '(' => depth += 1,
             ')' => {
@@ -639,11 +640,11 @@ pub(crate) fn enum_names_from_switchmap_key(key: &str) -> Option<(String, String
 /// Map `(switchmap_field_key, slot) → (enum_type_simple_or_fq, const_name)`.
 pub(crate) fn parse_switchmap_assignments(
     body: &str,
-) -> std::collections::HashMap<(String, i32), (String, String)> {
-    let mut map = std::collections::HashMap::new();
+) -> DetHashMap<(String, i32), (String, String)> {
+    let mut map = DetHashMap::default();
     // Track local vars assigned from a SwitchMap field.
-    let mut local_to_key: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut local_to_key: DetHashMap<String, String> =
+        DetHashMap::default();
     for line in body.lines() {
         let binding = strip_trailing_comment(line);
         let stmt = binding.trim();
@@ -746,8 +747,8 @@ pub(crate) fn restore_enum_switchmap_cases(body: &str) -> String {
         }
         // If body still has assignment lines for a key, use the key that has slots.
         if switchmap_key.is_none() {
-            // Pick any key present in assignments (typical: one SwitchMap per method).
-            if let Some(((k, _), _)) = assignments.iter().next() {
+            // Typical: one SwitchMap per method; otherwise the smallest key.
+            if let Some((k, _)) = assignments.keys().min() {
                 switchmap_key = Some(k.clone());
             }
         }
@@ -1260,7 +1261,7 @@ pub(crate) fn restore_d8_try_with_resources_once(body: &str) -> String {
             .map(|(_, ty, var, rhs)| (ty.clone(), var.clone(), rhs.clone()))
             .chain(decls_inside)
             .collect();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = DetHashSet::default();
         all_decls.retain(|(_, v, _)| seen.insert(v.clone()));
 
         let resource_names: Vec<&str> = all_decls.iter().map(|(_, v, _)| v.as_str()).collect();
@@ -1293,8 +1294,14 @@ pub(crate) fn restore_d8_try_with_resources_once(body: &str) -> String {
         if !had_inline_close && !has_boilerplate {
             continue;
         }
+        // A catch or finally that does not close the resources is the method's own:
+        // rewriting the try would leave it orphaned.
+        let left = lines.get(boilerplate_end).map(|l| l.trim()).unwrap_or("");
+        if left.starts_with("} catch (") || left.starts_with("} finally") || left == "finally {" {
+            continue;
+        }
 
-        let decl_idxs: std::collections::HashSet<usize> =
+        let decl_idxs: DetHashSet<usize> =
             decls_above.iter().map(|(i, _, _, _)| *i).collect();
         let indent = leading_indent(lines[try_i]);
         let resources_hdr: String = all_decls
@@ -1631,7 +1638,7 @@ pub(crate) fn restore_try_with_resources_once(body: &str) -> String {
             continue;
         }
 
-        let decl_idxs: std::collections::HashSet<usize> =
+        let decl_idxs: DetHashSet<usize> =
             decls.iter().map(|(i, _, _, _)| *i).collect();
         let indent = leading_indent(lines[try_i]);
         let resources_hdr: String = decls
@@ -1707,4 +1714,17 @@ pub(crate) fn restore_try_with_resources_once(body: &str) -> String {
         return out;
     }
     body.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn if_break_oneliner_non_ascii() {
+        assert_eq!(
+            parse_if_break_oneliner("if (s.equals(\"问\")) break;").as_deref(),
+            Some("s.equals(\"问\")")
+        );
+    }
 }

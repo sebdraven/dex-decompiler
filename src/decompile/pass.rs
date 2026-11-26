@@ -4,8 +4,8 @@
 //! invoke+move-result+return folding and similar patterns.
 
 use crate::decompile::ir::VarId;
-use crate::decompile::ir::{Expr as IrExpr, Stmt as IrStmt};
-use std::collections::{HashMap, HashSet};
+use crate::decompile::ir::{map_outside_literals, Expr as IrExpr, Stmt as IrStmt};
+use crate::decompile::{DetHashMap, DetHashSet};
 
 /// A single transformation pass over method IR.
 pub trait Pass {
@@ -272,7 +272,7 @@ impl Pass for DeadAssignPass {
 /// Dead-assign using a precomputed set of used *register numbers* (not VarId).
 /// Keeps Assign if dst.reg is in used_regs. Use when emitting CFG so assigns
 /// whose destination is used in other blocks are not removed.
-pub fn run_dead_assign_with_used_regs(stmts: Vec<IrStmt>, used_regs: &HashSet<u32>) -> Vec<IrStmt> {
+pub fn run_dead_assign_with_used_regs(stmts: Vec<IrStmt>, used_regs: &DetHashSet<u32>) -> Vec<IrStmt> {
     stmts
         .into_iter()
         .filter(|s| {
@@ -340,14 +340,14 @@ fn is_fp_or_wide_const_rhs(rhs: &str) -> bool {
 }
 
 /// Collect all register numbers that are read (used) in the IR.
-pub fn used_regs(stmts: &[IrStmt]) -> HashSet<u32> {
+pub fn used_regs(stmts: &[IrStmt]) -> DetHashSet<u32> {
     used_var_ids(stmts).iter().map(|v| v.reg).collect()
 }
 
 /// Collect all VarIds that are read (used) in the IR (in RHS, Return, Expr).
 /// Includes VarIds mentioned in Raw strings and Call args so dead-assign doesn't remove defs that are only used there.
-fn used_var_ids(stmts: &[IrStmt]) -> HashSet<VarId> {
-    let mut set = HashSet::new();
+fn used_var_ids(stmts: &[IrStmt]) -> DetHashSet<VarId> {
+    let mut set = DetHashSet::default();
     for s in stmts {
         match s {
             IrStmt::Assign { rhs, .. } => collect_var_ids_expr(rhs, &mut set),
@@ -365,7 +365,7 @@ fn used_var_ids(stmts: &[IrStmt]) -> HashSet<VarId> {
     set
 }
 
-fn collect_var_ids_expr(expr: &IrExpr, set: &mut HashSet<VarId>) {
+fn collect_var_ids_expr(expr: &IrExpr, set: &mut DetHashSet<VarId>) {
     match expr {
         IrExpr::Var(v) => {
             set.insert(*v);
@@ -381,7 +381,7 @@ fn collect_var_ids_expr(expr: &IrExpr, set: &mut HashSet<VarId>) {
 }
 
 /// Collect all VarIds mentioned in text (vN or vN_k).
-fn var_ids_in_text(s: &str, set: &mut HashSet<VarId>) {
+fn var_ids_in_text(s: &str, set: &mut DetHashSet<VarId>) {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -417,7 +417,7 @@ pub struct CopyPropPass;
 
 impl Pass for CopyPropPass {
     fn run(&self, stmts: Vec<IrStmt>) -> Vec<IrStmt> {
-        let mut alias: HashMap<VarId, VarId> = HashMap::new();
+        let mut alias: DetHashMap<VarId, VarId> = DetHashMap::default();
         for stmt in &stmts {
             if let IrStmt::Assign { dst, rhs, .. } = stmt {
                 if let Some(src) = copy_source(rhs) {
@@ -430,10 +430,10 @@ impl Pass for CopyPropPass {
         if alias.is_empty() {
             return stmts;
         }
-        let mut resolved: HashMap<VarId, VarId> = HashMap::new();
+        let mut resolved: DetHashMap<VarId, VarId> = DetHashMap::default();
         for &dst in alias.keys() {
             let mut cur = dst;
-            let mut seen: HashSet<VarId> = HashSet::new();
+            let mut seen: DetHashSet<VarId> = DetHashSet::default();
             while let Some(&next) = alias.get(&cur) {
                 if !seen.insert(cur) {
                     break;
@@ -475,7 +475,7 @@ fn copy_assign_must_keep(
     dst: VarId,
     stmts: &[IrStmt],
     rewritten: &[IrStmt],
-    resolved: &HashMap<VarId, VarId>,
+    resolved: &DetHashMap<VarId, VarId>,
 ) -> bool {
     let reg = dst.reg;
     // One-instruction block `dst = src` is a store used outside the block
@@ -502,7 +502,7 @@ fn copy_assign_must_keep(
     false
 }
 
-fn rewrite_stmt(stmt: &IrStmt, resolved: &HashMap<VarId, VarId>) -> IrStmt {
+fn rewrite_stmt(stmt: &IrStmt, resolved: &DetHashMap<VarId, VarId>) -> IrStmt {
     match stmt {
         IrStmt::Assign { dst, rhs, comment } => IrStmt::Assign {
             dst: *dst,
@@ -600,11 +600,11 @@ fn parse_bare_varid(s: &str) -> Option<VarId> {
     Some(VarId::new(reg, ver))
 }
 
-fn resolve_vid(v: VarId, map: &HashMap<VarId, VarId>) -> VarId {
+fn resolve_vid(v: VarId, map: &DetHashMap<VarId, VarId>) -> VarId {
     map.get(&v).copied().unwrap_or(v)
 }
 
-fn rewrite_expr(expr: IrExpr, map: &HashMap<VarId, VarId>) -> IrExpr {
+fn rewrite_expr(expr: IrExpr, map: &DetHashMap<VarId, VarId>) -> IrExpr {
     match expr {
         IrExpr::Var(v) => IrExpr::Var(resolve_vid(v, map)),
         IrExpr::Call { target, args } => IrExpr::Call {
@@ -624,7 +624,7 @@ fn format_varid(v: VarId) -> String {
     }
 }
 
-fn rewrite_varids_in_text(s: &str, map: &HashMap<VarId, VarId>) -> String {
+fn rewrite_varids_in_text(s: &str, map: &DetHashMap<VarId, VarId>) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -666,8 +666,9 @@ fn rewrite_varids_in_text(s: &str, map: &HashMap<VarId, VarId>) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&s[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -681,8 +682,8 @@ pub struct SsaRenamePass;
 
 impl Pass for SsaRenamePass {
     fn run(&self, stmts: Vec<IrStmt>) -> Vec<IrStmt> {
-        let mut next_ver: HashMap<u32, u32> = HashMap::new();
-        let mut cur_ver: HashMap<u32, u32> = HashMap::new();
+        let mut next_ver: DetHashMap<u32, u32> = DetHashMap::default();
+        let mut cur_ver: DetHashMap<u32, u32> = DetHashMap::default();
 
         let mut out = Vec::with_capacity(stmts.len());
         for stmt in stmts {
@@ -717,14 +718,37 @@ impl Pass for SsaRenamePass {
                     cur_ver.insert(dst.reg, dst.ver);
                     out.push(IrStmt::Phi { dst, incomings });
                 }
-                IrStmt::Raw(s) => out.push(IrStmt::Raw(rename_vars_in_text(&s, &cur_ver))),
+                IrStmt::Raw(s) => {
+                    // `vN = …;` (move-result without its invoke, cmp, float ops) defines vN.
+                    if let Some((reg, rhs)) = raw_register_def(&s) {
+                        let rhs = rename_vars_in_text(rhs, &cur_ver);
+                        let v = next_ver.entry(reg).or_insert(0);
+                        *v += 1;
+                        cur_ver.insert(reg, *v);
+                        out.push(IrStmt::Raw(format!("v{}_{} = {}", reg, *v, rhs)));
+                    } else {
+                        out.push(IrStmt::Raw(rename_vars_in_text(&s, &cur_ver)));
+                    }
+                }
             }
         }
         out
     }
 }
 
-fn rename_expr(expr: IrExpr, cur_ver: &HashMap<u32, u32>) -> IrExpr {
+/// `vN = rhs` at the start of a raw line → (N, rhs).
+fn raw_register_def(s: &str) -> Option<(u32, &str)> {
+    let rest = s.strip_prefix('v')?;
+    let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let reg = rest[..digits].parse().ok()?;
+    let rhs = rest[digits..].strip_prefix(" = ")?;
+    Some((reg, rhs))
+}
+
+fn rename_expr(expr: IrExpr, cur_ver: &DetHashMap<u32, u32>) -> IrExpr {
     match expr {
         IrExpr::Var(v) => IrExpr::Var(rename_var(v, cur_ver)),
         IrExpr::Call { target, args } => IrExpr::Call {
@@ -736,20 +760,24 @@ fn rename_expr(expr: IrExpr, cur_ver: &HashMap<u32, u32>) -> IrExpr {
     }
 }
 
-fn rename_var(v: VarId, cur_ver: &HashMap<u32, u32>) -> VarId {
+fn rename_var(v: VarId, cur_ver: &DetHashMap<u32, u32>) -> VarId {
     let ver = cur_ver.get(&v.reg).copied().unwrap_or(0);
     VarId::new(v.reg, ver)
 }
 
 /// Best-effort text rewrite: `vN` -> `vN_k` if current version for N is k>0.
 /// Leaves already-versioned `vN_k` unchanged.
-pub(crate) fn rename_vars_in_text_public(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
+pub(crate) fn rename_vars_in_text_public(s: &str, cur_ver: &DetHashMap<u32, u32>) -> String {
     rename_vars_in_text(s, cur_ver)
 }
 
 /// Best-effort text rewrite: `vN` -> `vN_k` if current version for N is k>0.
 /// Leaves already-versioned `vN_k` unchanged.
-fn rename_vars_in_text(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
+fn rename_vars_in_text(s: &str, cur_ver: &DetHashMap<u32, u32>) -> String {
+    map_outside_literals(s, |code| rename_vars_in_code(code, cur_ver))
+}
+
+fn rename_vars_in_code(s: &str, cur_ver: &DetHashMap<u32, u32>) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -795,32 +823,47 @@ fn rename_vars_in_text(s: &str, cur_ver: &HashMap<u32, u32>) -> String {
             i = j;
             continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&s[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
 
 /// Merge `new Foo()` + `receiver.<init>(args)` → `new Foo(args)`, and remove the bare `<init>` call.
-/// Allows intervening simple assignments (e.g. `const-class`) that don't redefine the receiver.
+/// Statements loading the arguments may sit in between as long as they leave the receiver
+/// alone (`const-class`, nested `new`, `sb.append(x)` without move-result, field reads).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConstructorMergePass;
 
 impl Pass for ConstructorMergePass {
     fn run(&self, stmts: Vec<IrStmt>) -> Vec<IrStmt> {
-        let mut out: Vec<IrStmt> = Vec::with_capacity(stmts.len());
-        let mut i = 0;
-        while i < stmts.len() {
-            if let Some((merged, next_i)) = try_merge_constructor(&stmts, i) {
-                out.extend(merged);
-                i = next_i;
-                continue;
+        // `new A(new B(…))`: the outer pair merges first, the inner one on the next round.
+        let mut current = stmts;
+        for _ in 0..8 {
+            let next = merge_constructors_once(&current);
+            if next == current {
+                break;
             }
-            out.push(stmts[i].clone());
-            i += 1;
+            current = next;
         }
-        out
+        current
     }
+}
+
+fn merge_constructors_once(stmts: &[IrStmt]) -> Vec<IrStmt> {
+    let mut out: Vec<IrStmt> = Vec::with_capacity(stmts.len());
+    let mut i = 0;
+    while i < stmts.len() {
+        if let Some((merged, next_i)) = try_merge_constructor(stmts, i) {
+            out.extend(merged);
+            i = next_i;
+            continue;
+        }
+        out.push(stmts[i].clone());
+        i += 1;
+    }
+    out
 }
 
 fn call_is_init_for_reg(target: &str, reg: u32) -> bool {
@@ -861,8 +904,10 @@ fn try_merge_constructor(stmts: &[IrStmt], i: usize) -> Option<(Vec<IrStmt>, usi
                 comment: c2,
             } if call_is_init_for_reg(target, dst_reg) => {
                 let merged_comment = merge_comment(comment.as_deref(), c2.as_deref());
-                // Inline intervening const-class / const-string temps into constructor args so
-                // we don't emit `new Intent(this, local0)` before `local0 = Foo.class`.
+                // Inline single-use literal temps (const-class / const-string) so we don't
+                // emit `new Intent(this, local0)` before `local0 = Foo.class`.
+                let later_uses = used_var_ids(&stmts[j + 1..]);
+                let between_uses = used_var_ids(&intervening);
                 let mut args = args.clone();
                 let mut keep_intervening: Vec<IrStmt> = Vec::new();
                 for inter in &intervening {
@@ -872,10 +917,15 @@ fn try_merge_constructor(stmts: &[IrStmt], i: usize) -> Option<(Vec<IrStmt>, usi
                         ..
                     } = inter
                     {
-                        let inlined = inline_var_in_args(&args, *idst, rval);
-                        if inlined != args {
-                            args = inlined;
-                            continue;
+                        if is_ctor_literal_arg(rval)
+                            && !later_uses.contains(idst)
+                            && !between_uses.contains(idst)
+                        {
+                            let inlined = inline_var_in_args(&args, *idst, rval);
+                            if inlined != args {
+                                args = inlined;
+                                continue;
+                            }
                         }
                     }
                     keep_intervening.push(inter.clone());
@@ -888,7 +938,9 @@ fn try_merge_constructor(stmts: &[IrStmt], i: usize) -> Option<(Vec<IrStmt>, usi
                 });
                 return Some((out, j + 1));
             }
-            s @ IrStmt::Assign { .. } => {
+            s @ (IrStmt::Assign { .. } | IrStmt::Expr { .. } | IrStmt::Raw(_))
+                if !used_regs(std::slice::from_ref(s)).contains(&dst_reg) =>
+            {
                 intervening.push(s.clone());
                 j += 1;
             }
@@ -898,24 +950,34 @@ fn try_merge_constructor(stmts: &[IrStmt], i: usize) -> Option<(Vec<IrStmt>, usi
     None
 }
 
-/// Replace `vN` / `vN_k` for `vid` in a comma-separated arg list with `rval`.
+/// Literal that may be moved into constructor arguments.
+fn is_ctor_literal_arg(rval: &str) -> bool {
+    let r = rval.trim();
+    (r.starts_with('"') && r.ends_with('"') && r.len() >= 2)
+        || r.ends_with(".class")
+        || matches!(r, "null" | "true" | "false")
+        || is_numeric_const_rhs(r)
+}
+
+/// Replace exactly `vid` (`vN_k`, or `vN` for version 0) in a comma-separated arg list.
+/// The bare `vN` of a versioned `vid` is the value from before the block: not `vid`.
 fn inline_var_in_args(args: &str, vid: VarId, rval: &str) -> String {
-    let names = if vid.ver == 0 {
-        vec![format!("v{}", vid.reg)]
+    let name = if vid.ver == 0 {
+        format!("v{}", vid.reg)
     } else {
-        vec![format!("v{}_{}", vid.reg, vid.ver), format!("v{}", vid.reg)]
+        format!("v{}_{}", vid.reg, vid.ver)
     };
-    let mut out = args.to_string();
-    for name in names {
-        out = replace_whole_ident(&out, &name, rval);
-    }
-    out
+    replace_whole_ident(args, &name, rval)
 }
 
 fn replace_whole_ident(text: &str, var: &str, replacement: &str) -> String {
     if var.is_empty() || !text.contains(var) {
         return text.to_string();
     }
+    map_outside_literals(text, |code| replace_whole_ident_in_code(code, var, replacement))
+}
+
+fn replace_whole_ident_in_code(text: &str, var: &str, replacement: &str) -> String {
     let bytes = text.as_bytes();
     let v = var.as_bytes();
     let mut out = String::with_capacity(text.len() + replacement.len());
@@ -933,8 +995,9 @@ fn replace_whole_ident(text: &str, var: &str, replacement: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&text[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -976,7 +1039,7 @@ pub struct InlineFilledArrayPass;
 
 impl Pass for InlineFilledArrayPass {
     fn run(&self, stmts: Vec<IrStmt>) -> Vec<IrStmt> {
-        let mut defs: HashMap<VarId, String> = HashMap::new();
+        let mut defs: DetHashMap<VarId, String> = DetHashMap::default();
         for s in &stmts {
             if let IrStmt::Assign {
                 dst,
@@ -992,8 +1055,8 @@ impl Pass for InlineFilledArrayPass {
         if defs.is_empty() {
             return stmts;
         }
-        let mut inlined_from: HashSet<VarId> = HashSet::new();
-        let mut rewrites: HashMap<usize, String> = HashMap::new();
+        let mut inlined_from: DetHashSet<VarId> = DetHashSet::default();
+        let mut rewrites: DetHashMap<usize, String> = DetHashMap::default();
         for (idx, s) in stmts.iter().enumerate() {
             let raw = match s {
                 IrStmt::Assign {
@@ -1052,7 +1115,7 @@ impl Pass for InlineFilledArrayPass {
 fn vid_used_outside_inlined_arrays(
     stmts: &[IrStmt],
     vid: VarId,
-    array_rewrites: &HashMap<usize, String>,
+    array_rewrites: &DetHashMap<usize, String>,
 ) -> bool {
     for (idx, s) in stmts.iter().enumerate() {
         if array_rewrites.contains_key(&idx) {
@@ -1063,7 +1126,7 @@ fn vid_used_outside_inlined_arrays(
                 continue;
             }
         }
-        let mut used = HashSet::new();
+        let mut used = DetHashSet::default();
         match s {
             IrStmt::Assign { rhs, .. } => collect_var_ids_expr(rhs, &mut used),
             IrStmt::Expr { expr, .. } => collect_var_ids_expr(expr, &mut used),
@@ -1117,8 +1180,8 @@ fn is_java_ident_part(s: &str) -> bool {
 
 fn try_inline_array_literal(
     r: &str,
-    defs: &HashMap<VarId, String>,
-    inlined: &mut HashSet<VarId>,
+    defs: &DetHashMap<VarId, String>,
+    inlined: &mut DetHashSet<VarId>,
 ) -> Option<String> {
     let r = r.trim();
     let open = r.find("[]{")?;
@@ -1458,12 +1521,12 @@ mod tests {
 
     #[test]
     fn var_ids_parses_versioned_aput() {
-        let mut set = HashSet::new();
+        let mut set = DetHashSet::default();
         var_ids_in_text("v8_2[v10_2] = v9_2;", &mut set);
         assert!(set.contains(&VarId::new(8, 2)), "{:?}", set);
         assert!(set.contains(&VarId::new(10, 2)), "{:?}", set);
         assert!(set.contains(&VarId::new(9, 2)), "{:?}", set);
-        let regs: HashSet<u32> = set.iter().map(|v| v.reg).collect();
+        let regs: DetHashSet<u32> = set.iter().map(|v| v.reg).collect();
         assert!(regs.contains(&9) && regs.contains(&10), "{:?}", regs);
     }
 
@@ -1642,5 +1705,147 @@ mod tests {
             }
             other => panic!("expected Return(Raw(...)), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn text_rewrites_keep_non_ascii() {
+        let text = "v1 = \"┌─┐ 友盟\" + v2; // 日志";
+        let mut map = DetHashMap::default();
+        map.insert(VarId::new(1, 0), VarId::new(3, 0));
+        assert_eq!(
+            rewrite_varids_in_text(text, &map),
+            "v3 = \"┌─┐ 友盟\" + v2; // 日志"
+        );
+        let mut cur_ver = DetHashMap::default();
+        cur_ver.insert(2u32, 1u32);
+        assert_eq!(
+            rename_vars_in_text(text, &cur_ver),
+            "v1 = \"┌─┐ 友盟\" + v2_1; // 日志"
+        );
+        assert_eq!(
+            replace_whole_ident(text, "v2", "x"),
+            "v1 = \"┌─┐ 友盟\" + x; // 日志"
+        );
+    }
+
+    #[test]
+    fn rename_vars_skips_literals() {
+        let cur_ver = DetHashMap::from_iter([(1, 2)]);
+        let out = rename_vars_in_text(r#"v1 + "ota/api/conf/v1" + 'v'"#, &cur_ver);
+        assert_eq!(out, r#"v1_2 + "ota/api/conf/v1" + 'v'"#);
+    }
+
+    #[test]
+    fn rename_vars_skips_a_literal_with_an_escaped_quote() {
+        let cur_ver = DetHashMap::from_iter([(1, 2)]);
+        let out = rename_vars_in_text(r#"f("a\"v1\"b", v1)"#, &cur_ver);
+        assert_eq!(out, r#"f("a\"v1\"b", v1_2)"#);
+    }
+
+    #[test]
+    fn replace_whole_ident_skips_literals() {
+        let out = replace_whole_ident(r#"g(v1, "v1", 'v')"#, "v1", "x");
+        assert_eq!(out, r#"g(x, "v1", 'v')"#);
+    }
+
+    #[test]
+    fn replace_whole_ident_skips_a_literal_with_an_escaped_quote() {
+        let out = replace_whole_ident(r#"g("a\"v1\"b", v1)"#, "v1", "x");
+        assert_eq!(out, r#"g("a\"v1\"b", x)"#);
+    }
+
+    /// D1: a `move-result` whose invoke is in another block is still a new definition.
+    #[test]
+    fn ssa_raw_move_result_is_a_new_definition() {
+        let stmts = vec![
+            IrStmt::Assign {
+                dst: VarId::new(0, 0),
+                rhs: IrExpr::Raw("\"wsClient\"".into()),
+                comment: None,
+            },
+            IrStmt::Raw("v0 = <result>;".into()),
+            IrStmt::Expr {
+                expr: IrExpr::Call {
+                    target: "v0.f".into(),
+                    args: "".into(),
+                },
+                comment: None,
+            },
+        ];
+        let out = SsaRenamePass.run(stmts);
+        assert_eq!(out[0].to_java_line(), "v0_1 = \"wsClient\";");
+        assert_eq!(out[1].to_java_line(), "v0_2 = <result>;");
+        assert_eq!(out[2].to_java_line(), "v0_2.f();");
+    }
+
+    /// D7: `new D0.K()` + argument set-up (nested `new`, `append` without result) + `<init>`.
+    #[test]
+    fn constructor_merge_skips_argument_setup() {
+        let call = |target: &str, args: &str| IrStmt::Expr {
+            expr: IrExpr::Call {
+                target: target.into(),
+                args: args.into(),
+            },
+            comment: None,
+        };
+        let stmts = vec![
+            IrStmt::Assign {
+                dst: VarId::new(2, 1),
+                rhs: IrExpr::Raw("new D0.K()".into()),
+                comment: None,
+            },
+            IrStmt::Assign {
+                dst: VarId::new(3, 1),
+                rhs: IrExpr::Raw("new java.lang.StringBuilder()".into()),
+                comment: None,
+            },
+            call("v3_1.<init>", ""),
+            call("v3_1.append", "v4"),
+            IrStmt::Assign {
+                dst: VarId::new(3, 2),
+                rhs: IrExpr::Call {
+                    target: "v3_1.toString".into(),
+                    args: "".into(),
+                },
+                comment: None,
+            },
+            call("v2_1.<init>", "v3_2"),
+        ];
+        let lines: Vec<String> = ConstructorMergePass
+            .run(stmts)
+            .iter()
+            .map(|s| s.to_java_line())
+            .collect();
+        assert!(lines.iter().all(|l| !l.contains("<init>")), "{lines:?}");
+        assert_eq!(lines.first().map(String::as_str), Some("v3_1 = new java.lang.StringBuilder();"));
+        assert_eq!(lines.last().map(String::as_str), Some("v2_1 = new D0.K(v3_2);"));
+    }
+
+    /// D1: inlining the temp `v1_1` into constructor args must not touch `v1`, the value
+    /// from before the block.
+    #[test]
+    fn constructor_merge_inlines_only_the_exact_version() {
+        let stmts = vec![
+            IrStmt::Assign {
+                dst: VarId::new(0, 1),
+                rhs: IrExpr::Raw("new Foo()".into()),
+                comment: None,
+            },
+            IrStmt::Assign {
+                dst: VarId::new(1, 1),
+                rhs: IrExpr::Raw("\"x\"".into()),
+                comment: None,
+            },
+            IrStmt::Expr {
+                expr: IrExpr::Call {
+                    target: "v0_1.<init>".into(),
+                    args: "v1, v1_1".into(),
+                },
+                comment: None,
+            },
+        ];
+        let out = ConstructorMergePass.run(stmts);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to_java_line(), "v0_1 = new Foo(v1, \"x\");");
     }
 }

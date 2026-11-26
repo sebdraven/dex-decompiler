@@ -1,6 +1,6 @@
 //! Restore for/foreach/do-while from lowered Dalvik loop shapes.
 
-use std::collections::{HashMap, HashSet};
+use crate::decompile::{DetHashMap, DetHashSet};
 
 use super::util::*;
 
@@ -163,8 +163,8 @@ pub(crate) fn parse_array_length_assign(line: &str) -> Option<(String, String)> 
 /// → `int[] out = new int[left.length + right.length];`
 pub(crate) fn fold_array_alloc_length_sum_via_temp(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut remove: HashSet<usize> = HashSet::new();
-    let mut replacements: HashMap<usize, String> = HashMap::new();
+    let mut remove: DetHashSet<usize> = DetHashSet::default();
+    let mut replacements: DetHashMap<usize, String> = DetHashMap::default();
     for (alloc_idx, line) in lines.iter().enumerate() {
         let binding = strip_trailing_comment(line);
         let stmt = binding.trim();
@@ -328,8 +328,8 @@ pub(crate) fn repair_merge_index_inits(body: &str) -> String {
 
 pub(crate) fn fold_array_alloc_length_sum(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut remove: HashSet<usize> = HashSet::new();
-    let mut replacements: HashMap<usize, String> = HashMap::new();
+    let mut remove: DetHashSet<usize> = DetHashSet::default();
+    let mut replacements: DetHashMap<usize, String> = DetHashMap::default();
     for (alloc_idx, line) in lines.iter().enumerate() {
         let binding = strip_trailing_comment(line);
         let stmt = binding.trim();
@@ -427,9 +427,9 @@ pub(crate) fn fold_array_alloc_length_sum(body: &str) -> String {
     out
 }
 
-pub(crate) fn fold_array_length_assigns(body: &str) -> String {
+pub(crate) fn fold_array_length_assigns_with_webs(body: &str, webs: &WebNames) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut length_init_count: HashMap<String, usize> = HashMap::new();
+    let mut length_init_count: DetHashMap<String, usize> = DetHashMap::default();
     for line in &lines {
         if let Some((var, _)) = parse_array_length_assign(line) {
             *length_init_count.entry(var).or_insert(0) += 1;
@@ -438,14 +438,16 @@ pub(crate) fn fold_array_length_assigns(body: &str) -> String {
     let mut folds: Vec<(String, String)> = Vec::new();
     for line in &lines {
         if let Some((var, arr)) = parse_array_length_assign(line) {
-            folds.push((var, arr));
+            if webs.may_substitute(&var) {
+                folds.push((var, arr));
+            }
         }
     }
     if folds.is_empty() {
         return body.to_string();
     }
-    let mut remove: HashSet<usize> = HashSet::new();
-    let mut subs: HashMap<String, String> = HashMap::new();
+    let mut remove: DetHashSet<usize> = DetHashSet::default();
+    let mut subs: DetHashMap<String, String> = DetHashMap::default();
     for (var, arr) in folds {
         if subs.contains_key(&var) {
             continue;
@@ -1385,7 +1387,7 @@ pub(crate) fn restore_foreach_array_once(body: &str) -> String {
         if other_use {
             continue;
         }
-        let mut remove: HashSet<usize> = HashSet::new();
+        let mut remove: DetHashSet<usize> = DetHashSet::default();
         for (idx, line) in lines.iter().enumerate().take(w) {
             if parse_array_length_assign(line).is_some_and(|(v, a)| v == bound || a == arr) {
                 remove.insert(idx);
@@ -2069,8 +2071,8 @@ pub(crate) fn rewrite_nonreturning_while(body: &str) -> String {
 /// The const is the compiler's copy of a second loop-exit test (`foobis`).
 pub(crate) fn fold_const_break_into_while(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    let mut skip = HashSet::new();
-    let mut repl: HashMap<usize, String> = HashMap::new();
+    let mut skip = DetHashSet::default();
+    let mut repl: DetHashMap<usize, String> = DetHashMap::default();
     let mut i = 0usize;
     while i < lines.len() {
         let Some(cond) = parse_while_condition(lines[i]) else {

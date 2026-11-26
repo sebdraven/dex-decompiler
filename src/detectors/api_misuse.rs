@@ -340,7 +340,9 @@ pub fn scan_root_detection(
     }
     if out.is_empty() {
         // Last resort: any invoke in the method
-        if let Some((&off, method_ref)) = owned.invoke_method_map.iter().next() {
+        if let Some((&off, method_ref)) =
+            owned.invoke_method_map.iter().min_by_key(|&(&o, _)| o)
+        {
             out.push(VulnFinding::new(
                 "root_detection",
                 class_name,
@@ -544,7 +546,9 @@ pub fn scan_sdk_int_check(
     );
     if out.is_empty() {
         // field sget may only appear in insn text
-        if let Some((&off, method_ref)) = owned.invoke_method_map.iter().next() {
+        if let Some((&off, method_ref)) =
+            owned.invoke_method_map.iter().min_by_key(|&(&o, _)| o)
+        {
             out.push(VulnFinding::new(
                 "sdk_int_check",
                 class_name,
@@ -554,7 +558,7 @@ pub fn scan_sdk_int_check(
                 off,
                 method_ref.clone(),
             ));
-        } else if let Some((&off, _)) = owned.insn_at.iter().next() {
+        } else if let Some(&off) = owned.insn_at.keys().min() {
             out.push(VulnFinding::new(
                 "sdk_int_check",
                 class_name,
@@ -630,7 +634,9 @@ pub fn scan_compose_password_visible(
         &["SecureTextField", "TextObfuscationMode"],
     );
     if out.is_empty() {
-        if let Some((&off, method_ref)) = owned.invoke_method_map.iter().next() {
+        if let Some((&off, method_ref)) =
+            owned.invoke_method_map.iter().min_by_key(|&(&o, _)| o)
+        {
             out.push(VulnFinding::new(
                 "compose_password_visible",
                 class_name,
